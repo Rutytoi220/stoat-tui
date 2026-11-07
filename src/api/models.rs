@@ -23,6 +23,24 @@ pub struct MfaTotpPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MfaTicketPayload {
+    pub ticket: String,
+    pub result: MfaTicketResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum MfaTicketResult {
+    Totp { code: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MfaTicketFallbackPayload {
+    pub ticket: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result")]
 pub enum LoginResponse {
     Success {

@@ -83,6 +83,30 @@ fn test_login_response_and_error_serde() {
     let payload_json = serde_json::to_string(&payload).unwrap();
     assert!(payload_json.contains("\"mfa_ticket\":\"mfa_challenge_abc\""));
     assert!(payload_json.contains("\"code\":\"123456\""));
+
+    // 8. Stoat Delta MFA Ticket payload serialization
+    use stoat_tui::api::models::{MfaTicketFallbackPayload, MfaTicketPayload, MfaTicketResult};
+    let ticket_payload = MfaTicketPayload {
+        ticket: "ticket_xyz".to_string(),
+        result: MfaTicketResult::Totp {
+            code: "654321".to_string(),
+        },
+    };
+    let ticket_json = serde_json::to_string(&ticket_payload).unwrap();
+    assert_eq!(
+        ticket_json,
+        r#"{"ticket":"ticket_xyz","result":{"type":"Totp","code":"654321"}}"#
+    );
+
+    let fallback_payload = MfaTicketFallbackPayload {
+        ticket: "ticket_xyz".to_string(),
+        code: "654321".to_string(),
+    };
+    let fallback_json = serde_json::to_string(&fallback_payload).unwrap();
+    assert_eq!(
+        fallback_json,
+        r#"{"ticket":"ticket_xyz","code":"654321"}"#
+    );
 }
 
 #[test]

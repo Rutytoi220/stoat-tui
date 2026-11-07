@@ -371,12 +371,12 @@ impl<'a> Widget for LoginModal<'a> {
         // Error message if any
         if let Some(ref err) = self.state.login_error {
             cur_y += 2;
-            let err_label = if err.starts_with('⚠') || err.starts_with("Error:") || err.starts_with("HTTP") {
-                if err.starts_with('⚠') {
-                    err.clone()
-                } else {
-                    format!("⚠ {}", err)
-                }
+            let err_label = if err.contains("<html") || err.contains("<!DOCTYPE") || err.contains("<HTML") {
+                "⚠ Server error: HTTP 401 Unauthorized (endpoint rejected request or invalid session)".to_string()
+            } else if err.starts_with('⚠') {
+                err.clone()
+            } else if err.starts_with("Error:") || err.starts_with("HTTP") {
+                format!("⚠ {}", err)
             } else {
                 format!("⚠ {}", err)
             };
@@ -402,7 +402,7 @@ impl<'a> Widget for LoginModal<'a> {
                 err_lines.push(line);
             }
 
-            for err_line in err_lines.iter().take(3) {
+            for err_line in err_lines.iter().take(4) {
                 if cur_y < inner.bottom() {
                     let mut ex = start_x;
                     for ch in err_line.chars() {

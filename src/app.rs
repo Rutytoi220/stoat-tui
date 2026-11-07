@@ -82,7 +82,7 @@ impl App {
             AppEvent::Resize(_, _) => {}
             AppEvent::Tick => {}
             AppEvent::Gateway(gw) => self.handle_gateway(gw).await,
-            AppEvent::ApiLoginSuccess { token, is_bot } => {
+            AppEvent::ApiLoginSuccess { token, is_bot } | AppEvent::LoginSuccess { token, is_bot } => {
                 self.state.login_loading = false;
                 self.state.login_error = None;
                 self.state.login_step = LoginStep::Credentials;
@@ -277,7 +277,7 @@ impl App {
                             let client = api.lock().await;
                             match client.verify_mfa_totp(&ticket_clone, &code).await {
                                 Ok(LoginResponse::Success { token, .. }) => {
-                                    let _ = tx.send(AppEvent::ApiLoginSuccess {
+                                    let _ = tx.send(AppEvent::LoginSuccess {
                                         token,
                                         is_bot: false,
                                     }).await;

@@ -14,6 +14,7 @@ pub enum AppEvent {
     Tick,
     Gateway(GatewayEvent),
     ApiLoginSuccess { token: String, is_bot: bool },
+    LoginSuccess { token: String, is_bot: bool },
     ApiMfaRequired { ticket: String, allowed_methods: Vec<String> },
     ApiLoginFailure(String),
     ApiMessageSent(Result<Message, String>),
