@@ -5,8 +5,12 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+pub const DEFAULT_STOAT_API: &str = "https://api.stoat.chat";
+pub const DEFAULT_REVOLT_API: &str = "https://api.revolt.chat";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Base API URL (e.g. "https://api.stoat.chat" or "https://api.revolt.chat")
     #[serde(default = "default_api_url")]
     pub api_url: String,
 
@@ -24,7 +28,7 @@ pub struct Config {
 }
 
 fn default_api_url() -> String {
-    "https://api.stoat.chat".to_string()
+    DEFAULT_STOAT_API.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +112,14 @@ pub fn parse_hex_color(hex: &str) -> Color {
 }
 
 impl Config {
+    pub fn toggle_api_fallback(&mut self) {
+        if self.api_url.contains("revolt.chat") {
+            self.api_url = DEFAULT_STOAT_API.to_string();
+        } else {
+            self.api_url = DEFAULT_REVOLT_API.to_string();
+        }
+    }
+
     pub fn config_dir() -> PathBuf {
         if let Some(proj_dirs) = ProjectDirs::from("chat", "stoat", "stoat-tui") {
             proj_dirs.config_dir().to_path_buf()

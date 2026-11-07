@@ -1,4 +1,4 @@
-use crate::api::models::Message;
+use crate::api::models::{LoginResponse, Message};
 use crate::api::DeltaClient;
 use crate::config::Config;
 use crate::event::AppEvent;
@@ -273,11 +273,24 @@ impl App {
                             tokio::spawn(async move {
                                 let client = api.lock().await;
                                 match client.login(&email, &password).await {
-                                    Ok(resp) => {
+                                    Ok(LoginResponse::Success { token, .. }) => {
                                         let _ = tx.send(AppEvent::ApiLoginSuccess {
-                                            token: resp.token,
+                                            token,
                                             is_bot: false,
                                         }).await;
+                                    }
+                                    Ok(LoginResponse::MFA { ticket: _, allowed_methods }) => {
+                                        let methods_str = if allowed_methods.is_empty() {
+                                            "".to_string()
+                                        } else {
+                                            format!(" (allowed: {})", allowed_methods.join(", "))
+                                        };
+                                        let _ = tx.send(AppEvent::ApiLoginFailure(
+                                            format!("MFA required{} - Authenticate using a session token or complete MFA in web client", methods_str)
+                                        )).await;
+                                    }
+                                    Ok(LoginResponse::Disabled) => {
+                                        let _ = tx.send(AppEvent::ApiLoginFailure("Account is disabled".to_string())).await;
                                     }
                                     Err(e) => {
                                         let _ = tx.send(AppEvent::ApiLoginFailure(e.to_string())).await;

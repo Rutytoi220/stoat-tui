@@ -48,9 +48,10 @@ stoat-tui [OPTIONS]
 OPTIONS:
     -h, -H, --help       Print help information, config paths, and keybindings
     -v, -V, --version    Print version information
+    -a, --api <URL>      Override base API URL (e.g. https://api.revolt.chat or https://api.stoat.chat)
 ```
 
-Running `stoat-tui` without options launches the fullscreen reactive TUI.
+Running `stoat-tui` without options launches the fullscreen reactive TUI. You can easily toggle between the official Stoat API (`https://api.stoat.chat`) and Revolt API (`https://api.revolt.chat`) via the `--api` flag or in `config.toml`.
 
 ---
 

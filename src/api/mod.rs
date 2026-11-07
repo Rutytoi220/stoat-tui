@@ -79,7 +79,7 @@ impl DeltaClient {
         let payload = LoginPayload {
             email: email.to_string(),
             password: password.to_string(),
-            friendly_name: "stoat-tui client".to_string(),
+            friendly_name: "stoat-tui".to_string(),
         };
 
         let resp = self
@@ -89,19 +89,69 @@ impl DeltaClient {
             .json(&payload)
             .send()
             .await
-            .with_context(|| format!("Failed to send login request to {}", url))?;
+            .with_context(|| format!("Failed to connect to API server at {}", url))?;
 
         let status = resp.status();
+        let raw_body = resp.text().await.unwrap_or_default();
+
         if !status.is_success() {
-            let err_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Login failed ({}): {}", status, err_text));
+            // 1. Attempt to deserialize standard Stoat/Revolt JSON error
+            if let Ok(api_err) = serde_json::from_str::<RevoltApiError>(&raw_body) {
+                let description = match api_err.error_type.as_str() {
+                    "InvalidCredentials" => "Invalid credentials",
+                    "UserNotFound" => "Account not found",
+                    "FailedValidation" => "Failed validation (invalid email or password format)",
+                    "InvalidSession" => "Invalid session",
+                    "CompromisedPassword" => "Compromised password, please reset password",
+                    "Blocked" => "Access blocked",
+                    "TooManyRequests" => "Too many login attempts, please wait and try again",
+                    other => other,
+                };
+                let extra = api_err.error.as_deref().unwrap_or("");
+                if extra.is_empty() {
+                    return Err(anyhow!("{} ({})", description, status.as_u16()));
+                } else {
+                    return Err(anyhow!("{} ({}): {}", description, status.as_u16(), extra));
+                }
+            }
+
+            // 2. Handle known HTTP status codes gracefully
+            let clean_body = raw_body.trim();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(anyhow!("HTTP 404 - Check API URL (endpoint not found at {})", self.api_url));
+            }
+            if clean_body.is_empty() {
+                return Err(anyhow!("Server returned HTTP {}", status));
+            } else if clean_body.starts_with('<') {
+                return Err(anyhow!("Server returned HTTP {} (HTML response - verify API URL)", status));
+            } else {
+                let preview = if clean_body.len() > 100 {
+                    format!("{}...", &clean_body[..100])
+                } else {
+                    clean_body.to_string()
+                };
+                return Err(anyhow!("Server returned HTTP {}: {}", status, preview));
+            }
         }
 
-        let login_resp: LoginResponse = resp
-            .json()
-            .await
-            .context("Failed to parse login response JSON")?;
-        Ok(login_resp)
+        // 3. Success deserialization: try tagged LoginResponse first, then direct
+        if let Ok(login_resp) = serde_json::from_str::<LoginResponse>(&raw_body) {
+            return Ok(login_resp);
+        }
+
+        if let Ok(direct) = serde_json::from_str::<DirectLoginSuccess>(&raw_body) {
+            return Ok(LoginResponse::Success {
+                token: direct.token,
+                user_id: direct.user_id,
+                _id: direct._id,
+            });
+        }
+
+        Err(anyhow!(
+            "Unexpected server response format (HTTP {}): {}",
+            status,
+            if raw_body.len() > 80 { format!("{}...", &raw_body[..80]) } else { raw_body }
+        ))
     }
 
     pub async fn get_current_user(&self) -> Result<User> {

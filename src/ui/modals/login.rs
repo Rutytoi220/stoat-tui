@@ -49,7 +49,22 @@ impl<'a> Widget for LoginModal<'a> {
         }
 
         let start_x = inner.left() + 2;
-        let mut cur_y = inner.top() + 1;
+        let mut cur_y = inner.top();
+
+        // 0. API Endpoint indicator
+        let api_pfx = "Server API: ";
+        let mut ax = start_x;
+        for ch in api_pfx.chars() {
+            buf[(ax, cur_y)].set_char(ch).set_fg(theme.muted);
+            ax += 1;
+        }
+        for ch in self.state.config.api_url.chars() {
+            if ax < inner.right().saturating_sub(2) {
+                buf[(ax, cur_y)].set_char(ch).set_fg(Color::Cyan);
+                ax += 1;
+            }
+        }
+        cur_y += 2;
 
         // 1. Tab Bar
         let tabs = [
@@ -230,15 +245,47 @@ impl<'a> Widget for LoginModal<'a> {
         // Error message if any
         if let Some(ref err) = self.state.login_error {
             cur_y += 2;
-            let err_pfx = "Error: ";
-            let mut ex = start_x;
-            for ch in err_pfx.chars() {
-                buf[(ex, cur_y)].set_char(ch).set_fg(Color::Red).set_style(Modifier::BOLD);
-                ex += 1;
+            let err_label = if err.starts_with("Error:") || err.starts_with("HTTP") {
+                format!("⚠ {}", err)
+            } else {
+                format!("⚠ Error: {}", err)
+            };
+
+            // Word wrap error across available width
+            let max_err_w = inner.width.saturating_sub(4) as usize;
+            let words: Vec<&str> = err_label.split_whitespace().collect();
+            let mut line = String::new();
+            let mut err_lines = Vec::new();
+
+            for word in words {
+                if !line.is_empty() && line.len() + word.len() + 1 > max_err_w {
+                    err_lines.push(line);
+                    line = word.to_string();
+                } else {
+                    if !line.is_empty() {
+                        line.push(' ');
+                    }
+                    line.push_str(word);
+                }
             }
-            for ch in err.chars().take(inner.width.saturating_sub(10) as usize) {
-                buf[(ex, cur_y)].set_char(ch).set_fg(Color::Red);
-                ex += 1;
+            if !line.is_empty() {
+                err_lines.push(line);
+            }
+
+            for err_line in err_lines.iter().take(3) {
+                if cur_y < inner.bottom() {
+                    let mut ex = start_x;
+                    for ch in err_line.chars() {
+                        if ex < inner.right() {
+                            buf[(ex, cur_y)]
+                                .set_char(ch)
+                                .set_fg(Color::Rgb(255, 80, 80))
+                                .set_style(Modifier::BOLD);
+                            ex += 1;
+                        }
+                    }
+                    cur_y += 1;
+                }
             }
         }
     }

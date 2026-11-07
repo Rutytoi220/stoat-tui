@@ -17,12 +17,42 @@ pub struct LoginPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoginResponse {
-    #[serde(rename = "_id")]
-    pub id: Option<String>,
-    pub user_id: Option<String>,
+#[serde(tag = "result")]
+pub enum LoginResponse {
+    Success {
+        token: String,
+        #[serde(default)]
+        user_id: Option<String>,
+        #[serde(default, rename = "_id")]
+        _id: Option<String>,
+    },
+    MFA {
+        ticket: String,
+        #[serde(default)]
+        allowed_methods: Vec<String>,
+    },
+    Disabled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectLoginSuccess {
     pub token: String,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default, rename = "_id")]
+    pub _id: Option<String>,
+    #[serde(default)]
     pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevoltApiError {
+    #[serde(rename = "type")]
+    pub error_type: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub location: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

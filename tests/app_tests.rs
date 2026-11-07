@@ -22,6 +22,65 @@ fn test_config_defaults_and_hex_color() {
 }
 
 #[test]
+fn test_login_response_and_error_serde() {
+    use stoat_tui::api::models::{DirectLoginSuccess, LoginResponse, RevoltApiError};
+
+    // 1. Tagged Success
+    let success_json = r#"{"result":"Success","token":"sess_abc123","user_id":"u_01"}"#;
+    let resp: LoginResponse = serde_json::from_str(success_json).unwrap();
+    match resp {
+        LoginResponse::Success { token, user_id, .. } => {
+            assert_eq!(token, "sess_abc123");
+            assert_eq!(user_id.as_deref(), Some("u_01"));
+        }
+        _ => panic!("Expected LoginResponse::Success"),
+    }
+
+    // 2. Tagged MFA
+    let mfa_json = r#"{"result":"MFA","ticket":"mfa_tick_789","allowed_methods":["totp"]}"#;
+    let mfa_resp: LoginResponse = serde_json::from_str(mfa_json).unwrap();
+    match mfa_resp {
+        LoginResponse::MFA { ticket, allowed_methods } => {
+            assert_eq!(ticket, "mfa_tick_789");
+            assert_eq!(allowed_methods, vec!["totp".to_string()]);
+        }
+        _ => panic!("Expected LoginResponse::MFA"),
+    }
+
+    // 3. Tagged Disabled
+    let disabled_json = r#"{"result":"Disabled"}"#;
+    let dis_resp: LoginResponse = serde_json::from_str(disabled_json).unwrap();
+    assert!(matches!(dis_resp, LoginResponse::Disabled));
+
+    // 4. Direct session fallback
+    let direct_json = r#"{"_id":"sess_1","token":"direct_tok_xyz","user_id":"u_99"}"#;
+    let direct: DirectLoginSuccess = serde_json::from_str(direct_json).unwrap();
+    assert_eq!(direct.token, "direct_tok_xyz");
+
+    // 5. Stoat / Revolt API Error JSON
+    let err_json = r#"{"type":"InvalidCredentials"}"#;
+    let api_err: RevoltApiError = serde_json::from_str(err_json).unwrap();
+    assert_eq!(api_err.error_type, "InvalidCredentials");
+
+    let val_err_json = r#"{"type":"FailedValidation","error":"email: Invalid address format"}"#;
+    let val_err: RevoltApiError = serde_json::from_str(val_err_json).unwrap();
+    assert_eq!(val_err.error_type, "FailedValidation");
+    assert_eq!(val_err.error.as_deref(), Some("email: Invalid address format"));
+}
+
+#[test]
+fn test_api_url_fallback() {
+    let mut cfg = Config::default();
+    assert_eq!(cfg.api_url, "https://api.stoat.chat");
+
+    cfg.toggle_api_fallback();
+    assert_eq!(cfg.api_url, "https://api.revolt.chat");
+
+    cfg.toggle_api_fallback();
+    assert_eq!(cfg.api_url, "https://api.stoat.chat");
+}
+
+#[test]
 fn test_markdown_parser() {
     let parser = MarkdownParser::default();
 

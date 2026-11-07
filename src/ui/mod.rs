@@ -169,8 +169,8 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     }
 
     if state.show_login_modal {
-        let modal_w = 60.min(size.width.saturating_sub(4));
-        let modal_h = 20.min(size.height.saturating_sub(4));
+        let modal_w = 64.min(size.width.saturating_sub(4));
+        let modal_h = 22.min(size.height.saturating_sub(4));
         let modal_rect = Rect {
             x: size.width.saturating_sub(modal_w) / 2,
             y: size.height.saturating_sub(modal_h) / 2,

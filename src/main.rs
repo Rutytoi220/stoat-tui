@@ -29,6 +29,7 @@ USAGE:
 OPTIONS:
     -h, -H, --help       Print help information, config paths, and keybindings
     -v, -V, --version    Print version information
+    -a, --api <URL>      Override base API URL (e.g. https://api.revolt.chat or https://api.stoat.chat)
 
 CONFIGURATION:
     Config directory:    {config_dir}
@@ -60,7 +61,10 @@ fn print_version() {
 async fn main() -> Result<()> {
     // 0. Parse command-line arguments
     let args: Vec<String> = env::args().skip(1).collect();
-    for arg in &args {
+    let mut override_api: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
         match arg.as_str() {
             "--help" | "-h" | "-H" => {
                 print_help();
@@ -69,6 +73,24 @@ async fn main() -> Result<()> {
             "--version" | "-V" | "-v" => {
                 print_version();
                 return Ok(());
+            }
+            "--api" | "-a" => {
+                if i + 1 < args.len() {
+                    override_api = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("stoat-tui: error: --api requires a URL parameter\n");
+                    print_help();
+                    std::process::exit(1);
+                }
+            }
+            s if s.starts_with("--api=") => {
+                override_api = Some(s.trim_start_matches("--api=").to_string());
+                i += 1;
+            }
+            s if s.starts_with("-a=") => {
+                override_api = Some(s.trim_start_matches("-a=").to_string());
+                i += 1;
             }
             unknown => {
                 eprintln!("stoat-tui: unrecognized argument '{}'\n", unknown);
@@ -104,8 +126,11 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // 3. Load configuration
-    let config = Config::load().unwrap_or_default();
+    // 3. Load configuration (and apply CLI overrides)
+    let mut config = Config::load().unwrap_or_default();
+    if let Some(api) = override_api {
+        config.api_url = api;
+    }
     let token_clone = config.token.clone();
     let gw_url_clone = config.gateway_url.clone();
 
