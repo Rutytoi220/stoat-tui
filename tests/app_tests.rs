@@ -66,6 +66,51 @@ fn test_login_response_and_error_serde() {
     let val_err: RevoltApiError = serde_json::from_str(val_err_json).unwrap();
     assert_eq!(val_err.error_type, "FailedValidation");
     assert_eq!(val_err.error.as_deref(), Some("email: Invalid address format"));
+
+    // 6. MFA Specific errors
+    let code_err: RevoltApiError = serde_json::from_str(r#"{"type":"InvalidCode"}"#).unwrap();
+    assert_eq!(code_err.error_type, "InvalidCode");
+
+    let ticket_err: RevoltApiError = serde_json::from_str(r#"{"type":"InvalidTicket"}"#).unwrap();
+    assert_eq!(ticket_err.error_type, "InvalidTicket");
+
+    // 7. MFA TOTP payload serialization
+    use stoat_tui::api::models::MfaTotpPayload;
+    let payload = MfaTotpPayload {
+        mfa_ticket: "mfa_challenge_abc".to_string(),
+        code: "123456".to_string(),
+    };
+    let payload_json = serde_json::to_string(&payload).unwrap();
+    assert!(payload_json.contains("\"mfa_ticket\":\"mfa_challenge_abc\""));
+    assert!(payload_json.contains("\"code\":\"123456\""));
+}
+
+#[test]
+fn test_mfa_login_step_transitions() {
+    use stoat_tui::state::LoginStep;
+
+    let mut state = AppState::new(Config::default());
+    assert_eq!(state.login_step, LoginStep::Credentials);
+    assert_eq!(state.login_totp_input, "");
+
+    // Simulate receiving MFA challenge
+    state.login_step = LoginStep::TotpChallenge {
+        ticket: "challenge_ticket_123".to_string(),
+    };
+    state.login_totp_input = "654321".to_string();
+
+    if let LoginStep::TotpChallenge { ref ticket } = state.login_step {
+        assert_eq!(ticket, "challenge_ticket_123");
+        assert_eq!(state.login_totp_input, "654321");
+    } else {
+        panic!("Expected LoginStep::TotpChallenge");
+    }
+
+    // Simulate Esc key returning to Credentials
+    state.login_step = LoginStep::Credentials;
+    state.login_totp_input.clear();
+    assert_eq!(state.login_step, LoginStep::Credentials);
+    assert_eq!(state.login_totp_input, "");
 }
 
 #[test]

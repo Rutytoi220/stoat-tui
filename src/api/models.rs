@@ -17,6 +17,12 @@ pub struct LoginPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MfaTotpPayload {
+    pub mfa_ticket: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result")]
 pub enum LoginResponse {
     Success {

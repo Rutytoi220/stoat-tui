@@ -154,6 +154,81 @@ impl DeltaClient {
         ))
     }
 
+    pub async fn verify_mfa_totp(&self, ticket: &str, code: &str) -> Result<LoginResponse> {
+        let url = format!("{}/auth/mfa/totp", self.api_url);
+        let payload = MfaTotpPayload {
+            mfa_ticket: ticket.to_string(),
+            code: code.to_string(),
+        };
+
+        let resp = self
+            .client
+            .post(&url)
+            .headers(self.headers())
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| format!("Failed to connect to API server at {}", url))?;
+
+        let status = resp.status();
+        let raw_body = resp.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            // 1. Attempt to deserialize standard Stoat/Revolt JSON error
+            if let Ok(api_err) = serde_json::from_str::<RevoltApiError>(&raw_body) {
+                let description = match api_err.error_type.as_str() {
+                    "InvalidCode" => "Invalid 2FA code. Please try again.",
+                    "InvalidTicket" => "MFA session timed out or invalid ticket. Please log in again.",
+                    "TooManyRequests" => "Too many verification attempts, please wait and try again",
+                    other => other,
+                };
+                let extra = api_err.error.as_deref().unwrap_or("");
+                if extra.is_empty() {
+                    return Err(anyhow!("{} ({})", description, status.as_u16()));
+                } else {
+                    return Err(anyhow!("{} ({}): {}", description, status.as_u16(), extra));
+                }
+            }
+
+            // 2. Fallback to HTTP status info
+            let clean_body = raw_body.trim();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(anyhow!("HTTP 404 - MFA endpoint not found at {}", self.api_url));
+            }
+            if clean_body.is_empty() {
+                return Err(anyhow!("Server returned HTTP {}", status));
+            } else if clean_body.starts_with('<') {
+                return Err(anyhow!("Server returned HTTP {} (HTML response - verify API URL)", status));
+            } else {
+                let preview = if clean_body.len() > 100 {
+                    format!("{}...", &clean_body[..100])
+                } else {
+                    clean_body.to_string()
+                };
+                return Err(anyhow!("Server returned HTTP {}: {}", status, preview));
+            }
+        }
+
+        // 3. Success deserialization: try tagged LoginResponse first, then direct
+        if let Ok(login_resp) = serde_json::from_str::<LoginResponse>(&raw_body) {
+            return Ok(login_resp);
+        }
+
+        if let Ok(direct) = serde_json::from_str::<DirectLoginSuccess>(&raw_body) {
+            return Ok(LoginResponse::Success {
+                token: direct.token,
+                user_id: direct.user_id,
+                _id: direct._id,
+            });
+        }
+
+        Err(anyhow!(
+            "Unexpected server response format (HTTP {}): {}",
+            status,
+            if raw_body.len() > 80 { format!("{}...", &raw_body[..80]) } else { raw_body }
+        ))
+    }
+
     pub async fn get_current_user(&self) -> Result<User> {
         let url = format!("{}/users/@me", self.api_url);
         let resp = self

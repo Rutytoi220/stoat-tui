@@ -87,6 +87,12 @@ pub enum LoginTab {
     Demo,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginStep {
+    Credentials,
+    TotpChallenge { ticket: String },
+}
+
 pub struct AppState {
     pub config: Config,
     pub theme: Theme,
@@ -115,9 +121,11 @@ pub struct AppState {
 
     pub show_login_modal: bool,
     pub login_tab: LoginTab,
+    pub login_step: LoginStep,
     pub login_field_index: usize, // 0 = email/token, 1 = password
     pub login_email_input: String,
     pub login_password_input: String,
+    pub login_totp_input: String,
     pub login_token_input: String,
     pub login_error: Option<String>,
     pub login_loading: bool,
@@ -182,9 +190,11 @@ impl AppState {
 
             show_login_modal: show_login,
             login_tab: LoginTab::EmailPassword,
+            login_step: LoginStep::Credentials,
             login_field_index: 0,
             login_email_input: String::new(),
             login_password_input: String::new(),
+            login_totp_input: String::new(),
             login_token_input: String::new(),
             login_error: None,
             login_loading: false,

@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::event::AppEvent;
 use crate::gateway::messages::ServerMessage;
 use crate::gateway::{BonfireClient, GatewayEvent};
-use crate::state::{AppState, Focus, GatewayStatus, LoginTab, PaletteItemType};
+use crate::state::{AppState, Focus, GatewayStatus, LoginStep, LoginTab, PaletteItemType};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -85,6 +85,7 @@ impl App {
             AppEvent::ApiLoginSuccess { token, is_bot } => {
                 self.state.login_loading = false;
                 self.state.login_error = None;
+                self.state.login_step = LoginStep::Credentials;
                 self.state.show_login_modal = false;
                 self.state.config.token = Some(token.clone());
                 self.state.config.is_bot = is_bot;
@@ -97,6 +98,12 @@ impl App {
 
                 self.start_gateway(token, self.state.config.gateway_url.clone());
                 self.fetch_initial_data().await;
+            }
+            AppEvent::ApiMfaRequired { ticket, allowed_methods: _ } => {
+                self.state.login_loading = false;
+                self.state.login_error = None;
+                self.state.login_step = LoginStep::TotpChallenge { ticket };
+                self.state.login_totp_input.clear();
             }
             AppEvent::ApiLoginFailure(err) => {
                 self.state.login_loading = false;
@@ -145,6 +152,15 @@ impl App {
         }
 
         if self.state.show_login_modal {
+            if matches!(self.state.login_step, LoginStep::TotpChallenge { .. }) {
+                for ch in text.chars() {
+                    if ch.is_ascii_digit() && self.state.login_totp_input.len() < 8 {
+                        self.state.login_totp_input.push(ch);
+                    }
+                }
+                return;
+            }
+
             match self.state.login_tab {
                 LoginTab::EmailPassword => {
                     if self.state.login_field_index == 0 {
@@ -226,6 +242,66 @@ impl App {
 
         // 2. If Login Modal is open
         if self.state.show_login_modal {
+            if let LoginStep::TotpChallenge { ticket } = self.state.login_step.clone() {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state.login_step = LoginStep::Credentials;
+                        self.state.login_error = None;
+                        self.state.login_totp_input.clear();
+                    }
+                    KeyCode::Backspace => {
+                        self.state.login_totp_input.pop();
+                    }
+                    KeyCode::Char(c) if c.is_ascii_digit() && self.state.login_totp_input.len() < 8 => {
+                        self.state.login_totp_input.push(c);
+                    }
+                    KeyCode::Enter => {
+                        let code = self.state.login_totp_input.trim().to_string();
+                        if code.is_empty() {
+                            self.state.login_error = Some("Please enter your 6-digit TOTP code".to_string());
+                            return;
+                        }
+                        if code.len() < 6 {
+                            self.state.login_error = Some("TOTP code must be at least 6 digits".to_string());
+                            return;
+                        }
+
+                        self.state.login_loading = true;
+                        self.state.login_error = None;
+
+                        let api = self.api_client.clone();
+                        let tx = self.event_tx.clone();
+                        let ticket_clone = ticket.clone();
+
+                        tokio::spawn(async move {
+                            let client = api.lock().await;
+                            match client.verify_mfa_totp(&ticket_clone, &code).await {
+                                Ok(LoginResponse::Success { token, .. }) => {
+                                    let _ = tx.send(AppEvent::ApiLoginSuccess {
+                                        token,
+                                        is_bot: false,
+                                    }).await;
+                                }
+                                Ok(LoginResponse::MFA { ticket: new_ticket, allowed_methods }) => {
+                                    let _ = tx.send(AppEvent::ApiMfaRequired {
+                                        ticket: new_ticket,
+                                        allowed_methods,
+                                    }).await;
+                                }
+                                Ok(LoginResponse::Disabled) => {
+                                    let _ = tx.send(AppEvent::ApiLoginFailure("Account is disabled".to_string())).await;
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::ApiLoginFailure(e.to_string())).await;
+                                }
+                            }
+                        });
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
             match key.code {
                 KeyCode::Esc => {
                     self.state.show_login_modal = false;
@@ -279,15 +355,11 @@ impl App {
                                             is_bot: false,
                                         }).await;
                                     }
-                                    Ok(LoginResponse::MFA { ticket: _, allowed_methods }) => {
-                                        let methods_str = if allowed_methods.is_empty() {
-                                            "".to_string()
-                                        } else {
-                                            format!(" (allowed: {})", allowed_methods.join(", "))
-                                        };
-                                        let _ = tx.send(AppEvent::ApiLoginFailure(
-                                            format!("MFA required{} - Authenticate using a session token or complete MFA in web client", methods_str)
-                                        )).await;
+                                    Ok(LoginResponse::MFA { ticket, allowed_methods }) => {
+                                        let _ = tx.send(AppEvent::ApiMfaRequired {
+                                            ticket,
+                                            allowed_methods,
+                                        }).await;
                                     }
                                     Ok(LoginResponse::Disabled) => {
                                         let _ = tx.send(AppEvent::ApiLoginFailure("Account is disabled".to_string())).await;
@@ -300,12 +372,16 @@ impl App {
                         }
                         LoginTab::Token => {
                             let token = self.state.login_token_input.trim().to_string();
-                            if !token.is_empty() {
-                                let _ = self.event_tx.send(AppEvent::ApiLoginSuccess {
-                                    token,
-                                    is_bot: false,
-                                }).await;
+                            if token.is_empty() {
+                                self.state.login_error = Some("Token cannot be empty".to_string());
+                                return;
                             }
+                            self.state.login_loading = true;
+                            self.state.login_error = None;
+                            let _ = self.event_tx.send(AppEvent::ApiLoginSuccess {
+                                token,
+                                is_bot: false,
+                            }).await;
                         }
                         LoginTab::Demo => {
                             self.state.load_demo_data();
@@ -408,7 +484,7 @@ impl App {
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if self.state.selected_server_index + 1 <= self.state.servers.len() {
+                    if self.state.selected_server_index < self.state.servers.len() {
                         self.state.selected_server_index += 1;
                     }
                 }
@@ -607,7 +683,6 @@ impl App {
                 let mem = self.state.rect_members;
                 if self.state.show_member_rail && mx >= mem.left() && mx < mem.right() && my >= mem.top() && my < mem.bottom() {
                     self.state.focus = Focus::Members;
-                    return;
                 }
             }
 
