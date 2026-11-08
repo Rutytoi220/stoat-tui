@@ -558,3 +558,150 @@ fn test_logger_file_output() {
     assert!(content.contains("[ERROR] Test error entry"));
     assert!(content.contains("[DEBUG] Test debug entry"));
 }
+
+#[tokio::test]
+async fn test_user_resolution_and_background_fetch() {
+    use stoat_tui::api::models::User;
+    use stoat_tui::event::AppEvent;
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let mut app = stoat_tui::app::App::new(Config::default(), tx);
+
+    // Initial query for unknown user triggers background fetch
+    let user_opt = app.state.resolve_user("01HMISSINGUSER");
+    assert!(user_opt.is_none());
+
+    // Second query does not re-queue fetch because it is pending
+    let user_opt2 = app.state.resolve_user("01HMISSINGUSER");
+    assert!(user_opt2.is_none());
+
+    // When the user arrives via ApiUserFetched event
+    let fetched_user = User {
+        id: "01HMISSINGUSER".to_string(),
+        username: "real_user".to_string(),
+        display_name: Some("Real Display Name".to_string()),
+        ..Default::default()
+    };
+    app.handle_event(AppEvent::ApiUserFetched(fetched_user.clone())).await;
+
+    // Now resolve_user returns the user immediately
+    let resolved = app.state.resolve_user("01HMISSINGUSER");
+    assert!(resolved.is_some());
+    assert_eq!(resolved.unwrap().name(), "Real Display Name");
+}
+
+#[test]
+fn test_dm_channel_name_resolution() {
+    use std::collections::HashMap;
+    use stoat_tui::api::models::{Channel, User};
+
+    let mut users = HashMap::new();
+    users.insert(
+        "user_other".to_string(),
+        User {
+            id: "user_other".to_string(),
+            username: "other_friend".to_string(),
+            display_name: Some("Best Friend".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let dm_channel = Channel {
+        id: "dm_123".to_string(),
+        channel_type: "DirectMessage".to_string(),
+        recipients: Some(vec!["user_me".to_string(), "user_other".to_string()]),
+        ..Default::default()
+    };
+
+    // Resolves to other participant's display name
+    let name = dm_channel.display_name(&users, Some("user_me"));
+    assert_eq!(name, "Best Friend");
+
+    // Fallback if recipient not in cache
+    let uncached_channel = Channel {
+        id: "dm_456".to_string(),
+        channel_type: "DirectMessage".to_string(),
+        recipients: Some(vec!["user_me".to_string(), "01J999XYZ".to_string()]),
+        ..Default::default()
+    };
+    let uncached_name = uncached_channel.display_name(&users, Some("user_me"));
+    assert_eq!(uncached_name, "User 01J999");
+}
+
+#[test]
+fn test_server_badge_abbreviations() {
+    fn badge(name: &str) -> String {
+        let words: Vec<&str> = name.split_whitespace().collect();
+        if words.len() >= 2 {
+            let first = words[0].chars().next().unwrap_or('?');
+            let second = words[1].chars().next().unwrap_or('?');
+            format!("{}{}", first, second).to_uppercase()
+        } else if let Some(first_word) = words.first() {
+            let chars: Vec<char> = first_word.chars().collect();
+            if chars.len() >= 2 {
+                format!("{}{}", chars[0], chars[1]).to_uppercase()
+            } else if let Some(&c) = chars.first() {
+                format!("{} ", c).to_uppercase()
+            } else {
+                "??".to_string()
+            }
+        } else {
+            "??".to_string()
+        }
+    }
+
+    assert_eq!(badge("Zero"), "ZE");
+    assert_eq!(badge("Origin"), "OR");
+    assert_eq!(badge("ZE"), "ZE");
+    assert_eq!(badge("OR"), "OR");
+    assert_eq!(badge("Stoat Official"), "SO");
+    assert_eq!(badge("Rust Language"), "RL");
+    assert_eq!(badge("A"), "A ");
+}
+
+#[test]
+fn test_purge_mock_servers() {
+    use stoat_tui::api::models::Server;
+
+    let mut state = AppState::new(Config::default());
+    state.load_demo_data();
+
+    // Verify mock servers are initially present in demo state
+    assert!(state.servers.iter().any(|s| s.id == "srv_stoat"));
+
+    // Add a real server
+    state.servers.push(Server {
+        id: "01J_REAL_SERVER".to_string(),
+        name: "Zero Guild".to_string(),
+        channels: vec!["c_real".to_string()],
+        ..Default::default()
+    });
+
+    // Purge mock servers
+    state.clear_mock_data();
+
+    assert!(!state.servers.iter().any(|s| s.id == "srv_stoat"));
+    assert!(!state.servers.iter().any(|s| s.id == "srv_rust"));
+    assert!(state.servers.iter().any(|s| s.id == "01J_REAL_SERVER"));
+}
+
+#[test]
+fn test_gateway_resilience_and_heartbeat_ping() {
+    use stoat_tui::gateway::messages::{ClientMessage, ServerMessage};
+
+    // Heartbeat ping serialization
+    let ping = ClientMessage::Ping { data: 0 };
+    let json = serde_json::to_string(&ping).unwrap();
+    assert_eq!(json, r#"{"type":"Ping","data":0}"#);
+
+    // Resilient parsing of unknown/unhandled events (typing indicators, reactions, etc.)
+    let typing_json = r#"{"type":"ChannelStartTyping","id":"c_123","user":"u_456"}"#;
+    let msg = ServerMessage::parse_resilient(typing_json);
+    assert!(msg.is_some());
+    assert!(matches!(msg.unwrap(), ServerMessage::Unknown));
+
+    let reaction_json = r#"{"type":"MessageReact","id":"m_1","channel_id":"c_1","user_id":"u_1","emoji_id":"👍"}"#;
+    let msg_react = ServerMessage::parse_resilient(reaction_json);
+    assert!(msg_react.is_some());
+    assert!(matches!(msg_react.unwrap(), ServerMessage::Unknown));
+}

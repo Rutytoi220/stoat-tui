@@ -1,4 +1,4 @@
-use crate::api::models::{Channel, Member, Message, Server, User};
+use crate::api::models::{Category, Channel, Member, Message, Server, User};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,7 +95,7 @@ impl ServerMessage {
                         None
                     }
                 }
-                _ => None,
+                _ => Some(ServerMessage::Unknown),
             }
         } else {
             None
@@ -134,11 +134,14 @@ pub fn parse_resilient_ready(val: &serde_json::Value) -> ServerMessage {
                     .and_then(|c| c.as_array())
                     .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                     .unwrap_or_default();
+                let categories = s_val.get("categories")
+                    .and_then(|c| serde_json::from_value::<Vec<Category>>(c.clone()).ok());
                 servers.push(Server {
                     id: id.to_string(),
                     name,
                     description,
                     channels,
+                    categories,
                     ..Default::default()
                 });
             }
@@ -159,12 +162,16 @@ pub fn parse_resilient_ready(val: &serde_json::Value) -> ServerMessage {
                 let name = c_val.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
                 let server = c_val.get("server").and_then(|s| s.as_str()).map(|s| s.to_string());
                 let description = c_val.get("description").and_then(|d| d.as_str()).map(|s| s.to_string());
+                let recipients = c_val.get("recipients")
+                    .and_then(|r| r.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect());
                 channels.push(Channel {
                     id: id.to_string(),
                     channel_type,
                     server,
                     name,
                     description,
+                    recipients,
                     ..Default::default()
                 });
             }

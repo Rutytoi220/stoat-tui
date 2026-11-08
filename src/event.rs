@@ -20,6 +20,7 @@ pub enum AppEvent {
     ApiMessageSent(Result<Message, String>),
     ApiMessagesFetched { channel_id: String, messages: Vec<Message> },
     ApiCurrentUser(User),
+    ApiUserFetched(User),
     ApiDmsFetched(Vec<Channel>),
     ApiSessionExpired,
     StartGateway { token: String, gateway_url: Option<String> },

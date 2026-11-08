@@ -304,6 +304,33 @@ impl DeltaClient {
         Ok(user)
     }
 
+    pub async fn fetch_user(&self, user_id: &str) -> Result<User> {
+        let url = format!("{}/users/{}", self.api_url, user_id);
+        log_debug!("GET {} (fetching user profile)", url);
+        let resp = self
+            .client
+            .get(&url)
+            .headers(self.headers())
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch user at {}", url))?;
+
+        let status = resp.status();
+        log_debug!("GET {} -> Status: {}", url, status);
+        if !status.is_success() {
+            let err_text = resp.text().await.unwrap_or_default();
+            log_warn!("GET {} failed with status {}: {}", url, status, err_text);
+            return Err(anyhow!("Failed to fetch user {}: HTTP {}", user_id, status));
+        }
+
+        let user: User = resp
+            .json()
+            .await
+            .context("Failed to parse user JSON")?;
+        log_info!("Fetched user: @{} ({})", user.username, user.id);
+        Ok(user)
+    }
+
     #[allow(dead_code)]
     pub async fn fetch_messages(&self, channel_id: &str, limit: u32) -> Result<Vec<Message>> {
         let url = format!(

@@ -102,18 +102,24 @@ impl<'a> Widget for ServersRail<'a> {
 
             let is_selected = is_focused && self.state.selected_server_index == idx;
 
-            // Get initials: e.g. "Stoat Official" -> "SO"
-            let initials: String = server
-                .name
-                .split_whitespace()
-                .filter_map(|w| w.chars().next())
-                .take(2)
-                .collect::<String>()
-                .to_uppercase();
-            let label = if initials.is_empty() {
-                server.name.chars().take(2).collect::<String>().to_uppercase()
+            // Generate 2-letter abbreviation badge: initials for multi-word (e.g. "Stoat Official" -> "SO"),
+            // or first 2 characters for single-word / short names (e.g. "Zero" -> "ZE", "Origin" -> "OR")
+            let words: Vec<&str> = server.name.split_whitespace().collect();
+            let label = if words.len() >= 2 {
+                let first = words[0].chars().next().unwrap_or('?');
+                let second = words[1].chars().next().unwrap_or('?');
+                format!("{}{}", first, second).to_uppercase()
+            } else if let Some(first_word) = words.first() {
+                let chars: Vec<char> = first_word.chars().collect();
+                if chars.len() >= 2 {
+                    format!("{}{}", chars[0], chars[1]).to_uppercase()
+                } else if let Some(&c) = chars.first() {
+                    format!("{} ", c).to_uppercase()
+                } else {
+                    "??".to_string()
+                }
             } else {
-                initials
+                "??".to_string()
             };
 
             let item_style = if is_server_active {

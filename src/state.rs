@@ -5,7 +5,9 @@ use chrono::Utc;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use ratatui::layout::Rect;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -145,6 +147,10 @@ pub struct AppState {
     pub messages: HashMap<String, Vec<Message>>,
     pub unread_counts: HashMap<String, usize>,
 
+    // Dynamic user resolution cache
+    pub pending_user_fetches: Arc<Mutex<HashSet<String>>>,
+    pub user_fetch_tx: Option<mpsc::UnboundedSender<String>>,
+
     // Precision hit-test rects from last render frame
     pub rect_rail: Rect,
     pub rect_server_items: Vec<(Option<String>, Rect)>, // None = DMs button, Some(id) = server
@@ -220,6 +226,8 @@ impl AppState {
             members: HashMap::new(),
             messages: HashMap::new(),
             unread_counts: HashMap::new(),
+            pending_user_fetches: Arc::new(Mutex::new(HashSet::new())),
+            user_fetch_tx: None,
 
             rect_rail: Rect::default(),
             rect_server_items: Vec::new(),
@@ -245,6 +253,42 @@ impl AppState {
 
     pub fn set_status(&mut self, text: impl Into<String>) {
         self.status_message = Some((text.into(), Utc::now()));
+    }
+
+    /// Resolve a user from the cache, or dispatch a non-blocking background fetch if missing.
+    pub fn resolve_user(&self, user_id: &str) -> Option<&User> {
+        if let Some(user) = self.users.get(user_id) {
+            return Some(user);
+        }
+
+        // Trigger background fetch if not already in-flight
+        if let Ok(mut pending) = self.pending_user_fetches.lock() {
+            if pending.insert(user_id.to_string()) {
+                if let Some(ref tx) = self.user_fetch_tx {
+                    let _ = tx.send(user_id.to_string());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Clear all mock demo data (servers, channels, mock messages, demo users) on real authentication
+    pub fn clear_mock_data(&mut self) {
+        self.servers.retain(|s| s.id != "srv_stoat" && s.id != "srv_rust");
+        self.channels.retain(|id, _| !id.starts_with("ch_stoat_") && !id.starts_with("ch_rust_") && !id.starts_with("dm_"));
+        self.server_channels.retain(|sid, _| sid != "srv_stoat" && sid != "srv_rust");
+        self.messages.retain(|cid, _| !cid.starts_with("ch_stoat_") && !cid.starts_with("ch_rust_") && !cid.starts_with("dm_"));
+        self.members.retain(|sid, _| sid != "srv_stoat" && sid != "srv_rust");
+        self.dms.retain(|ch| !ch.id.starts_with("dm_"));
+        self.unread_counts.retain(|cid, _| !cid.starts_with("ch_stoat_") && !cid.starts_with("ch_rust_"));
+        self.users.retain(|uid, _| uid != "user_me" && uid != "user_alice" && uid != "user_bob" && uid != "user_charlie" && uid != "user_dana" && uid != "user_eve");
+        if let Some(ref sid) = self.active_server_id {
+            if sid == "srv_stoat" || sid == "srv_rust" {
+                self.active_server_id = None;
+                self.active_channel_id = None;
+            }
+        }
     }
 
     pub fn active_channel(&self) -> Option<&Channel> {

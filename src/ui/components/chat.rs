@@ -75,8 +75,8 @@ impl<'a> Widget for ChatFeed<'a> {
         let mut rendered_lines: Vec<Line<'static>> = Vec::new();
 
         for msg in msgs {
-            // 1. Author header line
-            let user = self.state.users.get(&msg.author);
+            // 1. Author header line (resolved from cache or fetched asynchronously)
+            let user = self.state.resolve_user(&msg.author);
             let author_name = if let Some(ref m) = msg.masquerade {
                 m.name.clone().unwrap_or_else(|| "Anonymous".to_string())
             } else if let Some(u) = user {

@@ -242,13 +242,16 @@ impl Channel {
         }
         if self.channel_type == "DirectMessage" {
             if let Some(ref recipients) = self.recipients {
-                for r in recipients {
-                    if Some(r.as_str()) != current_user_id {
-                        if let Some(user) = users.get(r) {
-                            return user.name().to_string();
-                        }
-                        return format!("User {}", &r[..r.len().min(6)]);
+                let other_id = recipients
+                    .iter()
+                    .find(|&r| Some(r.as_str()) != current_user_id)
+                    .or_else(|| recipients.first());
+
+                if let Some(uid) = other_id {
+                    if let Some(user) = users.get(uid) {
+                        return user.name().to_string();
                     }
+                    return format!("User {}", &uid[..uid.len().min(6)]);
                 }
             }
             return "Direct Message".to_string();

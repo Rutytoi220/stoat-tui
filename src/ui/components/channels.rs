@@ -19,6 +19,11 @@ impl<'a> ChannelsSidebar<'a> {
         match &self.state.active_rail {
             ActiveRail::DirectMessages => {
                 for dm in &self.state.dms {
+                    if let Some(ref recipients) = dm.recipients {
+                        for r in recipients {
+                            let _ = self.state.resolve_user(r);
+                        }
+                    }
                     let name = dm.display_name(&self.state.users, self.state.current_user.as_ref().map(|u| u.id.as_str()));
                     items.push(SidebarItem::Channel {
                         id: dm.id.clone(),

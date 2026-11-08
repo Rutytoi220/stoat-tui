@@ -26,7 +26,25 @@ impl App {
             config.is_bot,
         )));
 
-        let state = AppState::new(config);
+        let (user_fetch_tx, mut user_fetch_rx) = mpsc::unbounded_channel::<String>();
+        let mut state = AppState::new(config);
+        state.user_fetch_tx = Some(user_fetch_tx);
+
+        let api_client_clone = api_client.clone();
+        let event_tx_clone = event_tx.clone();
+        tokio::spawn(async move {
+            while let Some(user_id) = user_fetch_rx.recv().await {
+                let client = api_client_clone.lock().await;
+                match client.fetch_user(&user_id).await {
+                    Ok(user) => {
+                        let _ = event_tx_clone.send(AppEvent::ApiUserFetched(user)).await;
+                    }
+                    Err(e) => {
+                        log_warn!("Background user fetch failed for {}: {}", user_id, e);
+                    }
+                }
+            }
+        });
 
         Self {
             state,
@@ -47,6 +65,9 @@ impl App {
             self.state.status_message = Some(("Please log in to connect".to_string(), chrono::Utc::now()));
             return;
         }
+
+        // Wipe mock data immediately upon starting an authenticated session
+        self.state.clear_mock_data();
 
         let token = token_opt.unwrap();
         log_info!("Startup: Found stored session token. Initiating startup authentication verification...");
@@ -170,6 +191,7 @@ impl App {
                 self.state.login_error = None;
                 self.state.login_step = LoginStep::Credentials;
                 self.state.show_login_modal = false;
+                self.state.clear_mock_data();
                 self.state.config.token = Some(token.clone());
                 self.state.config.is_bot = is_bot;
                 let _ = self.state.config.save();
@@ -203,12 +225,27 @@ impl App {
             AppEvent::ApiMessagesFetched { channel_id, mut messages } => {
                 // Stoat/Revolt Delta returns Latest first; sort by ULID id ascending for chronological feed
                 messages.sort_by(|a, b| a.id.cmp(&b.id));
+                for msg in &messages {
+                    let _ = self.state.resolve_user(&msg.author);
+                }
                 self.state.messages.insert(channel_id, messages);
             }
             AppEvent::ApiCurrentUser(user) => {
+                self.state.users.insert(user.id.clone(), user.clone());
                 self.state.current_user = Some(user);
             }
+            AppEvent::ApiUserFetched(user) => {
+                log_info!("Hydrated user into cache: @{} ({})", user.username, user.id);
+                self.state.users.insert(user.id.clone(), user);
+            }
             AppEvent::ApiDmsFetched(dms) => {
+                for dm in &dms {
+                    if let Some(ref recipients) = dm.recipients {
+                        for r in recipients {
+                            let _ = self.state.resolve_user(r);
+                        }
+                    }
+                }
                 self.state.dms = dms;
             }
             AppEvent::ApiSessionExpired => {
@@ -857,12 +894,17 @@ impl App {
 
     async fn handle_gateway(&mut self, event: GatewayEvent) {
         match event {
+            GatewayEvent::Connecting => {
+                log_info!("Gateway connecting event handled");
+                self.state.gateway_status = GatewayStatus::Connecting;
+            }
             GatewayEvent::Connected => {
                 log_info!("Gateway connected event handled");
                 self.state.gateway_status = GatewayStatus::Connecting;
             }
             GatewayEvent::Authenticated => {
                 log_info!("Gateway authenticated event handled: status set to ● Online");
+                self.state.clear_mock_data();
                 self.state.gateway_status = GatewayStatus::Connected { latency_ms: 20 };
                 self.state.set_status("● Online");
             }
@@ -875,6 +917,7 @@ impl App {
             }
             GatewayEvent::MessageReceived(msg) => match msg {
                 ServerMessage::Ready { users, servers, channels, members } => {
+                    self.state.clear_mock_data();
                     self.state.gateway_status = match self.state.gateway_status {
                         GatewayStatus::Connected { latency_ms } => GatewayStatus::Connected { latency_ms },
                         _ => GatewayStatus::Connected { latency_ms: 20 },
@@ -895,15 +938,37 @@ impl App {
                         self.state.servers.push(s);
                     }
                     for ch in channels {
-                        if let Some(ref sid) = ch.server {
-                            self.state.server_channels.entry(sid.clone()).or_default().push(ch.id.clone());
+                        let is_server_chan = ch.server.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+                        if is_server_chan {
+                            let sid = ch.server.clone().unwrap();
+                            self.state.server_channels.entry(sid).or_default().push(ch.id.clone());
                         } else if ch.channel_type == "DirectMessage" || ch.channel_type == "Group" {
                             self.state.dms.push(ch.clone());
                         }
                         self.state.channels.insert(ch.id.clone(), ch);
                     }
+
+                    // Also populate server_channels from s.channels if any
+                    for s in &self.state.servers {
+                        let entry = self.state.server_channels.entry(s.id.clone()).or_default();
+                        for cid in &s.channels {
+                            if !entry.contains(cid) {
+                                entry.push(cid.clone());
+                            }
+                        }
+                    }
+
                     for m in members {
                         self.state.members.entry(m.id.server.clone()).or_default().push(m);
+                    }
+
+                    // Pre-resolve all DM recipients
+                    for dm in &self.state.dms {
+                        if let Some(ref recipients) = dm.recipients {
+                            for r in recipients {
+                                let _ = self.state.resolve_user(r);
+                            }
+                        }
                     }
 
                     log_info!(
@@ -914,7 +979,7 @@ impl App {
                         self.state.dms.len()
                     );
 
-                    // Auto-select first available server and its first text channel
+                    // Auto-select first available real server and its first text channel, or DMs if no servers
                     if let Some(first_srv) = self.state.servers.first() {
                         let sid = first_srv.id.clone();
                         self.switch_to_server(Some(sid)).await;
@@ -923,6 +988,7 @@ impl App {
                     }
                 }
                 ServerMessage::Message(m) => {
+                    let _ = self.state.resolve_user(&m.author);
                     let channel_id = m.channel.clone();
                     let is_active_channel = self.state.active_channel_id.as_deref() == Some(&channel_id);
 
@@ -1092,6 +1158,17 @@ impl App {
                 }
                 if text_cid.is_none() {
                     text_cid = cids.first().cloned();
+                }
+            }
+
+            if text_cid.is_none() {
+                for (cid, chan) in &self.state.channels {
+                    if chan.server.as_deref() == Some(sid) {
+                        if chan.channel_type == "TextChannel" || chan.channel_type == "Text" {
+                            text_cid = Some(cid.clone());
+                            break;
+                        }
+                    }
                 }
             }
 

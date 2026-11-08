@@ -12,6 +12,7 @@ use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 #[allow(dead_code, clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum GatewayEvent {
+    Connecting,
     Connected,
     Authenticated,
     Latency(u64),
@@ -40,14 +41,16 @@ impl BonfireClient {
             let max_backoff = Duration::from_secs(30);
 
             loop {
-                let ws_url = if self.gateway_url.contains('?') {
+                let ws_url = if self.gateway_url.contains("format=") {
+                    self.gateway_url.clone()
+                } else if self.gateway_url.contains('?') {
                     format!("{}&format=json&version=1", self.gateway_url)
                 } else {
                     format!("{}?format=json&version=1", self.gateway_url)
                 };
 
                 log_info!("Connecting to Bonfire gateway at {}", ws_url);
-                let _ = self.event_tx.send(GatewayEvent::Disconnected("Connecting...".to_string())).await;
+                let _ = self.event_tx.send(GatewayEvent::Connecting).await;
 
                 match connect_async(&ws_url).await {
                     Ok((ws_stream, _)) => {
@@ -71,7 +74,7 @@ impl BonfireClient {
                             }
                         }
 
-                        // Set up heartbeat timer channel
+                        // Set up heartbeat timer channel: sends {"type": "Ping", "data": 0} every 20 seconds
                         let (ping_tx, mut ping_rx) = mpsc::channel::<()>(4);
                         let heartbeat_task = tokio::spawn(async move {
                             loop {
@@ -85,11 +88,7 @@ impl BonfireClient {
                         loop {
                             tokio::select! {
                                 Some(_) = ping_rx.recv() => {
-                                    let now_ms = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis() as u64;
-                                    let ping = ClientMessage::Ping { data: now_ms };
+                                    let ping = ClientMessage::Ping { data: 0 };
                                     if let Ok(json) = serde_json::to_string(&ping) {
                                         if write.send(WsMessage::Text(json)).await.is_err() {
                                             log_warn!("Failed to send gateway heartbeat ping");
