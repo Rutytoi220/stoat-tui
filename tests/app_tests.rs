@@ -705,3 +705,24 @@ fn test_gateway_resilience_and_heartbeat_ping() {
     assert!(msg_react.is_some());
     assert!(matches!(msg_react.unwrap(), ServerMessage::Unknown));
 }
+
+#[test]
+fn test_bonfire_url_construction() {
+    use stoat_tui::gateway::build_gateway_url;
+
+    // 1. Bare domain without path or query -> ensures trailing slash and ?format=json
+    let u1 = build_gateway_url("wss://events.stoat.chat").unwrap();
+    assert_eq!(u1.as_str(), "wss://events.stoat.chat/?format=json");
+
+    // 2. Erroneous version=1 and missing path -> strips version=1, adds path slash, sets ?format=json
+    let u2 = build_gateway_url("wss://events.stoat.chat?format=json&version=1").unwrap();
+    assert_eq!(u2.as_str(), "wss://events.stoat.chat/?format=json");
+
+    // 3. Trailing slash already present
+    let u3 = build_gateway_url("wss://events.stoat.chat/").unwrap();
+    assert_eq!(u3.as_str(), "wss://events.stoat.chat/?format=json");
+
+    // 4. Subpath preserved with ?format=json
+    let u4 = build_gateway_url("wss://api.revolt.chat/ws").unwrap();
+    assert_eq!(u4.as_str(), "wss://api.revolt.chat/ws?format=json");
+}

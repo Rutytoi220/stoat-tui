@@ -142,7 +142,7 @@ impl App {
         let event_tx = self.event_tx.clone();
         let api_client = self.api_client.clone();
 
-        let gw_url = gateway_url.unwrap_or_else(|| "wss://ws.stoat.chat".to_string());
+        let gw_url = gateway_url.unwrap_or_else(|| "wss://events.stoat.chat".to_string());
 
         // Spawn a gateway runner that queries GET / on the API endpoint to extract the active WebSocket URL
         let handle = tokio::spawn(async move {

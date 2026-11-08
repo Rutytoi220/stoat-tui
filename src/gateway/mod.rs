@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
+use url::Url;
 
 #[allow(dead_code, clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
@@ -18,6 +19,25 @@ pub enum GatewayEvent {
     Latency(u64),
     MessageReceived(ServerMessage),
     Disconnected(String),
+}
+
+/// Parse and sanitize the gateway WebSocket URL using the `url` crate.
+/// Ensures valid path target (e.g. "/" if empty) and strictly "?format=json".
+pub fn build_gateway_url(raw_url: &str) -> Result<Url, String> {
+    let mut ws_url = Url::parse(raw_url)
+        .map_err(|e| format!("Invalid gateway URL '{}': {}", raw_url, e))?;
+
+    // Ensure valid path target
+    if ws_url.path().is_empty() {
+        ws_url.set_path("/");
+    }
+
+    // Set ONLY format=json
+    ws_url.query_pairs_mut()
+        .clear()
+        .append_pair("format", "json");
+
+    Ok(ws_url)
 }
 
 pub struct BonfireClient {
@@ -41,20 +61,23 @@ impl BonfireClient {
             let max_backoff = Duration::from_secs(30);
 
             loop {
-                let ws_url = if self.gateway_url.contains("format=") {
-                    self.gateway_url.clone()
-                } else if self.gateway_url.contains('?') {
-                    format!("{}&format=json&version=1", self.gateway_url)
-                } else {
-                    format!("{}?format=json&version=1", self.gateway_url)
+                let ws_url = match build_gateway_url(&self.gateway_url) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        log_error!("Gateway URL error: {}", e);
+                        let _ = self.event_tx.send(GatewayEvent::Disconnected(e)).await;
+                        sleep(backoff).await;
+                        continue;
+                    }
                 };
 
-                log_info!("Connecting to Bonfire gateway at {}", ws_url);
+                let ws_url_str = ws_url.as_str();
+                log_info!("Connecting to Bonfire gateway at {}", ws_url_str);
                 let _ = self.event_tx.send(GatewayEvent::Connecting).await;
 
-                match connect_async(&ws_url).await {
+                match connect_async(ws_url_str).await {
                     Ok((ws_stream, _)) => {
-                        log_info!("Connected to Bonfire gateway WebSocket at {}", ws_url);
+                        log_info!("Connected to Bonfire gateway WebSocket at {}", ws_url_str);
                         let _ = self.event_tx.send(GatewayEvent::Connected).await;
                         backoff = Duration::from_secs(1); // Reset backoff on successful connect
 
