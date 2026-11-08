@@ -70,15 +70,15 @@ impl<'a> Widget for StatusBar<'a> {
 
         // 2. Dynamic contextual hotkeys for the current pane
         let pane_hints = match self.state.focus {
-            Focus::Servers => "Servers [ ↑/↓: Select • Enter: Switch • Tab: Channels ]",
-            Focus::Channels => "Channels [ ↑/↓: Select • Enter: Switch • Tab: Chat ]",
-            Focus::Chat => "Chat [ ↑/↓/PgUp/PgDn: Scroll • i: Type • Tab: Input ]",
-            Focus::Input => "Input [ Enter: Send • Esc: Unfocus • Tab: Next ]",
-            Focus::Members => "Members [ ↑/↓: Browse • F4: Toggle • Tab: Servers ]",
+            Focus::Servers => "Servers [ ↑/↓: Select • Enter: Switch ]",
+            Focus::Channels => "Channels [ ↑/↓: Select • Enter: Switch ]",
+            Focus::Chat => "Chat [ ↑/↓: Scroll • i: Type ]",
+            Focus::Input => "Input [ Enter: Send • Esc: Unfocus ]",
+            Focus::Members => "Members [ ↑/↓: Browse • F4: Toggle ]",
         };
 
         for ch in pane_hints.chars() {
-            if x >= area.right().saturating_sub(35) {
+            if x >= area.right().saturating_sub(68) {
                 break;
             }
             buf[(x, y)]
@@ -87,15 +87,15 @@ impl<'a> Widget for StatusBar<'a> {
             x += 1;
         }
 
-        // Global hint
-        let global_hint = " • Ctrl+P: Jump • F4: Members";
-        for ch in global_hint.chars() {
-            if x >= area.right().saturating_sub(25) {
+        // Fast navigation hints
+        let nav_hint = " • Alt+J/K: Channel | Ctrl+Alt+J/K: Server | Alt+Shift+J/K: Unread";
+        for ch in nav_hint.chars() {
+            if x >= area.right().saturating_sub(22) {
                 break;
             }
             buf[(x, y)]
                 .set_char(ch)
-                .set_fg(theme.muted);
+                .set_fg(theme.primary);
             x += 1;
         }
 

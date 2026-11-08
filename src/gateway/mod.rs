@@ -93,7 +93,7 @@ impl BonfireClient {
                                 msg = read.next() => {
                                     match msg {
                                         Some(Ok(WsMessage::Text(text))) => {
-                                            if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
+                                            if let Some(server_msg) = ServerMessage::parse_resilient(&text) {
                                                 match &server_msg {
                                                     ServerMessage::Authenticated => {
                                                         let _ = self.event_tx.send(GatewayEvent::Authenticated).await;

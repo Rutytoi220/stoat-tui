@@ -375,8 +375,6 @@ impl<'a> Widget for LoginModal<'a> {
                 "⚠ Server error: HTTP 401 Unauthorized (endpoint rejected request or invalid session)".to_string()
             } else if err.starts_with('⚠') {
                 err.clone()
-            } else if err.starts_with("Error:") || err.starts_with("HTTP") {
-                format!("⚠ {}", err)
             } else {
                 format!("⚠ {}", err)
             };

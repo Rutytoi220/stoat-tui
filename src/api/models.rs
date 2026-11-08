@@ -95,6 +95,7 @@ pub struct RevoltApiError {
 pub struct User {
     #[serde(rename = "_id")]
     pub id: String,
+    #[serde(default)]
     pub username: String,
     #[serde(default)]
     pub display_name: Option<String>,
@@ -179,9 +180,13 @@ pub struct FileObject {
 pub struct Server {
     #[serde(rename = "_id")]
     pub id: String,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
     pub icon: Option<FileObject>,
+    #[serde(default)]
     pub banner: Option<FileObject>,
     #[serde(default)]
     pub channels: Vec<String>,
@@ -212,7 +217,7 @@ pub struct Role {
 pub struct Channel {
     #[serde(rename = "_id")]
     pub id: String,
-    #[serde(rename = "channel_type")]
+    #[serde(alias = "type", rename = "channel_type", default)]
     pub channel_type: String,
     #[serde(default)]
     pub server: Option<String>,
@@ -254,13 +259,15 @@ impl Channel {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MemberId {
+    #[serde(default)]
     pub server: String,
+    #[serde(default)]
     pub user: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Member {
-    #[serde(rename = "_id")]
+    #[serde(rename = "_id", default)]
     pub id: MemberId,
     #[serde(default)]
     pub nickname: Option<String>,

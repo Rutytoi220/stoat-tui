@@ -317,4 +317,98 @@ fn test_gateway_messages_serde() {
         }
         _ => panic!("Expected Ready message"),
     }
+
+    // 2. Resilient Ready fallback with extra/missing fields and alternative type naming
+    let malformed_ready = r#"{
+        "type": "Ready",
+        "users": [
+            { "_id": "u2", "username": "bob", "extra_garbage_field": true },
+            { "_id": "u3" }
+        ],
+        "servers": [
+            { "_id": "s2", "name": "Resilient Server", "unexpected_field": 42 }
+        ],
+        "channels": [
+            { "_id": "c2", "type": "TextChannel", "name": "dev", "server": "s2" },
+            { "_id": "c3", "channel_type": "VoiceChannel" }
+        ],
+        "members": [
+            { "_id": { "server": "s2", "user": "u2" }, "nickname": "Bobby" }
+        ]
+    }"#;
+
+    let res_msg = ServerMessage::parse_resilient(malformed_ready).expect("Failed to parse resilient Ready");
+    match res_msg {
+        ServerMessage::Ready { users, servers, channels, members } => {
+            assert_eq!(users.len(), 2);
+            assert_eq!(users[0].id, "u2");
+            assert_eq!(users[0].username, "bob");
+            assert_eq!(users[1].id, "u3");
+
+            assert_eq!(servers.len(), 1);
+            assert_eq!(servers[0].id, "s2");
+            assert_eq!(servers[0].name, "Resilient Server");
+
+            assert_eq!(channels.len(), 2);
+            assert_eq!(channels[0].id, "c2");
+            assert_eq!(channels[0].channel_type, "TextChannel");
+            assert_eq!(channels[0].name.as_deref(), Some("dev"));
+
+            assert_eq!(members.len(), 1);
+            assert_eq!(members[0].id.server, "s2");
+            assert_eq!(members[0].id.user, "u2");
+        }
+        _ => panic!("Expected Ready message from resilient parser"),
+    }
+}
+
+#[tokio::test]
+async fn test_fast_keyboard_navigation_logic() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let mut app = stoat_tui::app::App::new(Config::default(), tx);
+    app.state.load_demo_data();
+
+    // Verify initial demo state
+    assert_eq!(app.state.servers.len(), 2);
+    let s0_id = app.state.servers[0].id.clone();
+    let s1_id = app.state.servers[1].id.clone();
+
+    // Switch to first server
+    app.switch_to_server(Some(s0_id.clone())).await;
+    assert_eq!(app.state.active_server_id.as_deref(), Some(s0_id.as_str()));
+
+    // Test channel cycling in current server
+    let s0_channels = app.state.current_channel_ids();
+    assert!(s0_channels.len() >= 2);
+    let first_ch = s0_channels[0].clone();
+    let second_ch = s0_channels[1].clone();
+
+    assert_eq!(app.state.active_channel_id.as_deref(), Some(first_ch.as_str()));
+
+    // Alt+j / Next channel
+    app.nav_next_channel().await;
+    assert_eq!(app.state.active_channel_id.as_deref(), Some(second_ch.as_str()));
+
+    // Alt+k / Prev channel
+    app.nav_prev_channel().await;
+    assert_eq!(app.state.active_channel_id.as_deref(), Some(first_ch.as_str()));
+
+    // Ctrl+Alt+j / Next server
+    app.nav_next_server().await;
+    assert_eq!(app.state.active_server_id.as_deref(), Some(s1_id.as_str()));
+
+    // Ctrl+Alt+k / Prev server (back to first server)
+    app.nav_prev_server().await;
+    assert_eq!(app.state.active_server_id.as_deref(), Some(s0_id.as_str()));
+
+    // Unread navigation test: clear and mark second channel in s0 with unread count
+    app.state.unread_counts.clear();
+    app.state.unread_counts.insert(second_ch.clone(), 3);
+    assert_eq!(app.get_unread_channels_ordered().len(), 1);
+
+    // Alt+Shift+j / Jump to next unread
+    app.nav_next_unread().await;
+    assert_eq!(app.state.active_channel_id.as_deref(), Some(second_ch.as_str()));
+    // Unread count cleared on switch
+    assert_eq!(app.state.unread_counts.get(&second_ch), None);
 }

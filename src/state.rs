@@ -247,14 +247,26 @@ impl AppState {
         self.active_server_id.as_ref().and_then(|id| self.servers.iter().find(|s| &s.id == id))
     }
 
+    pub fn current_channel_ids(&self) -> Vec<String> {
+        if let Some(ref sid) = self.active_server_id {
+            self.server_channels.get(sid).cloned().unwrap_or_default()
+        } else {
+            self.dms.iter().map(|d| d.id.clone()).collect()
+        }
+    }
+
     pub fn select_server(&mut self, server_id: Option<String>) {
         if let Some(id) = server_id {
             self.active_rail = ActiveRail::Server(id.clone());
             self.active_server_id = Some(id.clone());
 
-            // Switch to first channel of this server if available
+            // Switch to first channel of this server if available (preferring text channel)
             if let Some(chan_ids) = self.server_channels.get(&id) {
-                if let Some(first) = chan_ids.first() {
+                let first_text = chan_ids.iter().find(|cid| {
+                    self.channels.get(*cid).map(|c| c.channel_type == "TextChannel" || c.channel_type == "Text").unwrap_or(false)
+                }).or_else(|| chan_ids.first());
+
+                if let Some(first) = first_text {
                     self.active_channel_id = Some(first.clone());
                     self.chat_scroll_offset = 0;
                     self.selected_channel_index = 0;

@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::event::AppEvent;
 use crate::gateway::messages::ServerMessage;
 use crate::gateway::{BonfireClient, GatewayEvent};
-use crate::state::{AppState, Focus, GatewayStatus, LoginStep, LoginTab, PaletteItemType};
+use crate::state::{ActiveRail, AppState, Focus, GatewayStatus, LoginStep, LoginTab, PaletteItemType};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,17 +45,22 @@ impl App {
 
         let gw_url = gateway_url.unwrap_or_else(|| "wss://ws.stoat.chat".to_string());
 
-        // Spawn a gateway runner that first checks metadata if needed
+        // Spawn a gateway runner that queries GET / on the API endpoint to extract the active WebSocket URL
         let handle = tokio::spawn(async move {
             let (gw_tx, mut gw_rx) = mpsc::channel(128);
 
-            // Fetch gateway URL from root metadata if not explicitly configured
+            // Dynamic Gateway URL: Query GET / on API endpoint to extract active WebSocket URL (ws field)
             let effective_gw_url = {
                 let client = api_client.lock().await;
-                if let Ok(meta) = client.fetch_metadata().await {
-                    meta.ws.unwrap_or(gw_url)
-                } else {
-                    gw_url
+                match client.fetch_metadata().await {
+                    Ok(meta) => {
+                        if let Some(ws) = meta.ws {
+                            ws
+                        } else {
+                            gw_url
+                        }
+                    }
+                    Err(_) => gw_url,
                 }
             };
 
@@ -117,7 +122,9 @@ impl App {
                     self.state.set_status(format!("Error sending message: {}", err));
                 }
             },
-            AppEvent::ApiMessagesFetched { channel_id, messages } => {
+            AppEvent::ApiMessagesFetched { channel_id, mut messages } => {
+                // Stoat/Revolt Delta returns Latest first; sort by ULID id ascending for chronological feed
+                messages.sort_by(|a, b| a.id.cmp(&b.id));
                 self.state.messages.insert(channel_id, messages);
             }
             AppEvent::ApiCurrentUser(user) => {
@@ -211,17 +218,13 @@ impl App {
                     if let Some(item) = items.get(self.state.command_palette_selected) {
                         match item.item_type {
                             PaletteItemType::Server => {
-                                self.state.select_server(Some(item.id.clone()));
+                                self.switch_to_server(Some(item.id.clone())).await;
                             }
                             PaletteItemType::Channel => {
-                                if let Some(ref sid) = item.server_id {
-                                    self.state.select_server(Some(sid.clone()));
-                                }
-                                self.state.select_channel(item.id.clone());
+                                self.jump_to_channel(item.id.clone(), item.server_id.clone()).await;
                             }
                             PaletteItemType::DirectMessage => {
-                                self.state.select_server(None);
-                                self.state.select_channel(item.id.clone());
+                                self.jump_to_channel(item.id.clone(), None).await;
                             }
                         }
                     }
@@ -429,6 +432,57 @@ impl App {
             return;
         }
 
+        // Fast Keyboard Navigation Shortcuts
+        // 1. Server Switching: Ctrl + Alt + j/k OR Ctrl + Alt + Down/Up
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Down => {
+                    self.nav_next_server().await;
+                    return;
+                }
+                KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Up => {
+                    self.nav_prev_server().await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // 2. Unread Navigation: Alt + Shift + j/k OR Alt + Shift + Down/Up
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && (key.modifiers.contains(KeyModifiers::SHIFT) || matches!(key.code, KeyCode::Char('J') | KeyCode::Char('K')))
+        {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Down => {
+                    self.nav_next_unread().await;
+                    return;
+                }
+                KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Up => {
+                    self.nav_prev_unread().await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // 3. Channel Switching: Alt + j/k OR Alt + Down/Up
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.nav_next_channel().await;
+                    return;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.nav_prev_channel().await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // Member Rail toggle (F4)
         if key.code == KeyCode::F(4) {
             self.state.show_member_rail = !self.state.show_member_rail;
@@ -490,9 +544,9 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if self.state.selected_server_index == 0 {
-                        self.state.select_server(None);
+                        self.switch_to_server(None).await;
                     } else if let Some(server) = self.state.servers.get(self.state.selected_server_index - 1) {
-                        self.state.select_server(Some(server.id.clone()));
+                        self.switch_to_server(Some(server.id.clone())).await;
                     }
                 }
                 _ => {}
@@ -511,7 +565,7 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some((cid, _)) = self.state.rect_channel_items.get(self.state.selected_channel_index) {
-                        self.state.select_channel(cid.clone());
+                        self.switch_to_channel(cid.clone()).await;
                     }
                 }
                 _ => {}
@@ -609,16 +663,12 @@ impl App {
                         let items = self.state.get_palette_items();
                         if let Some(item) = items.get(inner_y) {
                             match item.item_type {
-                                PaletteItemType::Server => self.state.select_server(Some(item.id.clone())),
+                                PaletteItemType::Server => self.switch_to_server(Some(item.id.clone())).await,
                                 PaletteItemType::Channel => {
-                                    if let Some(ref sid) = item.server_id {
-                                        self.state.select_server(Some(sid.clone()));
-                                    }
-                                    self.state.select_channel(item.id.clone());
+                                    self.jump_to_channel(item.id.clone(), item.server_id.clone()).await;
                                 }
                                 PaletteItemType::DirectMessage => {
-                                    self.state.select_server(None);
-                                    self.state.select_channel(item.id.clone());
+                                    self.jump_to_channel(item.id.clone(), None).await;
                                 }
                             }
                             self.state.show_command_palette = false;
@@ -644,7 +694,7 @@ impl App {
 
                     for (srv_opt, rect) in &self.state.rect_server_items {
                         if my >= rect.top() && my <= rect.bottom() {
-                            self.state.select_server(srv_opt.clone());
+                            self.switch_to_server(srv_opt.clone()).await;
                             break;
                         }
                     }
@@ -658,7 +708,7 @@ impl App {
 
                     for (cid, rect) in &self.state.rect_channel_items {
                         if my == rect.top() {
-                            self.state.select_channel(cid.clone());
+                            self.switch_to_channel(cid.clone()).await;
                             break;
                         }
                     }
@@ -721,6 +771,13 @@ impl App {
             }
             GatewayEvent::MessageReceived(msg) => match msg {
                 ServerMessage::Ready { users, servers, channels, members } => {
+                    self.state.users.clear();
+                    self.state.servers.clear();
+                    self.state.channels.clear();
+                    self.state.server_channels.clear();
+                    self.state.dms.clear();
+                    self.state.members.clear();
+
                     for u in users {
                         self.state.users.insert(u.id.clone(), u);
                     }
@@ -730,7 +787,7 @@ impl App {
                     for ch in channels {
                         if let Some(ref sid) = ch.server {
                             self.state.server_channels.entry(sid.clone()).or_default().push(ch.id.clone());
-                        } else if ch.channel_type == "DirectMessage" {
+                        } else if ch.channel_type == "DirectMessage" || ch.channel_type == "Group" {
                             self.state.dms.push(ch.clone());
                         }
                         self.state.channels.insert(ch.id.clone(), ch);
@@ -739,11 +796,12 @@ impl App {
                         self.state.members.entry(m.id.server.clone()).or_default().push(m);
                     }
 
-                    // Auto-select first server and channel if none selected
-                    if self.state.active_server_id.is_none() {
-                        if let Some(first_srv) = self.state.servers.first() {
-                            self.state.select_server(Some(first_srv.id.clone()));
-                        }
+                    // Auto-select first available server and its first text channel
+                    if let Some(first_srv) = self.state.servers.first() {
+                        let sid = first_srv.id.clone();
+                        self.switch_to_server(Some(sid)).await;
+                    } else if !self.state.dms.is_empty() {
+                        self.switch_to_server(None).await;
                     }
                 }
                 ServerMessage::Message(m) => {
@@ -855,6 +913,259 @@ impl App {
 
                 let _ = tx.send(AppEvent::ApiMessageSent(Ok(bot_msg))).await;
             });
+        }
+    }
+
+    pub async fn fetch_channel_messages(&self, channel_id: String) {
+        let api = self.api_client.clone();
+        let tx = self.event_tx.clone();
+        let cid = channel_id.clone();
+
+        tokio::spawn(async move {
+            let client = api.lock().await;
+            if let Ok(mut messages) = client.fetch_messages(&cid, 50).await {
+                messages.sort_by(|a, b| a.id.cmp(&b.id));
+                let _ = tx.send(AppEvent::ApiMessagesFetched {
+                    channel_id: cid,
+                    messages,
+                }).await;
+            }
+        });
+    }
+
+    pub async fn switch_to_channel(&mut self, channel_id: String) {
+        self.state.active_channel_id = Some(channel_id.clone());
+        self.state.chat_scroll_offset = 0;
+        self.state.unread_counts.remove(&channel_id);
+
+        let current_cids = self.state.current_channel_ids();
+        if let Some(pos) = current_cids.iter().position(|id| id == &channel_id) {
+            self.state.selected_channel_index = pos;
+        }
+
+        self.fetch_channel_messages(channel_id).await;
+    }
+
+    pub async fn switch_to_server(&mut self, server_id: Option<String>) {
+        if let Some(ref sid) = server_id {
+            self.state.active_rail = ActiveRail::Server(sid.clone());
+            self.state.active_server_id = Some(sid.clone());
+
+            if let Some(pos) = self.state.servers.iter().position(|s| &s.id == sid) {
+                self.state.selected_server_index = pos + 1;
+            }
+
+            // Find first text channel in this server
+            let mut text_cid = None;
+            if let Some(cids) = self.state.server_channels.get(sid) {
+                for cid in cids {
+                    if let Some(chan) = self.state.channels.get(cid) {
+                        if chan.channel_type == "TextChannel" || chan.channel_type == "Text" {
+                            text_cid = Some(cid.clone());
+                            break;
+                        }
+                    }
+                }
+                if text_cid.is_none() {
+                    text_cid = cids.first().cloned();
+                }
+            }
+
+            if let Some(cid) = text_cid {
+                self.switch_to_channel(cid).await;
+            } else {
+                self.state.active_channel_id = None;
+                self.state.chat_scroll_offset = 0;
+            }
+        } else {
+            self.state.active_rail = ActiveRail::DirectMessages;
+            self.state.active_server_id = None;
+            self.state.selected_server_index = 0;
+
+            if let Some(first_dm) = self.state.dms.first() {
+                self.switch_to_channel(first_dm.id.clone()).await;
+            } else {
+                self.state.active_channel_id = None;
+                self.state.chat_scroll_offset = 0;
+            }
+        }
+    }
+
+    pub async fn jump_to_channel(&mut self, channel_id: String, server_id: Option<String>) {
+        if let Some(ref sid) = server_id {
+            self.state.active_rail = ActiveRail::Server(sid.clone());
+            self.state.active_server_id = Some(sid.clone());
+            if let Some(pos) = self.state.servers.iter().position(|s| &s.id == sid) {
+                self.state.selected_server_index = pos + 1;
+            }
+        } else {
+            self.state.active_rail = ActiveRail::DirectMessages;
+            self.state.active_server_id = None;
+            self.state.selected_server_index = 0;
+        }
+
+        self.switch_to_channel(channel_id).await;
+    }
+
+    pub fn get_server_targets(&self) -> Vec<Option<String>> {
+        let mut targets = vec![None]; // None = Direct Messages
+        for s in &self.state.servers {
+            targets.push(Some(s.id.clone()));
+        }
+        targets
+    }
+
+    pub async fn nav_next_server(&mut self) {
+        let targets = self.get_server_targets();
+        if targets.is_empty() {
+            return;
+        }
+
+        let cur_idx = targets
+            .iter()
+            .position(|opt| opt == &self.state.active_server_id)
+            .unwrap_or(0);
+
+        let next_idx = (cur_idx + 1) % targets.len();
+        let target = targets[next_idx].clone();
+        self.switch_to_server(target).await;
+    }
+
+    pub async fn nav_prev_server(&mut self) {
+        let targets = self.get_server_targets();
+        if targets.is_empty() {
+            return;
+        }
+
+        let cur_idx = targets
+            .iter()
+            .position(|opt| opt == &self.state.active_server_id)
+            .unwrap_or(0);
+
+        let prev_idx = if cur_idx == 0 {
+            targets.len() - 1
+        } else {
+            cur_idx - 1
+        };
+        let target = targets[prev_idx].clone();
+        self.switch_to_server(target).await;
+    }
+
+    pub async fn nav_next_channel(&mut self) {
+        let channels = self.state.current_channel_ids();
+        if channels.is_empty() {
+            return;
+        }
+
+        let cur_idx = self
+            .state
+            .active_channel_id
+            .as_ref()
+            .and_then(|cid| channels.iter().position(|id| id == cid))
+            .unwrap_or(0);
+
+        let next_idx = (cur_idx + 1) % channels.len();
+        let next_cid = channels[next_idx].clone();
+        self.switch_to_channel(next_cid).await;
+    }
+
+    pub async fn nav_prev_channel(&mut self) {
+        let channels = self.state.current_channel_ids();
+        if channels.is_empty() {
+            return;
+        }
+
+        let cur_idx = self
+            .state
+            .active_channel_id
+            .as_ref()
+            .and_then(|cid| channels.iter().position(|id| id == cid))
+            .unwrap_or(0);
+
+        let prev_idx = if cur_idx == 0 {
+            channels.len() - 1
+        } else {
+            cur_idx - 1
+        };
+        let prev_cid = channels[prev_idx].clone();
+        self.switch_to_channel(prev_cid).await;
+    }
+
+    pub fn get_all_channels_ordered(&self) -> Vec<(String, Option<String>)> {
+        let mut list = Vec::new();
+        for dm in &self.state.dms {
+            list.push((dm.id.clone(), None));
+        }
+        for srv in &self.state.servers {
+            if let Some(cids) = self.state.server_channels.get(&srv.id) {
+                for cid in cids {
+                    list.push((cid.clone(), Some(srv.id.clone())));
+                }
+            }
+        }
+        list
+    }
+
+    pub fn get_unread_channels_ordered(&self) -> Vec<(String, Option<String>)> {
+        self.get_all_channels_ordered()
+            .into_iter()
+            .filter(|(cid, _)| self.state.unread_counts.get(cid).copied().unwrap_or(0) > 0)
+            .collect()
+    }
+
+    pub async fn nav_next_unread(&mut self) {
+        let unreads = self.get_unread_channels_ordered();
+        if unreads.is_empty() {
+            self.state.set_status("No unread channels");
+            return;
+        }
+
+        let all = self.get_all_channels_ordered();
+        let cur_pos = self
+            .state
+            .active_channel_id
+            .as_ref()
+            .and_then(|cid| all.iter().position(|(id, _)| id == cid))
+            .unwrap_or(0);
+
+        let next_target = unreads
+            .iter()
+            .find(|(cid, _)| {
+                let pos = all.iter().position(|(id, _)| id == cid).unwrap_or(0);
+                pos > cur_pos
+            })
+            .or_else(|| unreads.first());
+
+        if let Some((cid, srv_opt)) = next_target.cloned() {
+            self.jump_to_channel(cid, srv_opt).await;
+        }
+    }
+
+    pub async fn nav_prev_unread(&mut self) {
+        let unreads = self.get_unread_channels_ordered();
+        if unreads.is_empty() {
+            self.state.set_status("No unread channels");
+            return;
+        }
+
+        let all = self.get_all_channels_ordered();
+        let cur_pos = self
+            .state
+            .active_channel_id
+            .as_ref()
+            .and_then(|cid| all.iter().position(|(id, _)| id == cid))
+            .unwrap_or(0);
+
+        let prev_target = unreads
+            .iter()
+            .rfind(|(cid, _)| {
+                let pos = all.iter().position(|(id, _)| id == cid).unwrap_or(0);
+                pos < cur_pos
+            })
+            .or_else(|| unreads.last());
+
+        if let Some((cid, srv_opt)) = prev_target.cloned() {
+            self.jump_to_channel(cid, srv_opt).await;
         }
     }
 }
