@@ -17,6 +17,18 @@ pub struct LoginPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MfaSessionLoginPayload {
+    pub mfa_ticket: String,
+    pub mfa_response: MfaResponse,
+    pub friendly_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MfaResponse {
+    pub totp_code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MfaTotpPayload {
     pub mfa_ticket: String,
     pub code: String,

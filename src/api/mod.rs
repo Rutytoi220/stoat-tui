@@ -155,12 +155,13 @@ impl DeltaClient {
     }
 
     pub async fn verify_mfa_totp(&self, ticket: &str, code: &str) -> Result<LoginResponse> {
-        let url = format!("{}/auth/mfa/ticket", self.api_url);
-        let payload = MfaTicketPayload {
-            ticket: ticket.to_string(),
-            result: MfaTicketResult::Totp {
-                code: code.to_string(),
+        let url = format!("{}/auth/session/login", self.api_url);
+        let payload = MfaSessionLoginPayload {
+            mfa_ticket: ticket.to_string(),
+            mfa_response: MfaResponse {
+                totp_code: code.to_string(),
             },
+            friendly_name: "stoat-tui".to_string(),
         };
 
         // Ensure the request does NOT send an x-session-token header
@@ -170,37 +171,17 @@ impl DeltaClient {
         let resp = self
             .client
             .post(&url)
-            .headers(anon_headers.clone())
+            .headers(anon_headers)
             .json(&payload)
             .send()
             .await
             .with_context(|| format!("Failed to connect to API server at {}", url))?;
 
-        let mut status = resp.status();
-        let mut raw_body = resp.text().await.unwrap_or_default();
-
-        // If the server rejects with HTTP 400 Bad Request, retry with fallback payload:
-        // { "ticket": "<mfa_ticket>", "code": "<code>" }
-        if status == reqwest::StatusCode::BAD_REQUEST {
-            let fallback_payload = MfaTicketFallbackPayload {
-                ticket: ticket.to_string(),
-                code: code.to_string(),
-            };
-            if let Ok(retry_resp) = self
-                .client
-                .post(&url)
-                .headers(anon_headers)
-                .json(&fallback_payload)
-                .send()
-                .await
-            {
-                status = retry_resp.status();
-                raw_body = retry_resp.text().await.unwrap_or_default();
-            }
-        }
+        let status = resp.status();
+        let raw_body = resp.text().await.unwrap_or_default();
 
         if !status.is_success() {
-            // 1. Attempt to extract exact JSON error type from the server
+            // Attempt to deserialize standard Stoat/Revolt JSON error
             if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&raw_body) {
                 let error_type = json_val
                     .get("type")
@@ -209,30 +190,15 @@ impl DeltaClient {
                     .or_else(|| json_val.get("message").and_then(|v| v.as_str()));
 
                 if let Some(err_type) = error_type {
-                    let description = match err_type {
-                        "InvalidCode" => "Invalid 2FA code. Please try again.",
-                        "InvalidTicket" => "MFA session timed out or invalid ticket. Please log in again.",
-                        "TooManyRequests" => "Too many verification attempts, please wait and try again",
-                        _ => "",
-                    };
-
-                    let detail = json_val
-                        .get("location")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| json_val.get("error").and_then(|v| v.as_str()))
-                        .unwrap_or("");
-
-                    if !description.is_empty() {
-                        return Err(anyhow!("{} [Error: {}]", description, err_type));
-                    } else if !detail.is_empty() && detail != err_type {
-                        return Err(anyhow!("Server error [{}]: {} ({})", err_type, detail, status.as_u16()));
-                    } else {
-                        return Err(anyhow!("Server error [{}]: HTTP {}", err_type, status.as_u16()));
+                    match err_type {
+                        "InvalidCode" => return Err(anyhow!("Invalid 2FA code. Please try again.")),
+                        "InvalidTicket" => return Err(anyhow!("MFA session timed out or invalid ticket. Please log in again.")),
+                        "TooManyRequests" => return Err(anyhow!("Too many verification attempts, please wait and try again")),
+                        other => return Err(anyhow!("Error: {}", other)),
                     }
                 }
             }
 
-            // 2. Fallback to RevoltApiError struct
             if let Ok(api_err) = serde_json::from_str::<RevoltApiError>(&raw_body) {
                 let description = match api_err.error_type.as_str() {
                     "InvalidCode" => "Invalid 2FA code. Please try again.",
@@ -240,23 +206,18 @@ impl DeltaClient {
                     "TooManyRequests" => "Too many verification attempts, please wait and try again",
                     other => other,
                 };
-                let extra = api_err.error.as_deref().unwrap_or("");
-                if extra.is_empty() {
-                    return Err(anyhow!("{} [Error: {}]", description, api_err.error_type));
-                } else {
-                    return Err(anyhow!("{}: {} [Error: {}]", description, extra, api_err.error_type));
-                }
+                return Err(anyhow!("{}", description));
             }
 
-            // 3. Fallback to HTTP status info
+            // Fallback to HTTP status info
             let clean_body = raw_body.trim();
             if status == reqwest::StatusCode::NOT_FOUND {
-                return Err(anyhow!("HTTP 404 - MFA ticket endpoint not found at {}", self.api_url));
+                return Err(anyhow!("HTTP 404 - Login endpoint not found at {}", self.api_url));
             }
             if clean_body.is_empty() {
                 return Err(anyhow!("Server returned HTTP {}", status));
             } else if clean_body.starts_with('<') {
-                return Err(anyhow!("Server returned HTTP {} (HTML response - check API URL / endpoint)", status));
+                return Err(anyhow!("Server returned HTTP {} (HTML response - check API URL)", status));
             } else {
                 let preview = if clean_body.len() > 100 {
                     format!("{}...", &clean_body[..100])
@@ -267,7 +228,7 @@ impl DeltaClient {
             }
         }
 
-        // 4. Success deserialization: try tagged LoginResponse first, then direct
+        // Success deserialization: try tagged LoginResponse first, then direct session object
         if let Ok(login_resp) = serde_json::from_str::<LoginResponse>(&raw_body) {
             return Ok(login_resp);
         }

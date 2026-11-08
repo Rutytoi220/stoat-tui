@@ -107,6 +107,21 @@ fn test_login_response_and_error_serde() {
         fallback_json,
         r#"{"ticket":"ticket_xyz","code":"654321"}"#
     );
+
+    // 9. Stoat Delta Native MFA Session Login payload serialization
+    use stoat_tui::api::models::{MfaResponse, MfaSessionLoginPayload};
+    let session_mfa_payload = MfaSessionLoginPayload {
+        mfa_ticket: "ticket_abc123".to_string(),
+        mfa_response: MfaResponse {
+            totp_code: "123456".to_string(),
+        },
+        friendly_name: "stoat-tui".to_string(),
+    };
+    let session_mfa_json = serde_json::to_string(&session_mfa_payload).unwrap();
+    assert_eq!(
+        session_mfa_json,
+        r#"{"mfa_ticket":"ticket_abc123","mfa_response":{"totp_code":"123456"},"friendly_name":"stoat-tui"}"#
+    );
 }
 
 #[test]
@@ -117,11 +132,15 @@ fn test_mfa_login_step_transitions() {
     assert_eq!(state.login_step, LoginStep::Credentials);
     assert_eq!(state.login_totp_input, "");
 
-    // Simulate receiving MFA challenge
+    // Simulate receiving MFA challenge (ApiMfaRequired event clears any errors)
+    state.login_loading = false;
+    state.login_error = None;
     state.login_step = LoginStep::TotpChallenge {
         ticket: "challenge_ticket_123".to_string(),
     };
     state.login_totp_input = "654321".to_string();
+
+    assert_eq!(state.login_error, None);
 
     if let LoginStep::TotpChallenge { ref ticket } = state.login_step {
         assert_eq!(ticket, "challenge_ticket_123");
