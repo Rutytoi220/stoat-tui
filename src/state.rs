@@ -164,7 +164,8 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config) -> Self {
         let theme = Theme::from_config(&config.theme);
-        let show_login = config.token.is_none();
+        let has_token = config.token.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false);
+        let show_login = !has_token;
 
         let mut state = Self {
             config,
@@ -199,8 +200,16 @@ impl AppState {
             login_error: None,
             login_loading: false,
 
-            gateway_status: GatewayStatus::Disconnected("Not connected".to_string()),
-            status_message: None,
+            gateway_status: if show_login {
+                GatewayStatus::Disconnected("Not logged in".to_string())
+            } else {
+                GatewayStatus::Connecting
+            },
+            status_message: if show_login {
+                Some(("Please log in to connect".to_string(), Utc::now()))
+            } else {
+                Some(("Connecting...".to_string(), Utc::now()))
+            },
 
             current_user: None,
             users: HashMap::new(),

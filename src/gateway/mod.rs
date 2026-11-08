@@ -1,5 +1,6 @@
 pub mod messages;
 
+use crate::{log_debug, log_error, log_info, log_warn};
 use futures_util::{SinkExt, StreamExt};
 use messages::{ClientMessage, ServerMessage};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -8,6 +9,7 @@ use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
+#[allow(dead_code, clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum GatewayEvent {
     Connected,
@@ -44,10 +46,12 @@ impl BonfireClient {
                     format!("{}?format=json&version=1", self.gateway_url)
                 };
 
+                log_info!("Connecting to Bonfire gateway at {}", ws_url);
                 let _ = self.event_tx.send(GatewayEvent::Disconnected("Connecting...".to_string())).await;
 
                 match connect_async(&ws_url).await {
                     Ok((ws_stream, _)) => {
+                        log_info!("Connected to Bonfire gateway WebSocket at {}", ws_url);
                         let _ = self.event_tx.send(GatewayEvent::Connected).await;
                         backoff = Duration::from_secs(1); // Reset backoff on successful connect
 
@@ -58,7 +62,9 @@ impl BonfireClient {
                             token: self.token.clone(),
                         };
                         if let Ok(json) = serde_json::to_string(&auth_msg) {
-                            if write.send(WsMessage::Text(json.into())).await.is_err() {
+                            log_debug!("Sending Authenticate handshake to Bonfire gateway");
+                            if write.send(WsMessage::Text(json)).await.is_err() {
+                                log_error!("Failed to send Authenticate message to Bonfire gateway");
                                 let _ = self.event_tx.send(GatewayEvent::Disconnected("Failed to send auth".to_string())).await;
                                 sleep(backoff).await;
                                 continue;
@@ -85,7 +91,8 @@ impl BonfireClient {
                                         .as_millis() as u64;
                                     let ping = ClientMessage::Ping { data: now_ms };
                                     if let Ok(json) = serde_json::to_string(&ping) {
-                                        if write.send(WsMessage::Text(json.into())).await.is_err() {
+                                        if write.send(WsMessage::Text(json)).await.is_err() {
+                                            log_warn!("Failed to send gateway heartbeat ping");
                                             break;
                                         }
                                     }
@@ -95,7 +102,16 @@ impl BonfireClient {
                                         Some(Ok(WsMessage::Text(text))) => {
                                             if let Some(server_msg) = ServerMessage::parse_resilient(&text) {
                                                 match &server_msg {
+                                                    ServerMessage::Ready { servers, channels, users, .. } => {
+                                                        log_info!(
+                                                            "Gateway Ready event: {} servers, {} channels, {} users",
+                                                            servers.len(),
+                                                            channels.len(),
+                                                            users.len()
+                                                        );
+                                                    }
                                                     ServerMessage::Authenticated => {
+                                                        log_info!("Gateway Authenticated event received");
                                                         let _ = self.event_tx.send(GatewayEvent::Authenticated).await;
                                                     }
                                                     ServerMessage::Pong { data } => {
@@ -104,6 +120,7 @@ impl BonfireClient {
                                                             .unwrap_or_default()
                                                             .as_millis() as u64;
                                                         let latency = now_ms.saturating_sub(*data);
+                                                        log_debug!("Gateway Pong: {}ms latency", latency);
                                                         let _ = self.event_tx.send(GatewayEvent::Latency(latency)).await;
                                                     }
                                                     _ => {}
@@ -112,7 +129,8 @@ impl BonfireClient {
                                             }
                                         }
                                         Some(Ok(WsMessage::Close(frame))) => {
-                                            let reason = frame.map(|f| f.reason.to_string()).unwrap_or_else(|| "Closed by server".to_string());
+                                            let reason = frame.map(|f| format!("code: {}, reason: {}", f.code, f.reason)).unwrap_or_else(|| "Closed by server".to_string());
+                                            log_warn!("Bonfire gateway WebSocket closed: {}", reason);
                                             let _ = self.event_tx.send(GatewayEvent::Disconnected(reason)).await;
                                             break;
                                         }
@@ -120,10 +138,12 @@ impl BonfireClient {
                                             let _ = write.send(WsMessage::Pong(data)).await;
                                         }
                                         Some(Err(e)) => {
+                                            log_error!("Bonfire gateway WebSocket error: {}", e);
                                             let _ = self.event_tx.send(GatewayEvent::Disconnected(format!("Error: {}", e))).await;
                                             break;
                                         }
                                         None => {
+                                            log_warn!("Bonfire gateway WebSocket stream ended");
                                             let _ = self.event_tx.send(GatewayEvent::Disconnected("Stream ended".to_string())).await;
                                             break;
                                         }
@@ -136,6 +156,7 @@ impl BonfireClient {
                         heartbeat_task.abort();
                     }
                     Err(e) => {
+                        log_error!("Failed to connect to Bonfire gateway at {}: {}", ws_url, e);
                         let _ = self.event_tx.send(GatewayEvent::Disconnected(format!("Failed to connect: {}", e))).await;
                     }
                 }

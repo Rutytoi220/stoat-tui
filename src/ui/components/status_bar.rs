@@ -78,12 +78,29 @@ impl<'a> Widget for StatusBar<'a> {
         };
 
         for ch in pane_hints.chars() {
-            if x >= area.right().saturating_sub(68) {
+            if x >= area.right().saturating_sub(76) {
                 break;
             }
             buf[(x, y)]
                 .set_char(ch)
                 .set_fg(Color::Rgb(200, 200, 220));
+            x += 1;
+        }
+
+        // F2 Login / Switch Account hint
+        let login_hint = if self.state.current_user.is_some() {
+            " • F2: Switch Account"
+        } else {
+            " • F2: Login"
+        };
+        for ch in login_hint.chars() {
+            if x >= area.right().saturating_sub(55) {
+                break;
+            }
+            buf[(x, y)]
+                .set_char(ch)
+                .set_fg(theme.accent)
+                .set_style(Modifier::BOLD);
             x += 1;
         }
 

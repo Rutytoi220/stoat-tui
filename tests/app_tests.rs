@@ -412,3 +412,149 @@ async fn test_fast_keyboard_navigation_logic() {
     // Unread count cleared on switch
     assert_eq!(app.state.unread_counts.get(&second_ch), None);
 }
+
+#[tokio::test]
+async fn test_startup_auth_modal_and_session_check() {
+    use stoat_tui::state::GatewayStatus;
+
+    // Case 1: Token is None
+    let config_none = Config { token: None, ..Default::default() };
+    let (tx1, _rx1) = tokio::sync::mpsc::channel(64);
+    let mut app_none = stoat_tui::app::App::new(config_none, tx1);
+    app_none.startup();
+    assert!(app_none.state.show_login_modal);
+    assert!(matches!(app_none.state.gateway_status, GatewayStatus::Disconnected(_)));
+    assert_eq!(
+        app_none.state.status_message.as_ref().map(|(msg, _)| msg.as_str()),
+        Some("Please log in to connect")
+    );
+
+    // Case 2: Token is whitespace / empty
+    let config_empty = Config { token: Some("   ".to_string()), ..Default::default() };
+    let (tx2, _rx2) = tokio::sync::mpsc::channel(64);
+    let mut app_empty = stoat_tui::app::App::new(config_empty, tx2);
+    app_empty.startup();
+    assert!(app_empty.state.show_login_modal);
+    assert!(matches!(app_empty.state.gateway_status, GatewayStatus::Disconnected(_)));
+
+    // Case 3: Token is valid non-empty string
+    let config_token = Config { token: Some("valid_secret_token".to_string()), ..Default::default() };
+    let (tx3, mut rx3) = tokio::sync::mpsc::channel(64);
+    let mut app_token = stoat_tui::app::App::new(config_token, tx3);
+    app_token.startup();
+    assert!(!app_token.state.show_login_modal);
+    assert!(matches!(app_token.state.gateway_status, GatewayStatus::Connecting));
+    assert_eq!(
+        app_token.state.status_message.as_ref().map(|(msg, _)| msg.as_str()),
+        Some("Connecting...")
+    );
+
+    // The spawned task will attempt get_current_user and eventually send an event
+    let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx3.recv()).await;
+    assert!(event.is_ok());
+}
+
+#[tokio::test]
+async fn test_manual_login_modal_keybindings_f2_ctrl_l() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let config = Config { token: Some("test_tok".to_string()), ..Default::default() };
+    let mut app = stoat_tui::app::App::new(config, tx);
+
+    // Initial state: token present, login modal closed
+    app.state.show_login_modal = false;
+
+    // Press F2 -> opens login modal
+    let f2_key = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
+    app.handle_event(stoat_tui::event::AppEvent::Key(f2_key)).await;
+    assert!(app.state.show_login_modal);
+
+    // Press Esc inside login modal -> closes login modal
+    let esc_key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    app.handle_event(stoat_tui::event::AppEvent::Key(esc_key)).await;
+    assert!(!app.state.show_login_modal);
+
+    // Press Ctrl+L -> opens login modal
+    let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+    app.handle_event(stoat_tui::event::AppEvent::Key(ctrl_l)).await;
+    assert!(app.state.show_login_modal);
+}
+
+#[tokio::test]
+async fn test_api_session_expired_event() {
+    use stoat_tui::api::models::User;
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::state::GatewayStatus;
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let config = Config { token: Some("expired_tok_123".to_string()), ..Default::default() };
+    let mut app = stoat_tui::app::App::new(config, tx);
+
+    app.state.current_user = Some(User {
+        id: "u_abc".to_string(),
+        username: "testuser".to_string(),
+        display_name: Some("Test User".to_string()),
+        avatar: None,
+        status: None,
+        bot: None,
+        online: Some(true),
+    });
+    app.state.show_login_modal = false;
+
+    // Dispatch ApiSessionExpired
+    app.handle_event(AppEvent::ApiSessionExpired).await;
+
+    // Token must be cleared from config
+    assert!(app.state.config.token.is_none());
+    // Current user reset
+    assert!(app.state.current_user.is_none());
+    // Login modal auto-shown
+    assert!(app.state.show_login_modal);
+    // Error message displayed
+    assert_eq!(
+        app.state.login_error.as_deref(),
+        Some("Session expired, please log in again.")
+    );
+    // Gateway status updated
+    assert!(matches!(app.state.gateway_status, GatewayStatus::Disconnected(_)));
+}
+
+#[tokio::test]
+async fn test_ready_and_authenticated_gateway_sync() {
+    use stoat_tui::gateway::GatewayEvent;
+    use stoat_tui::state::GatewayStatus;
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let mut app = stoat_tui::app::App::new(Config::default(), tx);
+
+    // Authenticated event sets Connected with latency and ● Online
+    app.handle_event(stoat_tui::event::AppEvent::Gateway(GatewayEvent::Authenticated)).await;
+    match app.state.gateway_status {
+        GatewayStatus::Connected { latency_ms } => assert!(latency_ms > 0),
+        _ => panic!("Expected Connected gateway status"),
+    }
+    assert_eq!(
+        app.state.status_message.as_ref().map(|(msg, _)| msg.as_str()),
+        Some("● Online")
+    );
+}
+
+#[test]
+fn test_logger_file_output() {
+    use std::fs;
+    let path = stoat_tui::logger::init();
+    assert!(path.exists() || path.parent().map(|p| p.exists()).unwrap_or(false));
+
+    stoat_tui::log_info!("Test log entry from unit test");
+    stoat_tui::log_warn!("Test warning entry");
+    stoat_tui::log_error!("Test error entry");
+    stoat_tui::log_debug!("Test debug entry");
+
+    assert!(path.exists());
+    let content = fs::read_to_string(&path).expect("Read debug log file");
+    assert!(content.contains("[INFO] Test log entry from unit test"));
+    assert!(content.contains("[WARN] Test warning entry"));
+    assert!(content.contains("[ERROR] Test error entry"));
+    assert!(content.contains("[DEBUG] Test debug entry"));
+}

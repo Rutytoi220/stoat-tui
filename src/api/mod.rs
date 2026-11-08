@@ -1,5 +1,6 @@
 pub mod models;
 
+use crate::{log_debug, log_error, log_info, log_warn};
 use anyhow::{anyhow, Context, Result};
 use models::*;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
@@ -55,6 +56,7 @@ impl DeltaClient {
 
     pub async fn fetch_metadata(&self) -> Result<ServerMetadata> {
         let url = format!("{}/", self.api_url);
+        log_debug!("GET {} (fetching metadata)", url);
         let resp = self
             .client
             .get(&url)
@@ -63,7 +65,9 @@ impl DeltaClient {
             .with_context(|| format!("Failed to reach API at {}", url))?;
 
         let status = resp.status();
+        log_debug!("GET {} -> Status: {}", url, status);
         if !status.is_success() {
+            log_warn!("API {} returned status {}", url, status);
             return Err(anyhow!("API returned status {}", status));
         }
 
@@ -76,6 +80,7 @@ impl DeltaClient {
 
     pub async fn login(&self, email: &str, password: &str) -> Result<LoginResponse> {
         let url = format!("{}/auth/session/login", self.api_url);
+        log_info!("POST {} (logging in user '{}')", url, email);
         let payload = LoginPayload {
             email: email.to_string(),
             password: password.to_string(),
@@ -93,8 +98,10 @@ impl DeltaClient {
 
         let status = resp.status();
         let raw_body = resp.text().await.unwrap_or_default();
+        log_info!("POST {} -> Status: {}", url, status);
 
         if !status.is_success() {
+            log_warn!("Login failed with status {}: {}", status, raw_body);
             // 1. Attempt to deserialize standard Stoat/Revolt JSON error
             if let Ok(api_err) = serde_json::from_str::<RevoltApiError>(&raw_body) {
                 let description = match api_err.error_type.as_str() {
@@ -156,6 +163,7 @@ impl DeltaClient {
 
     pub async fn verify_mfa_totp(&self, ticket: &str, code: &str) -> Result<LoginResponse> {
         let url = format!("{}/auth/session/login", self.api_url);
+        log_info!("POST {} (verifying MFA TOTP code)", url);
         let payload = MfaSessionLoginPayload {
             mfa_ticket: ticket.to_string(),
             mfa_response: MfaResponse {
@@ -179,8 +187,10 @@ impl DeltaClient {
 
         let status = resp.status();
         let raw_body = resp.text().await.unwrap_or_default();
+        log_info!("POST {} (MFA verify) -> Status: {}", url, status);
 
         if !status.is_success() {
+            log_warn!("MFA TOTP verification failed with status {}: {}", status, raw_body);
             // Attempt to deserialize standard Stoat/Revolt JSON error
             if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&raw_body) {
                 let error_type = json_val
@@ -262,6 +272,7 @@ impl DeltaClient {
 
     pub async fn get_current_user(&self) -> Result<User> {
         let url = format!("{}/users/@me", self.api_url);
+        log_debug!("GET {} (fetching current user profile)", url);
         let resp = self
             .client
             .get(&url)
@@ -271,8 +282,17 @@ impl DeltaClient {
             .with_context(|| format!("Failed to query current user at {}", url))?;
 
         let status = resp.status();
+        log_debug!("GET {} -> Status: {}", url, status);
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let err_text = resp.text().await.unwrap_or_default();
+            log_warn!("GET {} failed with 401 Unauthorized (session expired or invalid): {}", url, err_text);
+            return Err(anyhow!("401 Unauthorized: Session expired"));
+        }
+
         if !status.is_success() {
             let err_text = resp.text().await.unwrap_or_default();
+            log_warn!("GET {} returned error status {}: {}", url, status, err_text);
             return Err(anyhow!("Failed to get user ({}): {}", status, err_text));
         }
 
@@ -280,6 +300,7 @@ impl DeltaClient {
             .json()
             .await
             .context("Failed to parse user JSON")?;
+        log_info!("GET {} successful for user @{} ({})", url, user.username, user.id);
         Ok(user)
     }
 
@@ -289,6 +310,7 @@ impl DeltaClient {
             "{}/channels/{}/messages?limit={}&sort=Latest",
             self.api_url, channel_id, limit
         );
+        log_debug!("GET {} (fetching messages)", url);
         let resp = self
             .client
             .get(&url)
@@ -298,13 +320,16 @@ impl DeltaClient {
             .with_context(|| format!("Failed to fetch messages for channel {}", channel_id))?;
 
         let status = resp.status();
+        log_debug!("GET {} -> Status: {}", url, status);
         if !status.is_success() {
             let err_text = resp.text().await.unwrap_or_default();
+            log_warn!("GET {} returned error status {}: {}", url, status, err_text);
             return Err(anyhow!("Fetch messages error ({}): {}", status, err_text));
         }
 
         let text = resp.text().await?;
         if let Ok(list) = serde_json::from_str::<Vec<Message>>(&text) {
+            log_debug!("Fetched {} messages for channel {}", list.len(), channel_id);
             return Ok(list);
         }
 
@@ -313,14 +338,17 @@ impl DeltaClient {
             messages: Vec<Message>,
         }
         if let Ok(wrapper) = serde_json::from_str::<MessagesWrapper>(&text) {
+            log_debug!("Fetched {} messages (wrapped) for channel {}", wrapper.messages.len(), channel_id);
             return Ok(wrapper.messages);
         }
 
+        log_error!("Unrecognized messages format from API for channel {}: {}", channel_id, text);
         Err(anyhow!("Unrecognized messages format from API: {}", text))
     }
 
     pub async fn send_message(&self, channel_id: &str, content: &str) -> Result<Message> {
         let url = format!("{}/channels/{}/messages", self.api_url, channel_id);
+        log_debug!("POST {} (sending message, len: {})", url, content.len());
         let payload = SendMessagePayload {
             content: content.to_string(),
             replies: None,
@@ -336,8 +364,10 @@ impl DeltaClient {
             .with_context(|| format!("Failed to post message to channel {}", channel_id))?;
 
         let status = resp.status();
+        log_debug!("POST {} -> Status: {}", url, status);
         if !status.is_success() {
             let err_text = resp.text().await.unwrap_or_default();
+            log_warn!("POST {} returned error status {}: {}", url, status, err_text);
             return Err(anyhow!("Send message error ({}): {}", status, err_text));
         }
 
@@ -345,6 +375,7 @@ impl DeltaClient {
             .json()
             .await
             .context("Failed to parse returned message JSON")?;
+        log_debug!("Message {} posted successfully to channel {}", msg.id, channel_id);
         Ok(msg)
     }
 

@@ -21,6 +21,8 @@ pub enum AppEvent {
     ApiMessagesFetched { channel_id: String, messages: Vec<Message> },
     ApiCurrentUser(User),
     ApiDmsFetched(Vec<Channel>),
+    ApiSessionExpired,
+    StartGateway { token: String, gateway_url: Option<String> },
 }
 
 pub struct EventHandler {

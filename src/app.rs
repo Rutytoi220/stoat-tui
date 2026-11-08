@@ -5,6 +5,7 @@ use crate::event::AppEvent;
 use crate::gateway::messages::ServerMessage;
 use crate::gateway::{BonfireClient, GatewayEvent};
 use crate::state::{ActiveRail, AppState, Focus, GatewayStatus, LoginStep, LoginTab, PaletteItemType};
+use crate::{log_debug, log_error, log_info, log_warn};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +34,83 @@ impl App {
             event_tx,
             gateway_handle: None,
         }
+    }
+
+    pub fn startup(&mut self) {
+        let token_opt = self.state.config.token.clone();
+        let has_token = token_opt.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false);
+
+        if !has_token {
+            log_info!("Startup: No session token found. Displaying login modal.");
+            self.state.show_login_modal = true;
+            self.state.gateway_status = GatewayStatus::Disconnected("Not logged in".to_string());
+            self.state.status_message = Some(("Please log in to connect".to_string(), chrono::Utc::now()));
+            return;
+        }
+
+        let token = token_opt.unwrap();
+        log_info!("Startup: Found stored session token. Initiating startup authentication verification...");
+        self.state.show_login_modal = false;
+        self.state.gateway_status = GatewayStatus::Connecting;
+        self.state.status_message = Some(("Connecting...".to_string(), chrono::Utc::now()));
+
+        let api = self.api_client.clone();
+        let tx = self.event_tx.clone();
+        let gw_url_config = self.state.config.gateway_url.clone();
+
+        tokio::spawn(async move {
+            let client = api.lock().await;
+
+            // 1. Call GET /users/@me with header x-session-token: <TOKEN>
+            match client.get_current_user().await {
+                Ok(user) => {
+                    log_info!("Startup: Successfully authenticated user @{} ({})", user.username, user.id);
+                    let _ = tx.send(AppEvent::ApiCurrentUser(user)).await;
+
+                    // Also fetch initial DMs
+                    if let Ok(dms) = client.fetch_dms().await {
+                        let _ = tx.send(AppEvent::ApiDmsFetched(dms)).await;
+                    }
+
+                    // 2. Query GET / to get dynamic gateway WebSocket URL (meta.ws)
+                    let effective_gw_url = match client.fetch_metadata().await {
+                        Ok(meta) => {
+                            if let Some(ws) = meta.ws {
+                                log_info!("Startup: Dynamic gateway URL extracted: {}", ws);
+                                Some(ws)
+                            } else {
+                                gw_url_config
+                            }
+                        }
+                        Err(e) => {
+                            log_warn!("Startup: Could not query dynamic gateway URL from GET /: {}", e);
+                            gw_url_config
+                        }
+                    };
+
+                    // 3. Connect to Bonfire WebSocket gateway
+                    let _ = tx.send(AppEvent::StartGateway {
+                        token,
+                        gateway_url: effective_gw_url,
+                    }).await;
+                }
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    log_warn!("Startup: GET /users/@me verification failed: {}", err_msg);
+                    if err_msg.contains("401") || err_msg.contains("Unauthorized") || err_msg.contains("Session expired") {
+                        log_warn!("Startup: Token expired or rejected (HTTP 401). Clearing token and requesting login.");
+                        let _ = tx.send(AppEvent::ApiSessionExpired).await;
+                    } else {
+                        // Network error / connection timeout - still attempt gateway connection
+                        log_warn!("Startup: Non-401 error during GET /users/@me: {}. Proceeding with gateway connection.", err_msg);
+                        let _ = tx.send(AppEvent::StartGateway {
+                            token,
+                            gateway_url: gw_url_config,
+                        }).await;
+                    }
+                }
+            }
+        });
     }
 
     pub fn start_gateway(&mut self, token: String, gateway_url: Option<String>) {
@@ -132,6 +210,20 @@ impl App {
             }
             AppEvent::ApiDmsFetched(dms) => {
                 self.state.dms = dms;
+            }
+            AppEvent::ApiSessionExpired => {
+                log_warn!("Handling ApiSessionExpired: Invalidating session token, showing login modal");
+                self.state.config.token = None;
+                let _ = self.state.config.save();
+                self.state.current_user = None;
+                self.state.login_loading = false;
+                self.state.login_error = Some("Session expired, please log in again.".to_string());
+                self.state.show_login_modal = true;
+                self.state.gateway_status = GatewayStatus::Disconnected("Session expired".to_string());
+                self.state.set_status("Session expired, please log in again.");
+            }
+            AppEvent::StartGateway { token, gateway_url } => {
+                self.start_gateway(token, gateway_url);
             }
         }
     }
@@ -424,6 +516,15 @@ impl App {
         }
 
         // Global Shortcuts:
+        // Manual Login Modal Trigger: F2 or Ctrl+L
+        if key.code == KeyCode::F(2)
+            || (key.modifiers.contains(KeyModifiers::CONTROL)
+                && (key.code == KeyCode::Char('l') || key.code == KeyCode::Char('L')))
+        {
+            self.state.show_login_modal = true;
+            return;
+        }
+
         // Command Palette
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
             self.state.show_command_palette = true;
@@ -757,20 +858,29 @@ impl App {
     async fn handle_gateway(&mut self, event: GatewayEvent) {
         match event {
             GatewayEvent::Connected => {
+                log_info!("Gateway connected event handled");
                 self.state.gateway_status = GatewayStatus::Connecting;
             }
             GatewayEvent::Authenticated => {
+                log_info!("Gateway authenticated event handled: status set to ● Online");
                 self.state.gateway_status = GatewayStatus::Connected { latency_ms: 20 };
-                self.state.set_status("Connected to Bonfire Gateway");
+                self.state.set_status("● Online");
             }
             GatewayEvent::Latency(ms) => {
                 self.state.gateway_status = GatewayStatus::Connected { latency_ms: ms };
             }
             GatewayEvent::Disconnected(reason) => {
+                log_warn!("Gateway disconnected event: {}", reason);
                 self.state.gateway_status = GatewayStatus::Disconnected(reason);
             }
             GatewayEvent::MessageReceived(msg) => match msg {
                 ServerMessage::Ready { users, servers, channels, members } => {
+                    self.state.gateway_status = match self.state.gateway_status {
+                        GatewayStatus::Connected { latency_ms } => GatewayStatus::Connected { latency_ms },
+                        _ => GatewayStatus::Connected { latency_ms: 20 },
+                    };
+                    self.state.set_status("● Online");
+
                     self.state.users.clear();
                     self.state.servers.clear();
                     self.state.channels.clear();
@@ -795,6 +905,14 @@ impl App {
                     for m in members {
                         self.state.members.entry(m.id.server.clone()).or_default().push(m);
                     }
+
+                    log_info!(
+                        "Ready loaded: {} servers, {} channels, {} users, {} dms",
+                        self.state.servers.len(),
+                        self.state.channels.len(),
+                        self.state.users.len(),
+                        self.state.dms.len()
+                    );
 
                     // Auto-select first available server and its first text channel
                     if let Some(first_srv) = self.state.servers.first() {
@@ -917,18 +1035,24 @@ impl App {
     }
 
     pub async fn fetch_channel_messages(&self, channel_id: String) {
+        log_debug!("Fetching messages for channel {}", channel_id);
         let api = self.api_client.clone();
         let tx = self.event_tx.clone();
         let cid = channel_id.clone();
 
         tokio::spawn(async move {
             let client = api.lock().await;
-            if let Ok(mut messages) = client.fetch_messages(&cid, 50).await {
-                messages.sort_by(|a, b| a.id.cmp(&b.id));
-                let _ = tx.send(AppEvent::ApiMessagesFetched {
-                    channel_id: cid,
-                    messages,
-                }).await;
+            match client.fetch_messages(&cid, 50).await {
+                Ok(mut messages) => {
+                    messages.sort_by(|a, b| a.id.cmp(&b.id));
+                    let _ = tx.send(AppEvent::ApiMessagesFetched {
+                        channel_id: cid,
+                        messages,
+                    }).await;
+                }
+                Err(e) => {
+                    log_error!("Failed to fetch channel messages for {}: {}", cid, e);
+                }
             }
         });
     }
