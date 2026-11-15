@@ -20,21 +20,9 @@ use ratatui::Frame;
 pub fn render(f: &mut Frame, state: &mut AppState) {
     let size = f.area();
 
-    // If call fullscreen mode is active, render call stage taking 100% of workspace
+    // If call fullscreen mode is active, render CallStage across the entire terminal area
     if state.call_fullscreen && state.active_call.is_some() {
-        let root_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(5),
-                Constraint::Length(1), // Status Bar
-            ])
-            .split(size);
-
-        let workspace_area = root_chunks[0];
-        let status_bar_area = root_chunks[1];
-
-        f.render_widget(CallStage::new(state), workspace_area);
-        f.render_widget(StatusBar::new(state), status_bar_area);
+        f.render_widget(CallStage::new(state), size);
         return;
     }
 
@@ -79,20 +67,53 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         Rect::default()
     };
 
-    // 3. Center Area Split: Header + (Optional Call Stage) + Chat + Input
+    // Check if current channel has an active incoming/room call in progress that the user has NOT joined
+    let current_cid_opt = state.active_channel_id.as_deref();
+    let has_unjoined_active_call = if state.active_call.is_none() {
+        if let Some(cid) = current_cid_opt {
+            state.voice_channel_participants.get(cid).map(|v| !v.is_empty()).unwrap_or(false)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // 3. Center Area Split:
+    // When state.active_call is Some:
+    //   1. Header (Constraint::Length(3))
+    //   2. CallStage (Constraint::Percentage(45) / Constraint::Min(10))
+    //   3. ChatFeed (Constraint::Min(6))
+    //   4. Input (Constraint::Length(3))
+    // When an unjoined active call banner is visible:
+    //   1. Header (Constraint::Length(3))
+    //   2. CallBanner (Constraint::Length(1))
+    //   3. ChatFeed (Constraint::Min(6))
+    //   4. Input (Constraint::Length(3))
+    // Otherwise:
+    //   1. Header (Constraint::Length(3))
+    //   2. ChatFeed (Constraint::Min(6))
+    //   3. Input (Constraint::Length(3))
     let has_call = state.active_call.is_some();
     let center_constraints = if has_call {
         vec![
-            Constraint::Length(2),  // Channel Header
-            Constraint::Length(10), // Docked Call Stage
-            Constraint::Min(3),     // Message Feed
-            Constraint::Length(3),  // Message Input Bar
+            Constraint::Length(3),         // 1. Header
+            Constraint::Percentage(45),    // 2. CallStage (at least 10)
+            Constraint::Min(6),            // 3. ChatFeed
+            Constraint::Length(3),         // 4. Input
+        ]
+    } else if has_unjoined_active_call {
+        vec![
+            Constraint::Length(3),         // 1. Header
+            Constraint::Length(1),         // 2. CallBanner
+            Constraint::Min(6),            // 3. ChatFeed
+            Constraint::Length(3),         // 4. Input
         ]
     } else {
         vec![
-            Constraint::Length(2), // Channel Header
-            Constraint::Min(3),    // Message Feed
-            Constraint::Length(3), // Message Input Bar
+            Constraint::Length(3),         // 1. Header
+            Constraint::Min(6),            // 2. ChatFeed
+            Constraint::Length(3),         // 3. Input
         ]
     };
 
@@ -101,10 +122,12 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         .constraints(center_constraints)
         .split(center_rect);
 
-    let (header_rect, call_rect, chat_rect, input_rect) = if has_call {
-        (center_chunks[0], Some(center_chunks[1]), center_chunks[2], center_chunks[3])
+    let (header_rect, call_rect, banner_rect, chat_rect, input_rect) = if has_call {
+        (center_chunks[0], Some(center_chunks[1]), None, center_chunks[2], center_chunks[3])
+    } else if has_unjoined_active_call {
+        (center_chunks[0], None, Some(center_chunks[1]), center_chunks[2], center_chunks[3])
     } else {
-        (center_chunks[0], None, center_chunks[1], center_chunks[2])
+        (center_chunks[0], None, None, center_chunks[1], center_chunks[2])
     };
 
     // Record layout rects in state for mouse hit testing
@@ -114,6 +137,7 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     state.rect_input = input_rect;
     state.rect_members = members_rect;
     state.rect_header = header_rect;
+    state.rect_call_banner = banner_rect;
 
     // Member button toggle hit-test area (top right of header)
     state.rect_member_toggle = Rect {
@@ -178,6 +202,16 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     f.render_widget(ServersRail::new(state), rail_rect);
     f.render_widget(ChannelsSidebar::new(state), channels_rect);
     f.render_widget(ContentHeader::new(state), header_rect);
+    if let Some(br) = banner_rect {
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::{Line, Span};
+        let banner_line = Line::from(vec![
+            Span::styled(" 📞 Active call in progress — ", Style::default().fg(Color::White).bg(Color::Rgb(35, 120, 65)).add_modifier(Modifier::BOLD)),
+            Span::styled("Press [c] to join (or click here)", Style::default().fg(Color::Yellow).bg(Color::Rgb(35, 120, 65)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
+            Span::styled(" ", Style::default().bg(Color::Rgb(35, 120, 65))),
+        ]);
+        f.render_widget(ratatui::widgets::Paragraph::new(banner_line).style(Style::default().bg(Color::Rgb(35, 120, 65))), br);
+    }
     if let Some(cr) = call_rect {
         f.render_widget(CallStage::new(state), cr);
     }

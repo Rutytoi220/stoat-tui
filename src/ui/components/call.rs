@@ -78,7 +78,11 @@ impl<'a> Widget for CallStage<'a> {
         }
 
         // Top line: Duration and Control status badges
-        let duration = active_call.formatted_duration();
+        let duration = if active_call.status == crate::voice::CallStatus::Connecting {
+            "Connecting...".to_string()
+        } else {
+            active_call.formatted_duration()
+        };
         let is_muted = active_call.is_muted();
         let is_deafened = active_call.is_deafened();
         let is_screensharing = active_call.is_screensharing();

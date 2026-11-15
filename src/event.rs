@@ -25,6 +25,7 @@ pub enum AppEvent {
     ApiSessionExpired,
     StartGateway { token: String, gateway_url: Option<String> },
     VideoFrameReady,
+    CallConnected { channel_id: String },
 }
 
 pub struct EventHandler {

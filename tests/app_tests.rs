@@ -745,3 +745,40 @@ fn test_config_token_serialization_and_persistence() {
     let parsed: Config = toml::from_str(&toml_some).unwrap();
     assert_eq!(parsed.token.as_deref(), Some("test_session_token_12345"));
 }
+
+#[test]
+fn test_config_last_navigation_persistence() {
+    let mut config = Config::default();
+    assert!(!config.last_in_dm);
+    assert!(config.last_server_id.is_none());
+    assert!(config.last_channel_id.is_none());
+
+    // Update navigation fields
+    config.last_in_dm = false;
+    config.last_server_id = Some("srv_01J_RUST".to_string());
+    config.last_channel_id = Some("chan_01J_DEV".to_string());
+
+    let toml_str = toml::to_string_pretty(&config).unwrap();
+    assert!(toml_str.contains(r#"last_server_id = "srv_01J_RUST""#));
+    assert!(toml_str.contains(r#"last_channel_id = "chan_01J_DEV""#));
+
+    let parsed: Config = toml::from_str(&toml_str).unwrap();
+    assert!(!parsed.last_in_dm);
+    assert_eq!(parsed.last_server_id.as_deref(), Some("srv_01J_RUST"));
+    assert_eq!(parsed.last_channel_id.as_deref(), Some("chan_01J_DEV"));
+
+    // DM navigation
+    config.last_in_dm = true;
+    config.last_server_id = None;
+    config.last_channel_id = Some("dm_01J_ALICE".to_string());
+
+    let toml_dm = toml::to_string_pretty(&config).unwrap();
+    assert!(toml_dm.contains("last_in_dm = true"));
+    assert!(!toml_dm.contains("last_server_id ="));
+    assert!(toml_dm.contains(r#"last_channel_id = "dm_01J_ALICE""#));
+
+    let parsed_dm: Config = toml::from_str(&toml_dm).unwrap();
+    assert!(parsed_dm.last_in_dm);
+    assert!(parsed_dm.last_server_id.is_none());
+    assert_eq!(parsed_dm.last_channel_id.as_deref(), Some("dm_01J_ALICE"));
+}

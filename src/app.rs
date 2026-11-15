@@ -264,6 +264,14 @@ impl App {
                 self.state.set_status("Session expired, please log in again.");
             }
             AppEvent::VideoFrameReady => {}
+            AppEvent::CallConnected { channel_id } => {
+                if let Some(ref mut call) = self.state.active_call {
+                    if call.channel_id == channel_id {
+                        call.status = crate::voice::CallStatus::Connected;
+                        call.connected_at = Some(std::time::Instant::now());
+                    }
+                }
+            }
             AppEvent::StartGateway { token, gateway_url } => {
                 self.start_gateway(token, gateway_url);
             }
@@ -919,6 +927,14 @@ impl App {
                     return;
                 }
 
+                // Call banner clicked under header
+                if let Some(br) = self.state.rect_call_banner {
+                    if mx >= br.left() && mx < br.right() && my >= br.top() && my < br.bottom() {
+                        self.toggle_call().await;
+                        return;
+                    }
+                }
+
                 // 1. Click Left Rail (Servers & DMs)
                 let rail = self.state.rect_rail;
                 if mx >= rail.left() && mx < rail.right() && my >= rail.top() && my < rail.bottom() {
@@ -1073,18 +1089,100 @@ impl App {
                         self.state.dms.len()
                     );
 
-                    // Auto-select first available real server and its first text channel, or DMs if no servers
-                    if let Some(first_srv) = self.state.servers.first() {
-                        let sid = first_srv.id.clone();
-                        self.switch_to_server(Some(sid)).await;
-                    } else if !self.state.dms.is_empty() {
-                        self.switch_to_server(None).await;
+                    // Restore saved navigation location across restarts:
+                    // 1. If config.last_in_dm is true: keep active_server_id = None (DMs).
+                    //    Restore config.last_channel_id if present in channels, else first DM.
+                    // 2. Else if config.last_server_id exists in servers:
+                    //    Switch to that server, restoring config.last_channel_id if it belongs to that server.
+                    // 3. Fallback (first-time launch or missing saved target):
+                    //    Select servers.first() and its first text channel, or DMs if no servers.
+                    let last_in_dm = self.state.config.last_in_dm;
+                    let last_srv_id = self.state.config.last_server_id.clone();
+                    let last_chan_id = self.state.config.last_channel_id.clone();
+
+                    let mut restored = false;
+
+                    if last_in_dm {
+                        log_info!("Restoring saved session in Direct Messages view");
+                        self.state.active_rail = ActiveRail::DirectMessages;
+                        self.state.active_server_id = None;
+                        self.state.selected_server_index = 0;
+
+                        if let Some(ref lcid) = last_chan_id {
+                            if self.state.channels.contains_key(lcid) {
+                                self.switch_to_channel(lcid.clone()).await;
+                                restored = true;
+                            }
+                        }
+                        if !restored {
+                            if let Some(first_dm) = self.state.dms.first() {
+                                self.switch_to_channel(first_dm.id.clone()).await;
+                                restored = true;
+                            }
+                        }
+                    } else if let Some(ref saved_sid) = last_srv_id {
+                        if self.state.servers.iter().any(|s| &s.id == saved_sid) {
+                            log_info!("Restoring saved session in server {}", saved_sid);
+                            self.state.active_rail = ActiveRail::Server(saved_sid.clone());
+                            self.state.active_server_id = Some(saved_sid.clone());
+                            if let Some(pos) = self.state.servers.iter().position(|s| &s.id == saved_sid) {
+                                self.state.selected_server_index = pos + 1;
+                            }
+
+                            // Check if saved_channel_id belongs to this server
+                            if let Some(ref lcid) = last_chan_id {
+                                let belongs_to_server = self.state.server_channels
+                                    .get(saved_sid)
+                                    .map(|cids| cids.contains(lcid))
+                                    .unwrap_or(false)
+                                    || self.state.channels.get(lcid).and_then(|c| c.server.as_ref()) == Some(saved_sid);
+
+                                if belongs_to_server {
+                                    self.switch_to_channel(lcid.clone()).await;
+                                    restored = true;
+                                }
+                            }
+
+                            if !restored {
+                                // Fallback to this server's first text channel
+                                self.switch_to_server(Some(saved_sid.clone())).await;
+                                restored = true;
+                            }
+                        }
+                    }
+
+                    if !restored {
+                        log_info!("First-time launch or no saved location: Selecting first server or DM fallback");
+                        if let Some(first_srv) = self.state.servers.first() {
+                            let sid = first_srv.id.clone();
+                            self.switch_to_server(Some(sid)).await;
+                        } else if !self.state.dms.is_empty() {
+                            self.switch_to_server(None).await;
+                        }
                     }
                 }
                 ServerMessage::Message(m) => {
                     let _ = self.state.resolve_user(&m.author);
                     let channel_id = m.channel.clone();
                     let is_active_channel = self.state.active_channel_id.as_deref() == Some(&channel_id);
+
+                    // Track call_started system event as active call participant
+                    if let Some(ref sys) = m.system {
+                        let ev_type = sys.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        if ev_type == "call_started" {
+                            let entry = self.state.voice_channel_participants.entry(channel_id.clone()).or_default();
+                            let user_id = sys.get("user").or_else(|| sys.get("id")).and_then(|u| u.as_str()).unwrap_or("caller").to_string();
+                            if !entry.iter().any(|p| p.user_id == user_id) {
+                                entry.push(crate::voice::VoiceParticipant {
+                                    user_id,
+                                    is_speaking: false,
+                                    is_muted: false,
+                                    is_deafened: false,
+                                    is_screensharing: false,
+                                });
+                            }
+                        }
+                    }
 
                     self.state.messages.entry(channel_id.clone()).or_default().push(m);
 
@@ -1269,6 +1367,12 @@ impl App {
             self.state.selected_channel_index = pos;
         }
 
+        // Persist session navigation state
+        self.state.config.last_in_dm = self.state.active_server_id.is_none();
+        self.state.config.last_server_id = self.state.active_server_id.clone();
+        self.state.config.last_channel_id = Some(channel_id.clone());
+        let _ = self.state.config.save();
+
         self.fetch_channel_messages(channel_id).await;
     }
 
@@ -1313,6 +1417,10 @@ impl App {
             } else {
                 self.state.active_channel_id = None;
                 self.state.chat_scroll_offset = 0;
+                self.state.config.last_in_dm = false;
+                self.state.config.last_server_id = Some(sid.clone());
+                self.state.config.last_channel_id = None;
+                let _ = self.state.config.save();
             }
         } else {
             self.state.active_rail = ActiveRail::DirectMessages;
@@ -1324,6 +1432,10 @@ impl App {
             } else {
                 self.state.active_channel_id = None;
                 self.state.chat_scroll_offset = 0;
+                self.state.config.last_in_dm = true;
+                self.state.config.last_server_id = None;
+                self.state.config.last_channel_id = None;
+                let _ = self.state.config.save();
             }
         }
     }
@@ -1522,10 +1634,10 @@ impl App {
             }
         };
 
-        self.state.set_status(format!("Joining call in channel {}...", channel_id));
+        // Immediate UI feedback on 'c' / 'Alt+c': initialize state.active_call instantly with status Connecting
         let mut call = crate::voice::ActiveCallState::new(channel_id.clone());
-        call.connected_at = Some(std::time::Instant::now());
-        call.status = crate::voice::CallStatus::Connected;
+        call.status = crate::voice::CallStatus::Connecting;
+        call.connected_at = None;
 
         let frame_tx = self.event_tx.clone();
         let (notify_tx, mut notify_rx) = mpsc::channel(16);
@@ -1546,19 +1658,22 @@ impl App {
         );
 
         self.state.active_call = Some(call);
-        self.state.set_status("📞 Connected to call! [c: Leave | s: Screen | m: Mute | d: Deafen | f: Fullscreen]");
+        self.state.set_status(format!("📞 Connecting to call in channel {}... [c: Disconnect]", channel_id));
 
         // Asynchronously request call token from Delta API
         let api = self.api_client.clone();
         let cid_clone = channel_id.clone();
+        let app_tx = self.event_tx.clone();
         tokio::spawn(async move {
             let client = api.lock().await;
             match client.join_call(&cid_clone).await {
                 Ok(_join_res) => {
                     log_info!("join_call returned LiveKit token for channel {}", cid_clone);
+                    let _ = app_tx.send(AppEvent::CallConnected { channel_id: cid_clone }).await;
                 }
                 Err(e) => {
-                    log_warn!("join_call API request returned error (falling back to local engine): {}", e);
+                    log_warn!("join_call API request returned error (falling back to connected local engine): {}", e);
+                    let _ = app_tx.send(AppEvent::CallConnected { channel_id: cid_clone }).await;
                 }
             }
         });

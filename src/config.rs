@@ -27,6 +27,15 @@ pub struct Config {
     pub is_bot: bool,
 
     #[serde(default)]
+    pub last_in_dm: bool,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_server_id: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_channel_id: Option<String>,
+
+    #[serde(default)]
     pub theme: ThemeConfig,
 }
 
@@ -95,6 +104,9 @@ impl Default for Config {
             gateway_url: None,
             token: None,
             is_bot: false,
+            last_in_dm: false,
+            last_server_id: None,
+            last_channel_id: None,
             theme: ThemeConfig::default(),
         }
     }

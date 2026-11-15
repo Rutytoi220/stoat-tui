@@ -166,6 +166,7 @@ pub struct AppState {
     pub rect_input: Rect,
     pub rect_members: Rect,
     pub rect_header: Rect,
+    pub rect_call_banner: Option<Rect>,
     pub rect_member_toggle: Rect,
     pub rect_command_palette: Rect,
 
@@ -246,6 +247,7 @@ impl AppState {
             rect_input: Rect::default(),
             rect_members: Rect::default(),
             rect_header: Rect::default(),
+            rect_call_banner: None,
             rect_member_toggle: Rect::default(),
             rect_command_palette: Rect::default(),
 
