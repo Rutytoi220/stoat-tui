@@ -10,6 +10,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAttachment {
+    pub id: String,
+    pub filename: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Servers,
@@ -112,9 +118,10 @@ pub struct AppState {
     // Chat scroll (0 = bottom, >0 = scrolled up by N lines)
     pub chat_scroll_offset: usize,
 
-    // Input buffer
+    // Input buffer & pending uploads
     pub input_buffer: String,
     pub input_cursor: usize,
+    pub pending_attachments: Vec<PendingAttachment>,
 
     // UI Toggles & Modals
     pub show_member_rail: bool,
@@ -206,6 +213,7 @@ impl AppState {
 
             input_buffer: String::new(),
             input_cursor: 0,
+            pending_attachments: Vec::new(),
 
             show_member_rail: true,
             show_command_palette: false,

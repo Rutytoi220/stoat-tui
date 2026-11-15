@@ -86,6 +86,19 @@ fn format_system_event(system: &serde_json::Value) -> String {
     }
 }
 
+enum ChatRenderItem {
+    Line(Line<'static>),
+    AuthorHeader {
+        spans: Vec<Span<'static>>,
+        author_id: String,
+    },
+    ImageAttachment {
+        key: String,
+        badge: String,
+        height: u16,
+    },
+}
+
 impl<'a> Widget for ChatFeed<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let is_focused = self.state.focus == Focus::Chat;
@@ -141,8 +154,8 @@ impl<'a> Widget for ChatFeed<'a> {
             return;
         }
 
-        // Pre-render all messages into formatted lines
-        let mut rendered_lines: Vec<Line<'static>> = Vec::new();
+        // Pre-render all messages into formatted items
+        let mut rendered_items: Vec<ChatRenderItem> = Vec::new();
 
         for msg in msgs {
             let has_content = msg.content.as_ref().map(|c| !c.trim().is_empty()).unwrap_or(false);
@@ -171,8 +184,8 @@ impl<'a> Widget for ChatFeed<'a> {
                     Span::styled(format!("[{}] ", time_str), Style::default().fg(Color::Rgb(90, 90, 100))),
                     Span::styled(notice, Style::default().fg(Color::Rgb(170, 170, 190)).add_modifier(Modifier::ITALIC)),
                 ];
-                rendered_lines.push(Line::from(sys_spans));
-                rendered_lines.push(Line::from(String::new()));
+                rendered_items.push(ChatRenderItem::Line(Line::from(sys_spans)));
+                rendered_items.push(ChatRenderItem::Line(Line::from(String::new())));
                 continue;
             }
 
@@ -188,11 +201,7 @@ impl<'a> Widget for ChatFeed<'a> {
 
             let author_color = theme.role_color(&msg.author);
 
-            let mut header_spans = vec![
-                Span::styled(format!("[{}] ", time_str), Style::default().fg(Color::Rgb(90, 90, 100))),
-            ];
-
-            // PFP prefix (avatar request trigger)
+            // Trigger avatar fetch if missing
             if let Some(ref u) = user {
                 let key = format!("avatar_{}", u.id);
                 let url = self.state.avatar_url_for_user(u);
@@ -204,10 +213,12 @@ impl<'a> Widget for ChatFeed<'a> {
                         }
                     }
                 }
-                header_spans.push(Span::styled("● ", Style::default().fg(theme.primary)));
             }
 
-            header_spans.push(Span::styled(author_name, Style::default().fg(author_color).add_modifier(Modifier::BOLD)));
+            let mut header_spans = vec![
+                Span::styled(format!("[{}] ", time_str), Style::default().fg(Color::Rgb(90, 90, 100))),
+                Span::styled(author_name, Style::default().fg(author_color).add_modifier(Modifier::BOLD)),
+            ];
 
             // Bot badge
             if let Some(ref u) = user {
@@ -216,16 +227,19 @@ impl<'a> Widget for ChatFeed<'a> {
                 }
             }
 
-            rendered_lines.push(Line::from(header_spans));
+            rendered_items.push(ChatRenderItem::AuthorHeader {
+                spans: header_spans,
+                author_id: msg.author.clone(),
+            });
 
             // 2. Content lines
             let content = msg.content.as_deref().unwrap_or("");
             if !content.trim().is_empty() {
                 let content_lines = parser.parse_message(content);
                 for mut cl in content_lines {
-                    let mut indented = vec![Span::styled("  ", Style::default())];
+                    let mut indented = vec![Span::styled("    ", Style::default())];
                     indented.append(&mut cl.spans);
-                    rendered_lines.push(Line::from(indented));
+                    rendered_items.push(ChatRenderItem::Line(Line::from(indented)));
                 }
             }
 
@@ -234,13 +248,11 @@ impl<'a> Widget for ChatFeed<'a> {
                 for att in attachments {
                     let name = att.filename.as_deref().unwrap_or("file");
                     let size_str = att.size.map(format_bytes).unwrap_or_else(|| "unknown size".to_string());
-                    let badge = format!("  📎 {} ({})", name, size_str);
-                    rendered_lines.push(Line::from(vec![
-                        Span::styled(badge, Style::default().fg(Color::Rgb(100, 200, 255)).add_modifier(Modifier::BOLD)),
-                    ]));
+                    let badge = format!("    📎 {} ({})", name, size_str);
 
                     // Check if attachment is an image
                     let is_image = att.content_type.as_deref().map(|c| c.starts_with("image/")).unwrap_or(false)
+                        || att.metadata.as_ref().and_then(|m| m.file_type.as_deref()) == Some("Image")
                         || name.ends_with(".png")
                         || name.ends_with(".jpg")
                         || name.ends_with(".jpeg")
@@ -263,15 +275,24 @@ impl<'a> Widget for ChatFeed<'a> {
                         }
 
                         if is_cached {
-                            // Reserve 8 lines for rendered image preview
-                            rendered_lines.push(Line::from(vec![
-                                Span::styled(format!("  [🖼️ Image: {}]", key), Style::default().fg(Color::Rgb(80, 200, 120))),
-                            ]));
+                            // Image height constrained to 10 rows
+                            rendered_items.push(ChatRenderItem::ImageAttachment {
+                                key: key.clone(),
+                                badge: badge.clone(),
+                                height: 10,
+                            });
                         } else {
-                            rendered_lines.push(Line::from(vec![
-                                Span::styled("  [🖼️ Loading image...]", Style::default().fg(Color::Rgb(140, 140, 150)).add_modifier(Modifier::ITALIC)),
-                            ]));
+                            rendered_items.push(ChatRenderItem::Line(Line::from(vec![
+                                Span::styled(badge.clone(), Style::default().fg(Color::Rgb(100, 200, 255)).add_modifier(Modifier::BOLD)),
+                            ])));
+                            rendered_items.push(ChatRenderItem::Line(Line::from(vec![
+                                Span::styled("    [🖼️ Loading image...]", Style::default().fg(Color::Rgb(140, 140, 150)).add_modifier(Modifier::ITALIC)),
+                            ])));
                         }
+                    } else {
+                        rendered_items.push(ChatRenderItem::Line(Line::from(vec![
+                            Span::styled(badge, Style::default().fg(Color::Rgb(100, 200, 255)).add_modifier(Modifier::BOLD)),
+                        ])));
                     }
                 }
             }
@@ -283,18 +304,18 @@ impl<'a> Widget for ChatFeed<'a> {
                     let url = emb.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
                     let desc = emb.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
                     let mut embed_spans = vec![
-                        Span::styled("  ┌ ", Style::default().fg(Color::Rgb(120, 120, 150))),
+                        Span::styled("    ┌ ", Style::default().fg(Color::Rgb(120, 120, 150))),
                         Span::styled(title, Style::default().fg(Color::Rgb(220, 220, 255)).add_modifier(Modifier::BOLD)),
                     ];
                     if !url.is_empty() {
                         embed_spans.push(Span::styled(format!(" ({})", url), Style::default().fg(Color::Rgb(100, 150, 240))));
                     }
-                    rendered_lines.push(Line::from(embed_spans));
+                    rendered_items.push(ChatRenderItem::Line(Line::from(embed_spans)));
                     if !desc.is_empty() {
-                        rendered_lines.push(Line::from(vec![
-                            Span::styled("  │ ", Style::default().fg(Color::Rgb(120, 120, 150))),
+                        rendered_items.push(ChatRenderItem::Line(Line::from(vec![
+                            Span::styled("    │ ", Style::default().fg(Color::Rgb(120, 120, 150))),
                             Span::styled(desc, Style::default().fg(Color::Rgb(180, 180, 190))),
-                        ]));
+                        ])));
                     }
                 }
             }
@@ -302,7 +323,7 @@ impl<'a> Widget for ChatFeed<'a> {
             // 5. Reactions
             if let Some(ref reactions) = msg.reactions {
                 if !reactions.is_empty() {
-                    let mut rx_spans = vec![Span::styled("  ", Style::default())];
+                    let mut rx_spans = vec![Span::styled("    ", Style::default())];
                     for (emoji, uids) in reactions {
                         let rx_str = format!(" [ {} {} ] ", emoji, uids.len());
                         rx_spans.push(Span::styled(
@@ -310,30 +331,110 @@ impl<'a> Widget for ChatFeed<'a> {
                             Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 50)),
                         ));
                     }
-                    rendered_lines.push(Line::from(rx_spans));
+                    rendered_items.push(ChatRenderItem::Line(Line::from(rx_spans)));
                 }
             }
 
             // Message separator spacing
-            rendered_lines.push(Line::from(String::new()));
+            rendered_items.push(ChatRenderItem::Line(Line::from(String::new())));
         }
 
-        let total_lines = rendered_lines.len();
+        // Expand items to lines count for scrolling calculation
+        struct PositionedItem<'b> {
+            y_offset: usize,
+            height: usize,
+            item: &'b ChatRenderItem,
+        }
+
+        let mut positioned_items = Vec::new();
+        let mut total_lines = 0;
+        for item in &rendered_items {
+            let h = match item {
+                ChatRenderItem::Line(_) => 1,
+                ChatRenderItem::AuthorHeader { .. } => 1,
+                ChatRenderItem::ImageAttachment { height, .. } => *height as usize + 1, // image + badge line
+            };
+            positioned_items.push(PositionedItem {
+                y_offset: total_lines,
+                height: h,
+                item,
+            });
+            total_lines += h;
+        }
+
         let visible_height = area.height as usize;
-
-        // Calculate scroll slice
-        // offset = 0: bottom of rendered_lines is at the bottom of the viewport
         let offset = self.state.chat_scroll_offset.min(total_lines.saturating_sub(visible_height));
+        let view_start = total_lines.saturating_sub(offset + visible_height);
+        let view_end = total_lines.saturating_sub(offset);
 
-        let end_idx = total_lines.saturating_sub(offset);
-        let start_idx = end_idx.saturating_sub(visible_height);
+        for pos in &positioned_items {
+            let item_top = pos.y_offset;
+            let item_bottom = pos.y_offset + pos.height;
 
-        let lines_to_draw = &rendered_lines[start_idx..end_idx];
+            // Check if item overlaps viewport [view_start, view_end)
+            if item_bottom <= view_start || item_top >= view_end {
+                continue;
+            }
 
-        for (i, line) in lines_to_draw.iter().enumerate() {
-            let y = area.top() + i as u16;
-            if y < area.bottom() {
-                buf.set_line(area.left() + 1, y, line, area.width.saturating_sub(2));
+            match pos.item {
+                ChatRenderItem::Line(line) => {
+                    let screen_y = area.top() + (item_top.saturating_sub(view_start)) as u16;
+                    if screen_y < area.bottom() {
+                        buf.set_line(area.left() + 1, screen_y, line, area.width.saturating_sub(2));
+                    }
+                }
+                ChatRenderItem::AuthorHeader { spans, author_id } => {
+                    let screen_y = area.top() + (item_top.saturating_sub(view_start)) as u16;
+                    if screen_y < area.bottom() {
+                        // Render 2x1 PFP thumbnail on the left
+                        let pfp_rect = Rect {
+                            x: area.left() + 1,
+                            y: screen_y,
+                            width: 2,
+                            height: 1,
+                        };
+                        let key = format!("avatar_{}", author_id);
+                        if let Some(ref mut cache) = self.state.image_cache {
+                            if let Some(proto) = cache.get_mut(&key) {
+                                ratatui_image::ResizeEncodeRender::render(proto, pfp_rect, buf);
+                            }
+                        }
+
+                        // Render header text to the right of PFP
+                        let header_line = Line::from(spans.clone());
+                        buf.set_line(area.left() + 4, screen_y, &header_line, area.width.saturating_sub(5));
+                    }
+                }
+                ChatRenderItem::ImageAttachment { key, badge, height } => {
+                    let badge_line = Line::from(vec![
+                        Span::styled(badge.clone(), Style::default().fg(Color::Rgb(100, 200, 255)).add_modifier(Modifier::BOLD)),
+                    ]);
+
+                    let img_screen_y = area.top() + (item_top.saturating_sub(view_start)) as u16;
+                    let img_h = *height;
+
+                    if img_screen_y + img_h < area.bottom() {
+                        let max_img_w = (area.width.saturating_sub(8)).min(60);
+                        let img_rect = Rect {
+                            x: area.left() + 4,
+                            y: img_screen_y,
+                            width: max_img_w,
+                            height: img_h,
+                        };
+
+                        if let Some(ref mut cache) = self.state.image_cache {
+                            if let Some(proto) = cache.get_mut(key) {
+                                ratatui_image::ResizeEncodeRender::render(proto, img_rect, buf);
+                            }
+                        }
+                    }
+
+                    // Render badge line underneath image
+                    let badge_screen_y = img_screen_y + img_h;
+                    if badge_screen_y < area.bottom() {
+                        buf.set_line(area.left() + 1, badge_screen_y, &badge_line, area.width.saturating_sub(2));
+                    }
+                }
             }
         }
 

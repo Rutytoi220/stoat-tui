@@ -27,6 +27,8 @@ pub enum AppEvent {
     VideoFrameReady,
     CallConnected { channel_id: String },
     ImageLoaded { key: String, dynamic_image: image::DynamicImage },
+    AttachmentUploaded { id: String, filename: String },
+    AttachmentUploadFailed(String),
 }
 
 pub struct EventHandler {

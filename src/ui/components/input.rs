@@ -49,7 +49,33 @@ impl<'a> Widget for MessageInput<'a> {
             }
         }
 
-        let input_y = inner.top();
+        let has_attachments = !self.state.pending_attachments.is_empty();
+        let mut input_y = inner.top();
+
+        if has_attachments {
+            let mut chip_str = String::from(" [ 📎 ");
+            for (idx, att) in self.state.pending_attachments.iter().enumerate() {
+                if idx > 0 {
+                    chip_str.push_str(", ");
+                }
+                chip_str.push_str(&att.filename);
+            }
+            chip_str.push_str(" • Esc/Backspace to clear ]");
+
+            let mut cx = inner.left();
+            for ch in chip_str.chars().take(inner.width as usize) {
+                buf[(cx, input_y)]
+                    .set_char(ch)
+                    .set_fg(Color::Rgb(100, 200, 255));
+                cx += 1;
+            }
+            input_y += 1;
+        }
+
+        if input_y >= inner.bottom() {
+            return;
+        }
+
         let start_x = inner.left();
         let max_w = inner.width as usize;
 

@@ -56,17 +56,20 @@ impl App {
                 let client = api_client_img.lock().await;
                 match client.fetch_bytes(&url).await {
                     Ok(bytes) => {
-                        if let Ok(dyn_img) = image::load_from_memory(&bytes) {
-                            let _ = event_tx_img.send(AppEvent::ImageLoaded {
-                                key,
-                                dynamic_image: dyn_img,
-                            }).await;
-                        } else {
-                            log_debug!("Failed to decode image from {}", url);
+                        match image::load_from_memory(&bytes) {
+                            Ok(dyn_img) => {
+                                let _ = event_tx_img.send(AppEvent::ImageLoaded {
+                                    key,
+                                    dynamic_image: dyn_img,
+                                }).await;
+                            }
+                            Err(e) => {
+                                log_error!("Failed to decode image from {} ({} bytes): {}", url, bytes.len(), e);
+                            }
                         }
                     }
                     Err(e) => {
-                        log_debug!("Failed to fetch asset from {}: {}", url, e);
+                        log_error!("Failed to fetch asset from {}: {}", url, e);
                     }
                 }
             }
@@ -337,6 +340,13 @@ impl App {
                 if let Some(ref mut cache) = self.state.image_cache {
                     cache.insert(key, dynamic_image);
                 }
+            }
+            AppEvent::AttachmentUploaded { id, filename } => {
+                self.state.set_status(format!("📎 Attached {}", filename));
+                self.state.pending_attachments.push(crate::state::PendingAttachment { id, filename });
+            }
+            AppEvent::AttachmentUploadFailed(err) => {
+                self.state.set_status(format!("❌ Upload failed: {}", err));
             }
             AppEvent::StartGateway { token, gateway_url } => {
                 self.start_gateway(token, gateway_url);
@@ -696,6 +706,10 @@ impl App {
                     }
                     return;
                 }
+                KeyCode::Char('u') | KeyCode::Char('U') => {
+                    self.open_image_upload();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -740,6 +754,10 @@ impl App {
                         self.state.set_status(if self.state.call_fullscreen { "Call fullscreen enabled" } else { "Call fullscreen disabled" });
                         return;
                     }
+                }
+                KeyCode::Char('u') => {
+                    self.open_image_upload();
+                    return;
                 }
                 _ => {}
             }
@@ -931,16 +949,28 @@ impl App {
             },
             Focus::Input => match key.code {
                 KeyCode::Esc => {
-                    self.state.focus = Focus::Chat;
+                    if !self.state.pending_attachments.is_empty() {
+                        self.state.pending_attachments.clear();
+                        self.state.set_status("Cleared pending attachments");
+                    } else {
+                        self.state.focus = Focus::Chat;
+                    }
                 }
                 KeyCode::Enter => {
                     let content = self.state.input_clear();
-                    if !content.trim().is_empty() {
+                    if !content.trim().is_empty() || !self.state.pending_attachments.is_empty() {
                         self.send_message(content).await;
                     }
                 }
                 KeyCode::Backspace => {
-                    self.state.input_backspace();
+                    if self.state.input_buffer.is_empty() && !self.state.pending_attachments.is_empty() {
+                        let removed = self.state.pending_attachments.pop();
+                        if let Some(att) = removed {
+                            self.state.set_status(format!("Removed attachment {}", att.filename));
+                        }
+                    } else {
+                        self.state.input_backspace();
+                    }
                 }
                 KeyCode::Delete => {
                     self.state.input_delete();
@@ -1428,22 +1458,85 @@ impl App {
         }
     }
 
+    pub fn open_image_upload(&mut self) {
+        let autumn_url = self.state.autumn_url.clone();
+        let api = self.api_client.clone();
+        let tx = self.event_tx.clone();
+
+        self.state.set_status("Opening file picker...");
+
+        tokio::task::spawn_blocking(move || {
+            let file_opt = rfd::FileDialog::new()
+                .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif"])
+                .pick_file();
+
+            if let Some(path) = file_opt {
+                let filename = path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("image.png")
+                    .to_string();
+
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let tx_clone = tx.clone();
+                        let filename_clone = filename.clone();
+                        tokio::spawn(async move {
+                            let client = api.lock().await;
+                            match client.upload_autumn_attachment(&autumn_url, filename_clone.clone(), bytes).await {
+                                Ok(id) => {
+                                    let _ = tx_clone.send(AppEvent::AttachmentUploaded {
+                                        id,
+                                        filename: filename_clone,
+                                    }).await;
+                                }
+                                Err(e) => {
+                                    let _ = tx_clone.send(AppEvent::AttachmentUploadFailed(e.to_string())).await;
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.blocking_send(AppEvent::AttachmentUploadFailed(format!("Failed to read file: {}", e)));
+                    }
+                }
+            }
+        });
+    }
+
     async fn send_message(&mut self, content: String) {
         let channel_id = match &self.state.active_channel_id {
             Some(cid) => cid.clone(),
             None => return,
         };
 
+        let pending = std::mem::take(&mut self.state.pending_attachments);
+        let attachment_ids: Option<Vec<String>> = if !pending.is_empty() {
+            Some(pending.iter().map(|a| a.id.clone()).collect())
+        } else {
+            None
+        };
+
+        let content_opt: Option<String> = if content.trim().is_empty() {
+            None
+        } else {
+            Some(content.clone())
+        };
+
+        // Don't send completely empty messages if no content and no attachments
+        if content_opt.is_none() && attachment_ids.is_none() {
+            return;
+        }
+
         // If authenticated with real token, send via REST API
         if let Some(ref _token) = self.state.config.token {
             let api = self.api_client.clone();
             let tx = self.event_tx.clone();
             let cid = channel_id.clone();
-            let cnt = content.clone();
 
             tokio::spawn(async move {
                 let client = api.lock().await;
-                match client.send_message(&cid, &cnt).await {
+                match client.send_message_with_attachments(&cid, content_opt, attachment_ids).await {
                     Ok(msg) => {
                         let _ = tx.send(AppEvent::ApiMessageSent(Ok(msg))).await;
                     }
@@ -1455,11 +1548,21 @@ impl App {
         } else {
             // Local Demo/Offline Mode: Immediately append to channel messages and auto-scroll
             let current_user_id = self.state.current_user.as_ref().map(|u| u.id.clone()).unwrap_or_else(|| "user_me".to_string());
+            let demo_attachments = if !pending.is_empty() {
+                Some(pending.into_iter().map(|p| crate::api::models::FileObject {
+                    id: p.id,
+                    filename: Some(p.filename),
+                    ..Default::default()
+                }).collect())
+            } else {
+                None
+            };
             let new_msg = Message {
                 id: format!("demo_msg_{}", chrono::Utc::now().timestamp_millis()),
                 channel: channel_id.clone(),
                 author: current_user_id,
-                content: Some(content.clone()),
+                content: content_opt,
+                attachments: demo_attachments,
                 reactions: None,
                 ..Default::default()
             };

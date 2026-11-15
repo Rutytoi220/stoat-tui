@@ -96,25 +96,26 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     //   2. ChatFeed (Constraint::Min(6))
     //   3. Input (Constraint::Length(3))
     let has_call = state.active_call.is_some();
+    let input_height = if state.pending_attachments.is_empty() { 3 } else { 4 };
     let center_constraints = if has_call {
         vec![
-            Constraint::Length(3),         // 1. Header
-            Constraint::Percentage(45),    // 2. CallStage (at least 10)
-            Constraint::Min(6),            // 3. ChatFeed
-            Constraint::Length(3),         // 4. Input
+            Constraint::Length(3),            // 1. Header
+            Constraint::Percentage(45),       // 2. CallStage (at least 10)
+            Constraint::Min(6),               // 3. ChatFeed
+            Constraint::Length(input_height), // 4. Input
         ]
     } else if has_unjoined_active_call {
         vec![
-            Constraint::Length(3),         // 1. Header
-            Constraint::Length(1),         // 2. CallBanner
-            Constraint::Min(6),            // 3. ChatFeed
-            Constraint::Length(3),         // 4. Input
+            Constraint::Length(3),            // 1. Header
+            Constraint::Length(1),            // 2. CallBanner
+            Constraint::Min(6),               // 3. ChatFeed
+            Constraint::Length(input_height), // 4. Input
         ]
     } else {
         vec![
-            Constraint::Length(3),         // 1. Header
-            Constraint::Min(6),            // 2. ChatFeed
-            Constraint::Length(3),         // 3. Input
+            Constraint::Length(3),            // 1. Header
+            Constraint::Min(6),               // 2. ChatFeed
+            Constraint::Length(input_height), // 3. Input
         ]
     };
 

@@ -20,6 +20,7 @@ impl DeltaClient {
     pub fn new(api_url: String, token: Option<String>, is_bot: bool) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(15))
+            .user_agent("stoat-tui/0.1.0")
             .build()
             .unwrap_or_else(|_| Client::new());
 
@@ -374,10 +375,20 @@ impl DeltaClient {
     }
 
     pub async fn send_message(&self, channel_id: &str, content: &str) -> Result<Message> {
+        self.send_message_with_attachments(channel_id, if content.trim().is_empty() { None } else { Some(content.to_string()) }, None).await
+    }
+
+    pub async fn send_message_with_attachments(
+        &self,
+        channel_id: &str,
+        content: Option<String>,
+        attachments: Option<Vec<String>>,
+    ) -> Result<Message> {
         let url = format!("{}/channels/{}/messages", self.api_url, channel_id);
-        log_debug!("POST {} (sending message, len: {})", url, content.len());
+        log_debug!("POST {} (sending message, content_len: {:?}, attachments: {:?})", url, content.as_ref().map(|c| c.len()), attachments.as_ref().map(|a| a.len()));
         let payload = SendMessagePayload {
-            content: content.to_string(),
+            content,
+            attachments,
             replies: None,
         };
 
@@ -404,6 +415,42 @@ impl DeltaClient {
             .context("Failed to parse returned message JSON")?;
         log_debug!("Message {} posted successfully to channel {}", msg.id, channel_id);
         Ok(msg)
+    }
+
+    pub async fn upload_autumn_attachment(
+        &self,
+        autumn_url: &str,
+        filename: String,
+        bytes: Vec<u8>,
+    ) -> Result<String> {
+        let url = format!("{}/attachments", autumn_url.trim_end_matches('/'));
+        log_info!("Uploading file '{}' ({} bytes) to Autumn at {}...", filename, bytes.len(), url);
+
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename.clone());
+        let form = reqwest::multipart::Form::new().part("file", part);
+
+        let resp = self
+            .client
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await
+            .with_context(|| format!("Failed to upload attachment to {}", url))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let err_text = resp.text().await.unwrap_or_default();
+            log_error!("Autumn upload failed (HTTP {}): {}", status, err_text);
+            return Err(anyhow!("Autumn upload returned HTTP {}: {}", status, err_text));
+        }
+
+        let upload_resp: AutumnUploadResponse = resp
+            .json()
+            .await
+            .context("Failed to parse Autumn upload response")?;
+        log_info!("Autumn file '{}' uploaded successfully with id {}", filename, upload_resp.id);
+        Ok(upload_resp.id)
     }
 
     pub async fn fetch_dms(&self) -> Result<Vec<Channel>> {
@@ -463,6 +510,7 @@ impl DeltaClient {
             .with_context(|| format!("Failed to fetch asset from {}", url))?;
         let status = resp.status();
         if !status.is_success() {
+            log_error!("Asset fetch from {} returned HTTP {}", url, status);
             return Err(anyhow!("Asset fetch returned HTTP {}", status));
         }
         let bytes = resp.bytes().await.context("Failed to read asset bytes")?;

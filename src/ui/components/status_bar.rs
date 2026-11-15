@@ -77,11 +77,11 @@ impl<'a> Widget for StatusBar<'a> {
             }
         } else {
             match self.state.focus {
-                Focus::Servers => "Servers [ ↑/↓: Select • Enter: Switch ]",
-                Focus::Channels => "Channels [ ↑/↓: Select • Enter: Switch • c: Call ]",
-                Focus::Chat => "Chat [ ↑/↓: Scroll • i: Type • c: Call ]",
-                Focus::Input => "Input [ Enter: Send • Esc: Unfocus • Alt+C: Call ]",
-                Focus::Members => "Members [ ↑/↓: Browse • F4: Toggle ]",
+                Focus::Servers => "Servers [ ↑/↓: Select • Enter: Switch • u: Upload ]",
+                Focus::Channels => "Channels [ ↑/↓: Select • Enter: Switch • c: Call • u: Upload ]",
+                Focus::Chat => "Chat [ ↑/↓: Scroll • i: Type • c: Call • u: Upload ]",
+                Focus::Input => "Input [ Enter: Send • Esc: Unfocus • Alt+U: Upload • Alt+C: Call ]",
+                Focus::Members => "Members [ ↑/↓: Browse • F4: Toggle • u: Upload ]",
             }
         };
 

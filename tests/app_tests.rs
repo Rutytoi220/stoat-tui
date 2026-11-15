@@ -861,3 +861,40 @@ async fn test_login_modal_reset_on_f2_and_account_switch_cleanup() {
     assert!(!app.state.show_login_modal);
     assert_eq!(app.state.config.token.as_deref(), Some("brand_new_token_456"));
 }
+
+#[tokio::test]
+async fn test_pending_attachment_and_clear_shortcuts() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::state::{Focus, PendingAttachment};
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let config = Config { token: Some("tok_123".to_string()), ..Default::default() };
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(config, tx, picker);
+    app.state.show_login_modal = false;
+    app.state.focus = Focus::Input;
+
+    // Simulate uploaded attachment event
+    app.handle_event(AppEvent::AttachmentUploaded {
+        id: "att_01J_FILE".to_string(),
+        filename: "screenshot.png".to_string(),
+    }).await;
+
+    assert_eq!(app.state.pending_attachments.len(), 1);
+    assert_eq!(app.state.pending_attachments[0].filename, "screenshot.png");
+
+    // Backspace with empty input buffer removes the attachment
+    let backspace_key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+    app.handle_event(AppEvent::Key(backspace_key)).await;
+    assert!(app.state.pending_attachments.is_empty());
+
+    // Add back an attachment and test Esc clears it
+    app.state.pending_attachments.push(PendingAttachment {
+        id: "att_02J_TEST".to_string(),
+        filename: "photo.jpg".to_string(),
+    });
+    let esc_key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    app.handle_event(AppEvent::Key(esc_key)).await;
+    assert!(app.state.pending_attachments.is_empty());
+}

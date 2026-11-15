@@ -186,14 +186,28 @@ pub struct BotInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FileMetadata {
+    #[serde(rename = "type", default)]
+    pub file_type: Option<String>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileObject {
     #[serde(rename = "_id")]
     pub id: String,
+    #[serde(default)]
+    pub tag: Option<String>,
     pub filename: Option<String>,
     #[serde(default)]
-    pub size: Option<u64>,
+    pub metadata: Option<FileMetadata>,
     #[serde(default)]
     pub content_type: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -335,9 +349,17 @@ pub struct Masquerade {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessagePayload {
-    pub content: String,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replies: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AutumnUploadResponse {
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
