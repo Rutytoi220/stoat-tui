@@ -3,8 +3,9 @@ pub mod messages;
 use crate::{log_debug, log_error, log_info, log_warn};
 use futures_util::{SinkExt, StreamExt};
 use messages::{ClientMessage, ServerMessage};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
@@ -108,11 +109,15 @@ impl BonfireClient {
                             }
                         });
 
+                        let last_ping_sent = Arc::new(Mutex::new(None::<Instant>));
+
                         loop {
+                            let ping_sent_clone = last_ping_sent.clone();
                             tokio::select! {
                                 Some(_) = ping_rx.recv() => {
                                     let ping = ClientMessage::Ping { data: 0 };
                                     if let Ok(json) = serde_json::to_string(&ping) {
+                                        *ping_sent_clone.lock().await = Some(Instant::now());
                                         if write.send(WsMessage::Text(json)).await.is_err() {
                                             log_warn!("Failed to send gateway heartbeat ping");
                                             break;
@@ -136,14 +141,12 @@ impl BonfireClient {
                                                         log_info!("Gateway Authenticated event received");
                                                         let _ = self.event_tx.send(GatewayEvent::Authenticated).await;
                                                     }
-                                                    ServerMessage::Pong { data } => {
-                                                        let now_ms = SystemTime::now()
-                                                            .duration_since(UNIX_EPOCH)
-                                                            .unwrap_or_default()
-                                                            .as_millis() as u64;
-                                                        let latency = now_ms.saturating_sub(*data);
-                                                        log_debug!("Gateway Pong: {}ms latency", latency);
-                                                        let _ = self.event_tx.send(GatewayEvent::Latency(latency)).await;
+                                                    ServerMessage::Pong { .. } => {
+                                                        if let Some(sent) = ping_sent_clone.lock().await.take() {
+                                                            let latency = sent.elapsed().as_millis() as u64;
+                                                            log_debug!("Gateway Pong: {}ms latency", latency);
+                                                            let _ = self.event_tx.send(GatewayEvent::Latency(latency)).await;
+                                                        }
                                                     }
                                                     _ => {}
                                                 }

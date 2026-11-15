@@ -174,6 +174,10 @@ pub struct FileObject {
     #[serde(rename = "_id")]
     pub id: String,
     pub filename: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub content_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -293,6 +297,10 @@ pub struct Message {
     #[serde(default)]
     pub attachments: Option<Vec<FileObject>>,
     #[serde(default)]
+    pub embeds: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub system: Option<serde_json::Value>,
+    #[serde(default)]
     pub edited: Option<String>,
     #[serde(default)]
     pub replies: Option<Vec<String>>,
@@ -314,4 +322,47 @@ pub struct SendMessagePayload {
     pub content: String,
     #[serde(default)]
     pub replies: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CallJoinResponse {
+    pub token: String,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// Crockford Base32 character mapping for ULID timestamp decoding
+const CROCKFORD_CHARS: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// Extracts the 48-bit Unix timestamp in milliseconds from a 26-character Crockford Base32 ULID.
+/// The first 10 characters encode the timestamp in milliseconds.
+pub fn ulid_timestamp(id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let id_bytes = id.as_bytes();
+    if id_bytes.len() < 10 {
+        return None;
+    }
+
+    let mut timestamp_ms: u64 = 0;
+    for &b in &id_bytes[..10] {
+        let upper = b.to_ascii_uppercase();
+        let val = CROCKFORD_CHARS.iter().position(|&c| c == upper)? as u64;
+        timestamp_ms = (timestamp_ms << 5) | val;
+    }
+
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ulid_timestamp() {
+        // ULID starting with 01ARZ3NDEK...
+        // 01ARZ3NDEK -> timestamp ms: 1469922850259 (2016-07-30T23:54:10.259Z)
+        let dt = ulid_timestamp("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert!(dt.is_some());
+        let dt = dt.unwrap();
+        assert_eq!(dt.timestamp_millis(), 1469922850259);
+    }
 }

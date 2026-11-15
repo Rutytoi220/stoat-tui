@@ -54,6 +54,26 @@ pub enum ServerMessage {
         id: String,
         data: serde_json::Value,
     },
+    VoiceChannelJoin {
+        id: String,
+        user: String,
+    },
+    VoiceChannelLeave {
+        id: String,
+        user: String,
+    },
+    UserVoiceStateUpdate {
+        id: String,
+        user: String,
+        #[serde(default)]
+        speaking: Option<bool>,
+        #[serde(default)]
+        muted: Option<bool>,
+        #[serde(default)]
+        deafened: Option<bool>,
+        #[serde(default)]
+        screensharing: Option<bool>,
+    },
     Error {
         error: String,
     },
@@ -94,6 +114,32 @@ impl ServerMessage {
                     } else {
                         None
                     }
+                }
+                "VoiceChannelJoin" => {
+                    let id = val.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    let user = val.get("user").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    Some(ServerMessage::VoiceChannelJoin { id, user })
+                }
+                "VoiceChannelLeave" => {
+                    let id = val.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    let user = val.get("user").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    Some(ServerMessage::VoiceChannelLeave { id, user })
+                }
+                "UserVoiceStateUpdate" => {
+                    let id = val.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    let user = val.get("user").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    let speaking = val.get("speaking").and_then(|v| v.as_bool());
+                    let muted = val.get("muted").and_then(|v| v.as_bool());
+                    let deafened = val.get("deafened").and_then(|v| v.as_bool());
+                    let screensharing = val.get("screensharing").and_then(|v| v.as_bool());
+                    Some(ServerMessage::UserVoiceStateUpdate {
+                        id,
+                        user,
+                        speaking,
+                        muted,
+                        deafened,
+                        screensharing,
+                    })
                 }
                 _ => Some(ServerMessage::Unknown),
             }

@@ -24,6 +24,7 @@ pub enum AppEvent {
     ApiDmsFetched(Vec<Channel>),
     ApiSessionExpired,
     StartGateway { token: String, gateway_url: Option<String> },
+    VideoFrameReady,
 }
 
 pub struct EventHandler {

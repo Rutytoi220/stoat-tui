@@ -1,3 +1,4 @@
+pub mod call;
 pub mod channels;
 pub mod chat;
 pub mod header;

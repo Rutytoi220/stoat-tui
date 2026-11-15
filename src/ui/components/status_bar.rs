@@ -69,12 +69,20 @@ impl<'a> Widget for StatusBar<'a> {
         x += 2;
 
         // 2. Dynamic contextual hotkeys for the current pane
-        let pane_hints = match self.state.focus {
-            Focus::Servers => "Servers [ ↑/↓: Select • Enter: Switch ]",
-            Focus::Channels => "Channels [ ↑/↓: Select • Enter: Switch ]",
-            Focus::Chat => "Chat [ ↑/↓: Scroll • i: Type ]",
-            Focus::Input => "Input [ Enter: Send • Esc: Unfocus ]",
-            Focus::Members => "Members [ ↑/↓: Browse • F4: Toggle ]",
+        let pane_hints = if self.state.active_call.is_some() {
+            if self.state.focus == Focus::Input {
+                "Call [ Alt+C: Leave • Alt+M: Mute • Alt+D: Deafen • Alt+S: Screen • Alt+F: Fullscreen ]"
+            } else {
+                "Call [ c: Leave • m: Mute • d: Deafen • s: Screen • f: Fullscreen ]"
+            }
+        } else {
+            match self.state.focus {
+                Focus::Servers => "Servers [ ↑/↓: Select • Enter: Switch ]",
+                Focus::Channels => "Channels [ ↑/↓: Select • Enter: Switch • c: Call ]",
+                Focus::Chat => "Chat [ ↑/↓: Scroll • i: Type • c: Call ]",
+                Focus::Input => "Input [ Enter: Send • Esc: Unfocus • Alt+C: Call ]",
+                Focus::Members => "Members [ ↑/↓: Browse • F4: Toggle ]",
+            }
         };
 
         for ch in pane_hints.chars() {

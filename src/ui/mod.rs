@@ -4,6 +4,7 @@ pub mod modals;
 pub mod theme;
 
 use crate::state::AppState;
+use components::call::CallStage;
 use components::channels::ChannelsSidebar;
 use components::chat::ChatFeed;
 use components::header::ContentHeader;
@@ -18,6 +19,24 @@ use ratatui::Frame;
 
 pub fn render(f: &mut Frame, state: &mut AppState) {
     let size = f.area();
+
+    // If call fullscreen mode is active, render call stage taking 100% of workspace
+    if state.call_fullscreen && state.active_call.is_some() {
+        let root_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(5),
+                Constraint::Length(1), // Status Bar
+            ])
+            .split(size);
+
+        let workspace_area = root_chunks[0];
+        let status_bar_area = root_chunks[1];
+
+        f.render_widget(CallStage::new(state), workspace_area);
+        f.render_widget(StatusBar::new(state), status_bar_area);
+        return;
+    }
 
     // 1. Root Vertical Split: Main Workspace + Bottom Status Bar
     let root_chunks = Layout::default()
@@ -60,19 +79,33 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         Rect::default()
     };
 
-    // 3. Center Area Split: Header + Chat + Input
-    let center_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    // 3. Center Area Split: Header + (Optional Call Stage) + Chat + Input
+    let has_call = state.active_call.is_some();
+    let center_constraints = if has_call {
+        vec![
+            Constraint::Length(2),  // Channel Header
+            Constraint::Length(10), // Docked Call Stage
+            Constraint::Min(3),     // Message Feed
+            Constraint::Length(3),  // Message Input Bar
+        ]
+    } else {
+        vec![
             Constraint::Length(2), // Channel Header
             Constraint::Min(3),    // Message Feed
             Constraint::Length(3), // Message Input Bar
-        ])
+        ]
+    };
+
+    let center_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(center_constraints)
         .split(center_rect);
 
-    let header_rect = center_chunks[0];
-    let chat_rect = center_chunks[1];
-    let input_rect = center_chunks[2];
+    let (header_rect, call_rect, chat_rect, input_rect) = if has_call {
+        (center_chunks[0], Some(center_chunks[1]), center_chunks[2], center_chunks[3])
+    } else {
+        (center_chunks[0], None, center_chunks[1], center_chunks[2])
+    };
 
     // Record layout rects in state for mouse hit testing
     state.rect_rail = rail_rect;
@@ -145,6 +178,9 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     f.render_widget(ServersRail::new(state), rail_rect);
     f.render_widget(ChannelsSidebar::new(state), channels_rect);
     f.render_widget(ContentHeader::new(state), header_rect);
+    if let Some(cr) = call_rect {
+        f.render_widget(CallStage::new(state), cr);
+    }
     f.render_widget(ChatFeed::new(state), chat_rect);
     f.render_widget(MessageInput::new(state), input_rect);
 

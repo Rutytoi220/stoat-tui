@@ -428,4 +428,29 @@ impl DeltaClient {
             .context("Failed to parse DMs JSON")?;
         Ok(channels)
     }
+
+    pub async fn join_call(&self, channel_id: &str) -> Result<CallJoinResponse> {
+        let url = format!("{}/channels/{}/join_call", self.api_url, channel_id);
+        log_info!("Calling POST {} to join voice call...", url);
+
+        let resp = self
+            .client
+            .post(&url)
+            .headers(self.headers())
+            .send()
+            .await
+            .with_context(|| format!("Failed to call join_call at {}", url))?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        log_debug!("POST {} status {}: {}", url, status, body);
+
+        if !status.is_success() {
+            return Err(anyhow!("Join call error (HTTP {}): {}", status, body));
+        }
+
+        let join_resp: CallJoinResponse = serde_json::from_str(&body)
+            .with_context(|| format!("Failed to parse join_call response JSON: {}", body))?;
+        Ok(join_resp)
+    }
 }

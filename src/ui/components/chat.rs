@@ -1,5 +1,7 @@
+use crate::api::models::ulid_timestamp;
 use crate::state::{AppState, Focus};
 use crate::ui::markdown::MarkdownParser;
+use chrono::{Datelike, Local};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -13,6 +15,74 @@ pub struct ChatFeed<'a> {
 impl<'a> ChatFeed<'a> {
     pub fn new(state: &'a AppState) -> Self {
         Self { state }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn format_ulid_time(id: &str) -> String {
+    if let Some(utc) = ulid_timestamp(id) {
+        let local = utc.with_timezone(&Local);
+        let now = Local::now();
+        if local.year() == now.year() && local.ordinal() == now.ordinal() {
+            local.format("%H:%M").to_string()
+        } else {
+            local.format("%d/%m %H:%M").to_string()
+        }
+    } else {
+        "--:--".to_string()
+    }
+}
+
+fn format_system_event(system: &serde_json::Value) -> String {
+    let event_type = system.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match event_type {
+        "user_added" => {
+            let u = system.get("user").and_then(|v| v.as_str()).unwrap_or("someone");
+            format!("→ User {} was added to the channel", u)
+        }
+        "user_remove" => {
+            let u = system.get("user").and_then(|v| v.as_str()).unwrap_or("someone");
+            format!("← User {} was removed from the channel", u)
+        }
+        "user_joined" => {
+            let u = system.get("id").or_else(|| system.get("user")).and_then(|v| v.as_str()).unwrap_or("someone");
+            format!("→ User {} joined the server", u)
+        }
+        "user_left" => {
+            let u = system.get("id").or_else(|| system.get("user")).and_then(|v| v.as_str()).unwrap_or("someone");
+            format!("← User {} left the server", u)
+        }
+        "user_kicked" => {
+            let u = system.get("id").or_else(|| system.get("user")).and_then(|v| v.as_str()).unwrap_or("someone");
+            format!("🔨 User {} was kicked", u)
+        }
+        "user_banned" => {
+            let u = system.get("id").or_else(|| system.get("user")).and_then(|v| v.as_str()).unwrap_or("someone");
+            format!("⛔ User {} was banned", u)
+        }
+        "channel_renamed" => {
+            let name = system.get("name").and_then(|v| v.as_str()).unwrap_or("channel");
+            format!("✏️ Channel renamed to #{}", name)
+        }
+        "channel_description_changed" => "📝 Channel description updated".to_string(),
+        "channel_icon_changed" => "🖼️ Channel icon updated".to_string(),
+        "call_started" => "📞 Call started in channel".to_string(),
+        other => {
+            if !other.is_empty() {
+                format!("ℹ️ System event: {}", other)
+            } else {
+                "ℹ️ System notice".to_string()
+            }
+        }
     }
 }
 
@@ -75,6 +145,37 @@ impl<'a> Widget for ChatFeed<'a> {
         let mut rendered_lines: Vec<Line<'static>> = Vec::new();
 
         for msg in msgs {
+            let has_content = msg.content.as_ref().map(|c| !c.trim().is_empty()).unwrap_or(false);
+            let has_attachments = msg.attachments.as_ref().map(|a| !a.is_empty()).unwrap_or(false);
+            let has_embeds = msg.embeds.as_ref().map(|e| !e.is_empty()).unwrap_or(false);
+            let is_system = msg.author == "00000000000000000000000000" || msg.system.is_some();
+
+            // Skip rendering completely empty ghost messages
+            if !has_content && !has_attachments && !has_embeds && !is_system {
+                continue;
+            }
+
+            let time_str = format_ulid_time(&msg.id);
+
+            // Handle system messages specially
+            if is_system {
+                let notice = if let Some(ref sys) = msg.system {
+                    format_system_event(sys)
+                } else if let Some(ref c) = msg.content {
+                    c.clone()
+                } else {
+                    "ℹ️ System event".to_string()
+                };
+
+                let sys_spans = vec![
+                    Span::styled(format!("[{}] ", time_str), Style::default().fg(Color::Rgb(90, 90, 100))),
+                    Span::styled(notice, Style::default().fg(Color::Rgb(170, 170, 190)).add_modifier(Modifier::ITALIC)),
+                ];
+                rendered_lines.push(Line::from(sys_spans));
+                rendered_lines.push(Line::from(String::new()));
+                continue;
+            }
+
             // 1. Author header line (resolved from cache or fetched asynchronously)
             let user = self.state.resolve_user(&msg.author);
             let author_name = if let Some(ref m) = msg.masquerade {
@@ -86,9 +187,6 @@ impl<'a> Widget for ChatFeed<'a> {
             };
 
             let author_color = theme.role_color(&msg.author);
-
-            // Simple timestamp from message or dummy
-            let time_str = "12:30"; // Formatted timestamp
 
             let mut header_spans = vec![
                 Span::styled(format!("[{}] ", time_str), Style::default().fg(Color::Rgb(90, 90, 100))),
@@ -106,14 +204,51 @@ impl<'a> Widget for ChatFeed<'a> {
 
             // 2. Content lines
             let content = msg.content.as_deref().unwrap_or("");
-            let content_lines = parser.parse_message(content);
-            for mut cl in content_lines {
-                let mut indented = vec![Span::styled("  ", Style::default())];
-                indented.append(&mut cl.spans);
-                rendered_lines.push(Line::from(indented));
+            if !content.trim().is_empty() {
+                let content_lines = parser.parse_message(content);
+                for mut cl in content_lines {
+                    let mut indented = vec![Span::styled("  ", Style::default())];
+                    indented.append(&mut cl.spans);
+                    rendered_lines.push(Line::from(indented));
+                }
             }
 
-            // 3. Reactions
+            // 3. Attachments
+            if let Some(ref attachments) = msg.attachments {
+                for att in attachments {
+                    let name = att.filename.as_deref().unwrap_or("file");
+                    let size_str = att.size.map(format_bytes).unwrap_or_else(|| "unknown size".to_string());
+                    let badge = format!("  📎 {} ({})", name, size_str);
+                    rendered_lines.push(Line::from(vec![
+                        Span::styled(badge, Style::default().fg(Color::Rgb(100, 200, 255)).add_modifier(Modifier::BOLD)),
+                    ]));
+                }
+            }
+
+            // 4. Embeds
+            if let Some(ref embeds) = msg.embeds {
+                for emb in embeds {
+                    let title = emb.get("title").and_then(|t| t.as_str()).unwrap_or("Embed").to_string();
+                    let url = emb.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                    let desc = emb.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
+                    let mut embed_spans = vec![
+                        Span::styled("  ┌ ", Style::default().fg(Color::Rgb(120, 120, 150))),
+                        Span::styled(title, Style::default().fg(Color::Rgb(220, 220, 255)).add_modifier(Modifier::BOLD)),
+                    ];
+                    if !url.is_empty() {
+                        embed_spans.push(Span::styled(format!(" ({})", url), Style::default().fg(Color::Rgb(100, 150, 240))));
+                    }
+                    rendered_lines.push(Line::from(embed_spans));
+                    if !desc.is_empty() {
+                        rendered_lines.push(Line::from(vec![
+                            Span::styled("  │ ", Style::default().fg(Color::Rgb(120, 120, 150))),
+                            Span::styled(desc, Style::default().fg(Color::Rgb(180, 180, 190))),
+                        ]));
+                    }
+                }
+            }
+
+            // 5. Reactions
             if let Some(ref reactions) = msg.reactions {
                 if !reactions.is_empty() {
                     let mut rx_spans = vec![Span::styled("  ", Style::default())];

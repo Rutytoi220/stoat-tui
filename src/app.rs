@@ -259,6 +259,7 @@ impl App {
                 self.state.gateway_status = GatewayStatus::Disconnected("Session expired".to_string());
                 self.state.set_status("Session expired, please log in again.");
             }
+            AppEvent::VideoFrameReady => {}
             AppEvent::StartGateway { token, gateway_url } => {
                 self.start_gateway(token, gateway_url);
             }
@@ -553,6 +554,90 @@ impl App {
         }
 
         // Global Shortcuts:
+        // Call & Stream Global Controls: Alt + c, s, m, d, f
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    self.toggle_call().await;
+                    return;
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    if let Some(ref mut call) = self.state.active_call {
+                        let active = call.toggle_screen_share();
+                        self.state.set_status(if active { "Screen sharing started" } else { "Screen sharing stopped" });
+                    }
+                    return;
+                }
+                KeyCode::Char('m') | KeyCode::Char('M') => {
+                    if let Some(ref mut call) = self.state.active_call {
+                        let muted = call.toggle_mute();
+                        self.state.set_status(if muted { "Microphone muted" } else { "Microphone unmuted" });
+                    }
+                    return;
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    if let Some(ref mut call) = self.state.active_call {
+                        let deafened = call.toggle_deafen();
+                        self.state.set_status(if deafened { "Audio deafened (mic muted)" } else { "Audio undeafened" });
+                    }
+                    return;
+                }
+                KeyCode::Char('f') | KeyCode::Char('F') => {
+                    if self.state.active_call.is_some() {
+                        self.state.call_fullscreen = !self.state.call_fullscreen;
+                        self.state.set_status(if self.state.call_fullscreen { "Call fullscreen enabled" } else { "Call fullscreen disabled" });
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Fullscreen exit via Esc
+        if self.state.call_fullscreen && key.code == KeyCode::Esc {
+            self.state.call_fullscreen = false;
+            return;
+        }
+
+        // Unfocused Call Shortcuts (c, s, m, d, f) when not typing in Input bar
+        if self.state.focus != Focus::Input {
+            match key.code {
+                KeyCode::Char('c') => {
+                    self.toggle_call().await;
+                    return;
+                }
+                KeyCode::Char('s') => {
+                    if let Some(ref mut call) = self.state.active_call {
+                        let active = call.toggle_screen_share();
+                        self.state.set_status(if active { "Screen sharing started" } else { "Screen sharing stopped" });
+                        return;
+                    }
+                }
+                KeyCode::Char('m') => {
+                    if let Some(ref mut call) = self.state.active_call {
+                        let muted = call.toggle_mute();
+                        self.state.set_status(if muted { "Microphone muted" } else { "Microphone unmuted" });
+                        return;
+                    }
+                }
+                KeyCode::Char('d') => {
+                    if let Some(ref mut call) = self.state.active_call {
+                        let deafened = call.toggle_deafen();
+                        self.state.set_status(if deafened { "Audio deafened (mic muted)" } else { "Audio undeafened" });
+                        return;
+                    }
+                }
+                KeyCode::Char('f') => {
+                    if self.state.active_call.is_some() {
+                        self.state.call_fullscreen = !self.state.call_fullscreen;
+                        self.state.set_status(if self.state.call_fullscreen { "Call fullscreen enabled" } else { "Call fullscreen disabled" });
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // Manual Login Modal Trigger: F2 or Ctrl+L
         if key.code == KeyCode::F(2)
             || (key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1023,6 +1108,48 @@ impl App {
                 ServerMessage::ChannelDelete { id } => {
                     self.state.channels.remove(&id);
                 }
+                ServerMessage::VoiceChannelJoin { id, user } => {
+                    let entry = self.state.voice_channel_participants.entry(id).or_default();
+                    if !entry.iter().any(|p| p.user_id == user) {
+                        entry.push(crate::voice::VoiceParticipant {
+                            user_id: user,
+                            is_speaking: false,
+                            is_muted: false,
+                            is_deafened: false,
+                            is_screensharing: false,
+                        });
+                    }
+                }
+                ServerMessage::VoiceChannelLeave { id, user } => {
+                    if let Some(entry) = self.state.voice_channel_participants.get_mut(&id) {
+                        entry.retain(|p| p.user_id != user);
+                    }
+                }
+                ServerMessage::UserVoiceStateUpdate {
+                    id,
+                    user,
+                    speaking,
+                    muted,
+                    deafened,
+                    screensharing,
+                } => {
+                    if let Some(entry) = self.state.voice_channel_participants.get_mut(&id) {
+                        if let Some(p) = entry.iter_mut().find(|p| p.user_id == user) {
+                            if let Some(s) = speaking {
+                                p.is_speaking = s;
+                            }
+                            if let Some(m) = muted {
+                                p.is_muted = m;
+                            }
+                            if let Some(d) = deafened {
+                                p.is_deafened = d;
+                            }
+                            if let Some(sc) = screensharing {
+                                p.is_screensharing = sc;
+                            }
+                        }
+                    }
+                }
                 _ => {}
             },
         }
@@ -1368,5 +1495,63 @@ impl App {
         if let Some((cid, srv_opt)) = prev_target.cloned() {
             self.jump_to_channel(cid, srv_opt).await;
         }
+    }
+
+    pub async fn toggle_call(&mut self) {
+        if self.state.active_call.is_some() {
+            self.state.active_call = None;
+            self.state.call_fullscreen = false;
+            self.state.set_status("Disconnected from call");
+            return;
+        }
+
+        let channel_id = match &self.state.active_channel_id {
+            Some(cid) => cid.clone(),
+            None => {
+                self.state.set_status("No channel selected to join call");
+                return;
+            }
+        };
+
+        self.state.set_status(format!("Joining call in channel {}...", channel_id));
+        let mut call = crate::voice::ActiveCallState::new(channel_id.clone());
+        call.connected_at = Some(std::time::Instant::now());
+        call.status = crate::voice::CallStatus::Connected;
+
+        let frame_tx = self.event_tx.clone();
+        let (notify_tx, mut notify_rx) = mpsc::channel(16);
+
+        tokio::spawn(async move {
+            while notify_rx.recv().await.is_some() {
+                let _ = frame_tx.send(AppEvent::VideoFrameReady).await;
+            }
+        });
+
+        let _engine_handle = crate::voice::VoiceEngine::start(
+            String::new(),
+            None,
+            call.muted.clone(),
+            call.screensharing.clone(),
+            call.current_frame.clone(),
+            notify_tx,
+        );
+
+        self.state.active_call = Some(call);
+        self.state.set_status("📞 Connected to call! [c: Leave | s: Screen | m: Mute | d: Deafen | f: Fullscreen]");
+
+        // Asynchronously request call token from Delta API
+        let api = self.api_client.clone();
+        let cid_clone = channel_id.clone();
+        tokio::spawn(async move {
+            let client = api.lock().await;
+            match client.join_call(&cid_clone).await {
+                Ok(_join_res) => {
+                    log_info!("join_call returned LiveKit token for channel {}", cid_clone);
+                }
+                Err(e) => {
+                    log_warn!("join_call API request returned error (falling back to local engine): {}", e);
+                }
+            }
+        });
     }
 }

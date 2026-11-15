@@ -1,6 +1,7 @@
 use crate::api::models::{Category, Channel, Member, MemberId, Message, Role, Server, User, UserStatus, Presence};
 use crate::config::Config;
 use crate::ui::theme::Theme;
+use crate::voice::{ActiveCallState, VoiceParticipant};
 use chrono::Utc;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
@@ -147,6 +148,11 @@ pub struct AppState {
     pub messages: HashMap<String, Vec<Message>>,
     pub unread_counts: HashMap<String, usize>,
 
+    // Voice & Video Call Subsystem
+    pub active_call: Option<ActiveCallState>,
+    pub call_fullscreen: bool,
+    pub voice_channel_participants: HashMap<String, Vec<VoiceParticipant>>,
+
     // Dynamic user resolution cache
     pub pending_user_fetches: Arc<Mutex<HashSet<String>>>,
     pub user_fetch_tx: Option<mpsc::UnboundedSender<String>>,
@@ -226,6 +232,9 @@ impl AppState {
             members: HashMap::new(),
             messages: HashMap::new(),
             unread_counts: HashMap::new(),
+            active_call: None,
+            call_fullscreen: false,
+            voice_channel_participants: HashMap::new(),
             pending_user_fetches: Arc::new(Mutex::new(HashSet::new())),
             user_fetch_tx: None,
 
