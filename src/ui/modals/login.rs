@@ -5,11 +5,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Widget};
 
 pub struct LoginModal<'a> {
-    state: &'a AppState,
+    state: &'a mut AppState,
 }
 
 impl<'a> LoginModal<'a> {
-    pub fn new(state: &'a AppState) -> Self {
+    pub fn new(state: &'a mut AppState) -> Self {
         Self { state }
     }
 }
@@ -44,10 +44,8 @@ impl<'a> Widget for LoginModal<'a> {
 
         let bottom_title = if is_totp {
             " Enter: Verify Code • Esc: Back to Login "
-        } else if self.state.login_tab == LoginTab::Token {
-            " Enter: Connect with Token • Tab: Switch Tab • Esc: Close "
         } else {
-            " Tab: Switch Field/Tab • Enter: Submit • Esc: Close "
+            " Alt+1/2/3 or Click: Switch Tab • Tab: Next Field • Enter: Submit • Esc: Close "
         };
 
         let block = Block::default()
@@ -180,6 +178,10 @@ impl<'a> Widget for LoginModal<'a> {
                 (LoginTab::Demo, "[ 3. Demo Mode ]"),
             ];
 
+            self.state.rect_login_tabs.clear();
+            self.state.rect_login_fields.clear();
+            self.state.rect_login_submit_btn = None;
+
             let mut tx = start_x;
             for (tab, label) in tabs {
                 let is_cur = self.state.login_tab == tab;
@@ -188,6 +190,17 @@ impl<'a> Widget for LoginModal<'a> {
                 } else {
                     Style::default().fg(theme.muted)
                 };
+
+                let tab_len = label.chars().count() as u16;
+                self.state.rect_login_tabs.push((
+                    tab,
+                    Rect {
+                        x: tx,
+                        y: cur_y,
+                        width: tab_len,
+                        height: 1,
+                    },
+                ));
 
                 for ch in label.chars() {
                     buf[(tx, cur_y)].set_char(ch).set_style(tab_style);
@@ -222,6 +235,16 @@ impl<'a> Widget for LoginModal<'a> {
 
                     // Box for email
                     let input_w = inner.width.saturating_sub(6);
+                    self.state.rect_login_fields.push((
+                        0,
+                        Rect {
+                            x: start_x,
+                            y: cur_y,
+                            width: input_w,
+                            height: 1,
+                        },
+                    ));
+
                     for bx in start_x..(start_x + input_w) {
                         buf[(bx, cur_y)]
                             .set_char(' ')
@@ -250,6 +273,16 @@ impl<'a> Widget for LoginModal<'a> {
                     }
                     cur_y += 1;
 
+                    self.state.rect_login_fields.push((
+                        1,
+                        Rect {
+                            x: start_x,
+                            y: cur_y,
+                            width: input_w,
+                            height: 1,
+                        },
+                    ));
+
                     for bx in start_x..(start_x + input_w) {
                         buf[(bx, cur_y)]
                             .set_char(' ')
@@ -267,12 +300,20 @@ impl<'a> Widget for LoginModal<'a> {
 
                     cur_y += 3;
 
-                    // Action hint
+                    // Action hint / button
                     let hint = if self.state.login_loading {
                         "Logging in... Please wait."
                     } else {
                         "[ Press Enter to Log In ]"
                     };
+
+                    self.state.rect_login_submit_btn = Some(Rect {
+                        x: start_x,
+                        y: cur_y,
+                        width: hint.chars().count() as u16,
+                        height: 1,
+                    });
+
                     for (i, ch) in hint.chars().enumerate() {
                         buf[(start_x + i as u16, cur_y)]
                             .set_char(ch)
@@ -291,6 +332,16 @@ impl<'a> Widget for LoginModal<'a> {
                     cur_y += 1;
 
                     let input_w = inner.width.saturating_sub(6);
+                    self.state.rect_login_fields.push((
+                        0,
+                        Rect {
+                            x: start_x,
+                            y: cur_y,
+                            width: input_w,
+                            height: 1,
+                        },
+                    ));
+
                     for bx in start_x..(start_x + input_w) {
                         buf[(bx, cur_y)]
                             .set_char(' ')
@@ -325,6 +376,14 @@ impl<'a> Widget for LoginModal<'a> {
                     } else {
                         "[ Press Enter to Connect ]"
                     };
+
+                    self.state.rect_login_submit_btn = Some(Rect {
+                        x: start_x,
+                        y: cur_y,
+                        width: hint.chars().count() as u16,
+                        height: 1,
+                    });
+
                     for (i, ch) in hint.chars().enumerate() {
                         buf[(start_x + i as u16, cur_y)]
                             .set_char(ch)
@@ -358,6 +417,14 @@ impl<'a> Widget for LoginModal<'a> {
                     cur_y += 3;
 
                     let hint = "[ Press Enter to Launch Demo Mode ]";
+
+                    self.state.rect_login_submit_btn = Some(Rect {
+                        x: start_x,
+                        y: cur_y,
+                        width: hint.chars().count() as u16,
+                        height: 1,
+                    });
+
                     for (i, ch) in hint.chars().enumerate() {
                         buf[(start_x + i as u16, cur_y)]
                             .set_char(ch)

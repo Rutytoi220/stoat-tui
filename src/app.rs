@@ -19,7 +19,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: Config, event_tx: mpsc::Sender<AppEvent>) -> Self {
+    pub fn new(config: Config, event_tx: mpsc::Sender<AppEvent>, picker: Arc<ratatui_image::picker::Picker>) -> Self {
         let api_client = Arc::new(Mutex::new(DeltaClient::new(
             config.api_url.clone(),
             config.token.clone(),
@@ -27,8 +27,11 @@ impl App {
         )));
 
         let (user_fetch_tx, mut user_fetch_rx) = mpsc::unbounded_channel::<String>();
+        let (image_fetch_tx, mut image_fetch_rx) = mpsc::unbounded_channel::<(String, String)>();
         let mut state = AppState::new(config);
         state.user_fetch_tx = Some(user_fetch_tx);
+        state.image_fetch_tx = Some(image_fetch_tx);
+        state.image_cache = Some(crate::ui::images::ImageCache::new(picker));
 
         let api_client_clone = api_client.clone();
         let event_tx_clone = event_tx.clone();
@@ -41,6 +44,29 @@ impl App {
                     }
                     Err(e) => {
                         log_warn!("Background user fetch failed for {}: {}", user_id, e);
+                    }
+                }
+            }
+        });
+
+        let api_client_img = api_client.clone();
+        let event_tx_img = event_tx.clone();
+        tokio::spawn(async move {
+            while let Some((key, url)) = image_fetch_rx.recv().await {
+                let client = api_client_img.lock().await;
+                match client.fetch_bytes(&url).await {
+                    Ok(bytes) => {
+                        if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                            let _ = event_tx_img.send(AppEvent::ImageLoaded {
+                                key,
+                                dynamic_image: dyn_img,
+                            }).await;
+                        } else {
+                            log_debug!("Failed to decode image from {}", url);
+                        }
+                    }
+                    Err(e) => {
+                        log_debug!("Failed to fetch asset from {}: {}", url, e);
                     }
                 }
             }
@@ -93,21 +119,27 @@ impl App {
                         let _ = tx.send(AppEvent::ApiDmsFetched(dms)).await;
                     }
 
-                    // 2. Query GET / to get dynamic gateway WebSocket URL (meta.ws)
-                    let effective_gw_url = match client.fetch_metadata().await {
+                    // 2. Query GET / to get dynamic gateway WebSocket URL (meta.ws) and autumn URL
+                    let (effective_gw_url, autumn_url_opt) = match client.fetch_metadata().await {
                         Ok(meta) => {
-                            if let Some(ws) = meta.ws {
+                            let autumn_url = meta.features.and_then(|f| f.autumn).and_then(|a| a.url);
+                            let ws_url = if let Some(ws) = meta.ws {
                                 log_info!("Startup: Dynamic gateway URL extracted: {}", ws);
                                 Some(ws)
                             } else {
                                 gw_url_config
-                            }
+                            };
+                            (ws_url, autumn_url)
                         }
                         Err(e) => {
                             log_warn!("Startup: Could not query dynamic gateway URL from GET /: {}", e);
-                            gw_url_config
+                            (gw_url_config, None)
                         }
                     };
+
+                    if let Some(autumn) = autumn_url_opt {
+                        log_info!("Autumn CDN URL: {}", autumn);
+                    }
 
                     // 3. Connect to Bonfire WebSocket gateway
                     let _ = tx.send(AppEvent::StartGateway {
@@ -188,12 +220,40 @@ impl App {
             AppEvent::Gateway(gw) => self.handle_gateway(gw).await,
             AppEvent::ApiLoginSuccess { token, is_bot } | AppEvent::LoginSuccess { token, is_bot } => {
                 let trimmed_token = token.trim().to_string();
-                log_info!("Authentication succeeded! Updating session token and persisting config...");
+                log_info!("Authentication succeeded! Updating session token and tearing down old session...");
+
+                // 1. Abort old gateway task cleanly so no duplicate heartbeats or ghost events remain
+                if let Some(h) = self.gateway_handle.take() {
+                    h.abort();
+                }
+
+                // 2. Clear all cached account state in AppState
                 self.state.login_loading = false;
                 self.state.login_error = None;
                 self.state.login_step = LoginStep::Credentials;
+                self.state.login_email_input.clear();
+                self.state.login_password_input.clear();
+                self.state.login_totp_input.clear();
+                self.state.login_token_input.clear();
                 self.state.show_login_modal = false;
-                self.state.clear_mock_data();
+
+                self.state.servers.clear();
+                self.state.channels.clear();
+                self.state.server_channels.clear();
+                self.state.dms.clear();
+                self.state.members.clear();
+                self.state.messages.clear();
+                self.state.users.clear();
+                self.state.voice_channel_participants.clear();
+                self.state.active_call = None;
+                self.state.call_fullscreen = false;
+                self.state.active_server_id = None;
+                self.state.active_channel_id = None;
+                self.state.selected_server_index = 0;
+                self.state.selected_channel_index = 0;
+                self.state.unread_counts.clear();
+
+                // 3. Overwrite config.token with new session token, save config.toml
                 self.state.config.token = Some(trimmed_token.clone());
                 self.state.config.is_bot = is_bot;
                 if let Err(e) = self.state.config.save() {
@@ -205,6 +265,7 @@ impl App {
                     api.set_token(trimmed_token.clone(), is_bot);
                 }
 
+                // 4. Fetch GET /users/@me for the new account and spawn fresh Bonfire connection
                 self.start_gateway(trimmed_token, self.state.config.gateway_url.clone());
                 self.fetch_initial_data().await;
             }
@@ -270,6 +331,11 @@ impl App {
                         call.status = crate::voice::CallStatus::Connected;
                         call.connected_at = Some(std::time::Instant::now());
                     }
+                }
+            }
+            AppEvent::ImageLoaded { key, dynamic_image } => {
+                if let Some(ref mut cache) = self.state.image_cache {
+                    cache.insert(key, dynamic_image);
                 }
             }
             AppEvent::StartGateway { token, gateway_url } => {
@@ -469,14 +535,38 @@ impl App {
                         self.state.login_field_index = if self.state.login_field_index == 0 { 1 } else { 0 };
                     }
                 }
-                KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) => {
+                KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.state.login_tab = LoginTab::EmailPassword;
+                    self.state.login_step = LoginStep::Credentials;
+                    self.state.login_error = None;
                 }
-                KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => {
+                KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.state.login_tab = LoginTab::Token;
+                    self.state.login_step = LoginStep::Credentials;
+                    self.state.login_error = None;
                 }
-                KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => {
+                KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.state.login_tab = LoginTab::Demo;
+                    self.state.login_step = LoginStep::Credentials;
+                    self.state.login_error = None;
+                }
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.state.login_tab = match self.state.login_tab {
+                        LoginTab::EmailPassword => LoginTab::Demo,
+                        LoginTab::Token => LoginTab::EmailPassword,
+                        LoginTab::Demo => LoginTab::Token,
+                    };
+                    self.state.login_step = LoginStep::Credentials;
+                    self.state.login_error = None;
+                }
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.state.login_tab = match self.state.login_tab {
+                        LoginTab::EmailPassword => LoginTab::Token,
+                        LoginTab::Token => LoginTab::Demo,
+                        LoginTab::Demo => LoginTab::EmailPassword,
+                    };
+                    self.state.login_step = LoginStep::Credentials;
+                    self.state.login_error = None;
                 }
                 KeyCode::Enter => {
                     match self.state.login_tab {
@@ -661,6 +751,11 @@ impl App {
                 && (key.code == KeyCode::Char('l') || key.code == KeyCode::Char('L')))
         {
             self.state.show_login_modal = true;
+            self.state.login_step = LoginStep::Credentials;
+            self.state.login_error = None;
+            self.state.login_totp_input.clear();
+            self.state.login_password_input.clear();
+            self.state.login_token_input.clear();
             return;
         }
 
@@ -889,8 +984,79 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                // If login modal is open, ignore outside clicks or handle
+                // If login modal is open, handle clicks on tabs, fields, submit button, or outside
                 if self.state.show_login_modal {
+                    // Check tabs
+                    for (tab, rect) in &self.state.rect_login_tabs {
+                        if mx >= rect.left() && mx < rect.right() && my == rect.top() {
+                            self.state.login_tab = *tab;
+                            self.state.login_step = LoginStep::Credentials;
+                            self.state.login_error = None;
+                            return;
+                        }
+                    }
+
+                    // Check fields
+                    for (idx, rect) in &self.state.rect_login_fields {
+                        if mx >= rect.left() && mx < rect.right() && my == rect.top() {
+                            self.state.login_field_index = *idx;
+                            return;
+                        }
+                    }
+
+                    // Check submit button
+                    if let Some(btn_rect) = self.state.rect_login_submit_btn {
+                        if mx >= btn_rect.left() && mx < btn_rect.right() && my == btn_rect.top() {
+                            match self.state.login_tab {
+                                LoginTab::EmailPassword => {
+                                    let email = self.state.login_email_input.trim().to_string();
+                                    let password = self.state.login_password_input.clone();
+                                    if email.is_empty() || password.is_empty() {
+                                        self.state.login_error = Some("Email and password are required".to_string());
+                                        return;
+                                    }
+                                    self.state.login_loading = true;
+                                    self.state.login_error = None;
+                                    let api = self.api_client.clone();
+                                    let tx = self.event_tx.clone();
+                                    tokio::spawn(async move {
+                                        let client = api.lock().await;
+                                        match client.login(&email, &password).await {
+                                            Ok(LoginResponse::Success { token, .. }) => {
+                                                let trimmed = token.trim().to_string();
+                                                let _ = tx.send(AppEvent::ApiLoginSuccess { token: trimmed, is_bot: false }).await;
+                                            }
+                                            Ok(LoginResponse::MFA { ticket, allowed_methods }) => {
+                                                let _ = tx.send(AppEvent::ApiMfaRequired { ticket, allowed_methods }).await;
+                                            }
+                                            Ok(LoginResponse::Disabled) => {
+                                                let _ = tx.send(AppEvent::ApiLoginFailure("Account is disabled".to_string())).await;
+                                            }
+                                            Err(e) => {
+                                                let _ = tx.send(AppEvent::ApiLoginFailure(e.to_string())).await;
+                                            }
+                                        }
+                                    });
+                                }
+                                LoginTab::Token => {
+                                    let token = self.state.login_token_input.trim().to_string();
+                                    if token.is_empty() {
+                                        self.state.login_error = Some("Token cannot be empty".to_string());
+                                        return;
+                                    }
+                                    self.state.login_loading = true;
+                                    self.state.login_error = None;
+                                    let _ = self.event_tx.send(AppEvent::ApiLoginSuccess { token, is_bot: false }).await;
+                                }
+                                LoginTab::Demo => {
+                                    self.state.load_demo_data();
+                                    self.state.show_login_modal = false;
+                                }
+                            }
+                            return;
+                        }
+                    }
+
                     return;
                 }
 

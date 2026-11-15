@@ -1,4 +1,5 @@
 pub mod components;
+pub mod images;
 pub mod markdown;
 pub mod modals;
 pub mod theme;

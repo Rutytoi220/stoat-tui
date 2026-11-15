@@ -26,6 +26,7 @@ pub enum AppEvent {
     StartGateway { token: String, gateway_url: Option<String> },
     VideoFrameReady,
     CallConnected { channel_id: String },
+    ImageLoaded { key: String, dynamic_image: image::DynamicImage },
 }
 
 pub struct EventHandler {

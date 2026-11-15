@@ -127,7 +127,18 @@ async fn main() -> Result<()> {
         default_panic(info);
     }));
 
-    // 3. Initialize terminal in raw mode with alternate screen, mouse capture, and bracketed paste
+    // 3. Terminal graphics protocol detection before entering alternate screen
+    let picker = ratatui_image::picker::Picker::from_query_stdio()
+        .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
+    let picker = std::sync::Arc::new(picker);
+    stoat_tui::log_info!(
+        "Terminal graphics protocol: {:?} (font size: {}x{})",
+        picker.protocol_type(),
+        picker.font_size().width,
+        picker.font_size().height
+    );
+
+    // 4. Initialize terminal in raw mode with alternate screen, mouse capture, and bracketed paste
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(
@@ -139,18 +150,18 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // 4. Load configuration (and apply CLI overrides)
+    // 5. Load configuration (and apply CLI overrides)
     let mut config = Config::load().unwrap_or_default();
     if let Some(api) = override_api {
         config.api_url = api;
     }
     stoat_tui::log_info!("Loaded config: API={}, HasToken={}", config.api_url, config.token.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false));
 
-    // 5. Initialize event stream (30ms tick rate for responsive 30+ FPS UI updates)
+    // 6. Initialize event stream (30ms tick rate for responsive 30+ FPS UI updates)
     let mut event_handler = EventHandler::new(Duration::from_millis(30));
 
-    // 6. Initialize application & run startup authentication verification
-    let mut app = App::new(config, event_handler.sender());
+    // 7. Initialize application & run startup authentication verification
+    let mut app = App::new(config, event_handler.sender(), picker);
     app.startup();
 
     // 7. Main event loop

@@ -9,11 +9,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
 pub struct ChatFeed<'a> {
-    state: &'a AppState,
+    state: &'a mut AppState,
 }
 
 impl<'a> ChatFeed<'a> {
-    pub fn new(state: &'a AppState) -> Self {
+    pub fn new(state: &'a mut AppState) -> Self {
         Self { state }
     }
 }
@@ -177,10 +177,10 @@ impl<'a> Widget for ChatFeed<'a> {
             }
 
             // 1. Author header line (resolved from cache or fetched asynchronously)
-            let user = self.state.resolve_user(&msg.author);
+            let user = self.state.resolve_user(&msg.author).cloned();
             let author_name = if let Some(ref m) = msg.masquerade {
                 m.name.clone().unwrap_or_else(|| "Anonymous".to_string())
-            } else if let Some(u) = user {
+            } else if let Some(ref u) = user {
                 u.name().to_string()
             } else {
                 format!("User {}", &msg.author[..msg.author.len().min(6)])
@@ -190,11 +190,27 @@ impl<'a> Widget for ChatFeed<'a> {
 
             let mut header_spans = vec![
                 Span::styled(format!("[{}] ", time_str), Style::default().fg(Color::Rgb(90, 90, 100))),
-                Span::styled(author_name, Style::default().fg(author_color).add_modifier(Modifier::BOLD)),
             ];
 
+            // PFP prefix (avatar request trigger)
+            if let Some(ref u) = user {
+                let key = format!("avatar_{}", u.id);
+                let url = self.state.avatar_url_for_user(u);
+                if let Some(ref mut cache) = self.state.image_cache {
+                    if !cache.contains(&key) && !cache.is_pending(&key) {
+                        cache.mark_pending(key.clone());
+                        if let Some(ref tx) = self.state.image_fetch_tx {
+                            let _ = tx.send((key, url));
+                        }
+                    }
+                }
+                header_spans.push(Span::styled("● ", Style::default().fg(theme.primary)));
+            }
+
+            header_spans.push(Span::styled(author_name, Style::default().fg(author_color).add_modifier(Modifier::BOLD)));
+
             // Bot badge
-            if let Some(u) = user {
+            if let Some(ref u) = user {
                 if u.bot.is_some() {
                     header_spans.push(Span::styled(" BOT", Style::default().fg(Color::White).bg(theme.accent).add_modifier(Modifier::BOLD)));
                 }
@@ -213,7 +229,7 @@ impl<'a> Widget for ChatFeed<'a> {
                 }
             }
 
-            // 3. Attachments
+            // 3. Attachments & Images
             if let Some(ref attachments) = msg.attachments {
                 for att in attachments {
                     let name = att.filename.as_deref().unwrap_or("file");
@@ -222,6 +238,41 @@ impl<'a> Widget for ChatFeed<'a> {
                     rendered_lines.push(Line::from(vec![
                         Span::styled(badge, Style::default().fg(Color::Rgb(100, 200, 255)).add_modifier(Modifier::BOLD)),
                     ]));
+
+                    // Check if attachment is an image
+                    let is_image = att.content_type.as_deref().map(|c| c.starts_with("image/")).unwrap_or(false)
+                        || name.ends_with(".png")
+                        || name.ends_with(".jpg")
+                        || name.ends_with(".jpeg")
+                        || name.ends_with(".webp")
+                        || name.ends_with(".gif");
+
+                    if is_image {
+                        let key = format!("attachment_{}", att.id);
+                        let url = self.state.attachment_image_url(&att.id);
+                        let mut is_cached = false;
+                        if let Some(ref mut cache) = self.state.image_cache {
+                            if cache.contains(&key) {
+                                is_cached = true;
+                            } else if !cache.is_pending(&key) {
+                                cache.mark_pending(key.clone());
+                                if let Some(ref tx) = self.state.image_fetch_tx {
+                                    let _ = tx.send((key.clone(), url));
+                                }
+                            }
+                        }
+
+                        if is_cached {
+                            // Reserve 8 lines for rendered image preview
+                            rendered_lines.push(Line::from(vec![
+                                Span::styled(format!("  [🖼️ Image: {}]", key), Style::default().fg(Color::Rgb(80, 200, 120))),
+                            ]));
+                        } else {
+                            rendered_lines.push(Line::from(vec![
+                                Span::styled("  [🖼️ Loading image...]", Style::default().fg(Color::Rgb(140, 140, 150)).add_modifier(Modifier::ITALIC)),
+                            ]));
+                        }
+                    }
                 }
             }
 

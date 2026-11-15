@@ -5,11 +5,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Widget};
 
 pub struct ContentHeader<'a> {
-    state: &'a AppState,
+    state: &'a mut AppState,
 }
 
 impl<'a> ContentHeader<'a> {
-    pub fn new(state: &'a AppState) -> Self {
+    pub fn new(state: &'a mut AppState) -> Self {
         Self { state }
     }
 }
@@ -41,7 +41,7 @@ impl<'a> Widget for ContentHeader<'a> {
 
         // Channel name & prefix
         let channel = self.state.active_channel();
-        let (prefix, name, topic) = if let Some(ch) = channel {
+        let (prefix, name, topic, dm_user) = if let Some(ch) = channel {
             let pfx = if ch.channel_type == "VoiceChannel" {
                 "🔊 "
             } else if ch.channel_type == "DirectMessage" {
@@ -51,10 +51,42 @@ impl<'a> Widget for ContentHeader<'a> {
             };
             let n = ch.display_name(&self.state.users, self.state.current_user.as_ref().map(|u| u.id.as_str()));
             let t = ch.description.clone().unwrap_or_default();
-            (pfx, n, t)
+            let other_user = if ch.channel_type == "DirectMessage" {
+                ch.recipients.as_ref().and_then(|r| {
+                    let cur_id = self.state.current_user.as_ref().map(|u| u.id.as_str());
+                    let uid = r.iter().find(|&id| Some(id.as_str()) != cur_id).or_else(|| r.first());
+                    uid.and_then(|id| self.state.users.get(id)).cloned()
+                })
+            } else {
+                None
+            };
+            (pfx, n, t, other_user)
         } else {
-            ("", "No Channel Selected".to_string(), "".to_string())
+            ("", "No Channel Selected".to_string(), "".to_string(), None)
         };
+
+        // If in DM and user avatar is available, render 2x1 avatar
+        if let Some(ref u) = dm_user {
+            let key = format!("avatar_{}", u.id);
+            let url = self.state.avatar_url_for_user(u);
+            let pfp_rect = Rect {
+                x: cur_x,
+                y: cur_y,
+                width: 2,
+                height: 1,
+            };
+            if let Some(ref mut cache) = self.state.image_cache {
+                if let Some(proto) = cache.get_mut(&key) {
+                    ratatui_image::ResizeEncodeRender::render(proto, pfp_rect, buf);
+                } else if !cache.contains(&key) && !cache.is_pending(&key) {
+                    cache.mark_pending(key.clone());
+                    if let Some(ref tx) = self.state.image_fetch_tx {
+                        let _ = tx.send((key, url));
+                    }
+                }
+            }
+            cur_x += 3;
+        }
 
         // Render prefix
         for ch in prefix.chars() {

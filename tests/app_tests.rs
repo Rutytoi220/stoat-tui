@@ -365,7 +365,8 @@ fn test_gateway_messages_serde() {
 #[tokio::test]
 async fn test_fast_keyboard_navigation_logic() {
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
-    let mut app = stoat_tui::app::App::new(Config::default(), tx);
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(Config::default(), tx, picker);
     app.state.load_demo_data();
 
     // Verify initial demo state
@@ -418,9 +419,10 @@ async fn test_startup_auth_modal_and_session_check() {
     use stoat_tui::state::GatewayStatus;
 
     // Case 1: Token is None
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
     let config_none = Config { token: None, ..Default::default() };
     let (tx1, _rx1) = tokio::sync::mpsc::channel(64);
-    let mut app_none = stoat_tui::app::App::new(config_none, tx1);
+    let mut app_none = stoat_tui::app::App::new(config_none, tx1, picker.clone());
     app_none.startup();
     assert!(app_none.state.show_login_modal);
     assert!(matches!(app_none.state.gateway_status, GatewayStatus::Disconnected(_)));
@@ -432,7 +434,7 @@ async fn test_startup_auth_modal_and_session_check() {
     // Case 2: Token is whitespace / empty
     let config_empty = Config { token: Some("   ".to_string()), ..Default::default() };
     let (tx2, _rx2) = tokio::sync::mpsc::channel(64);
-    let mut app_empty = stoat_tui::app::App::new(config_empty, tx2);
+    let mut app_empty = stoat_tui::app::App::new(config_empty, tx2, picker.clone());
     app_empty.startup();
     assert!(app_empty.state.show_login_modal);
     assert!(matches!(app_empty.state.gateway_status, GatewayStatus::Disconnected(_)));
@@ -440,7 +442,7 @@ async fn test_startup_auth_modal_and_session_check() {
     // Case 3: Token is valid non-empty string
     let config_token = Config { token: Some("valid_secret_token".to_string()), ..Default::default() };
     let (tx3, mut rx3) = tokio::sync::mpsc::channel(64);
-    let mut app_token = stoat_tui::app::App::new(config_token, tx3);
+    let mut app_token = stoat_tui::app::App::new(config_token, tx3, picker.clone());
     app_token.startup();
     assert!(!app_token.state.show_login_modal);
     assert!(matches!(app_token.state.gateway_status, GatewayStatus::Connecting));
@@ -460,7 +462,8 @@ async fn test_manual_login_modal_keybindings_f2_ctrl_l() {
 
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
     let config = Config { token: Some("test_tok".to_string()), ..Default::default() };
-    let mut app = stoat_tui::app::App::new(config, tx);
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(config, tx, picker);
 
     // Initial state: token present, login modal closed
     app.state.show_login_modal = false;
@@ -489,7 +492,8 @@ async fn test_api_session_expired_event() {
 
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
     let config = Config { token: Some("expired_tok_123".to_string()), ..Default::default() };
-    let mut app = stoat_tui::app::App::new(config, tx);
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(config, tx, picker);
 
     app.state.current_user = Some(User {
         id: "u_abc".to_string(),
@@ -526,7 +530,8 @@ async fn test_ready_and_authenticated_gateway_sync() {
     use stoat_tui::state::GatewayStatus;
 
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
-    let mut app = stoat_tui::app::App::new(Config::default(), tx);
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(Config::default(), tx, picker);
 
     // Authenticated event sets Connected with latency and ● Online
     app.handle_event(stoat_tui::event::AppEvent::Gateway(GatewayEvent::Authenticated)).await;
@@ -565,7 +570,8 @@ async fn test_user_resolution_and_background_fetch() {
     use stoat_tui::event::AppEvent;
 
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
-    let mut app = stoat_tui::app::App::new(Config::default(), tx);
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(Config::default(), tx, picker);
 
     // Initial query for unknown user triggers background fetch
     let user_opt = app.state.resolve_user("01HMISSINGUSER");
@@ -781,4 +787,77 @@ fn test_config_last_navigation_persistence() {
     assert!(parsed_dm.last_in_dm);
     assert!(parsed_dm.last_server_id.is_none());
     assert_eq!(parsed_dm.last_channel_id.as_deref(), Some("dm_01J_ALICE"));
+}
+
+#[test]
+fn test_image_cache_lru_and_pending() {
+    use stoat_tui::ui::images::ImageCache;
+    use std::sync::Arc;
+    use image::RgbaImage;
+
+    let picker = Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut cache = ImageCache::new(picker);
+
+    // Initial state
+    assert!(!cache.contains("img_1"));
+    assert!(!cache.is_pending("img_1"));
+
+    // Mark pending
+    assert!(cache.mark_pending("img_1".to_string()));
+    assert!(cache.is_pending("img_1"));
+    // Re-marking pending returns false
+    assert!(!cache.mark_pending("img_1".to_string()));
+
+    // Insert decoded image
+    let dyn_img = image::DynamicImage::ImageRgba8(RgbaImage::new(16, 16));
+    cache.insert("img_1".to_string(), dyn_img);
+
+    assert!(cache.contains("img_1"));
+    assert!(!cache.is_pending("img_1"));
+    assert!(cache.get_mut("img_1").is_some());
+}
+
+#[tokio::test]
+async fn test_login_modal_reset_on_f2_and_account_switch_cleanup() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use stoat_tui::api::models::{Channel, Message, Server};
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::state::LoginStep;
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let config = Config { token: Some("old_token".to_string()), ..Default::default() };
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(config, tx, picker);
+
+    // Populate state with existing session data
+    app.state.servers.push(Server { id: "srv_old".to_string(), name: "Old Server".to_string(), ..Default::default() });
+    app.state.channels.insert("ch_old".to_string(), Channel { id: "ch_old".to_string(), name: Some("old-channel".to_string()), ..Default::default() });
+    app.state.messages.insert("ch_old".to_string(), vec![Message { id: "m1".to_string(), ..Default::default() }]);
+    app.state.login_step = LoginStep::TotpChallenge { ticket: "ticket_123".to_string() };
+    app.state.login_error = Some("Previous error".to_string());
+    app.state.login_totp_input = "123456".to_string();
+    app.state.login_password_input = "secret_password".to_string();
+
+    // Trigger F2 to open login modal: state must be cleanly reset
+    let f2_key = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
+    app.handle_event(AppEvent::Key(f2_key)).await;
+
+    assert!(app.state.show_login_modal);
+    assert_eq!(app.state.login_step, LoginStep::Credentials);
+    assert!(app.state.login_error.is_none());
+    assert!(app.state.login_totp_input.is_empty());
+    assert!(app.state.login_password_input.is_empty());
+
+    // Switch account via ApiLoginSuccess
+    app.handle_event(AppEvent::ApiLoginSuccess {
+        token: "brand_new_token_456".to_string(),
+        is_bot: false,
+    }).await;
+
+    // Previous data must be completely wiped
+    assert!(app.state.servers.is_empty());
+    assert!(app.state.channels.is_empty());
+    assert!(app.state.messages.is_empty());
+    assert!(!app.state.show_login_modal);
+    assert_eq!(app.state.config.token.as_deref(), Some("brand_new_token_456"));
 }

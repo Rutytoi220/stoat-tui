@@ -1,12 +1,28 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerMetadata {
     pub revolt: Option<String>,
     pub stoat: Option<String>,
     pub ws: Option<String>,
     pub app: Option<String>,
+    #[serde(default)]
+    pub features: Option<ServerFeatures>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServerFeatures {
+    #[serde(default)]
+    pub autumn: Option<AutumnFeature>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AutumnFeature {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

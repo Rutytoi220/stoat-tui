@@ -6,11 +6,11 @@ use ratatui::style::Modifier;
 use ratatui::widgets::{Block, Borders, Widget};
 
 pub struct MemberRail<'a> {
-    state: &'a AppState,
+    state: &'a mut AppState,
 }
 
 impl<'a> MemberRail<'a> {
-    pub fn new(state: &'a AppState) -> Self {
+    pub fn new(state: &'a mut AppState) -> Self {
         Self { state }
     }
 }
@@ -114,10 +114,32 @@ impl<'a> Widget for MemberRail<'a> {
                     .set_char(dot.chars().next().unwrap_or('●'))
                     .set_fg(dot_color);
 
+                // Render 2x1 Avatar icon if available
+                let pfp_rect = Rect {
+                    x: start_x + 2,
+                    y: cur_y,
+                    width: 2,
+                    height: 1,
+                };
+                if let Some(u) = user {
+                    let key = format!("avatar_{}", u.id);
+                    let url = self.state.avatar_url_for_user(u);
+                    if let Some(ref mut cache) = self.state.image_cache {
+                        if let Some(proto) = cache.get_mut(&key) {
+                            ratatui_image::ResizeEncodeRender::render(proto, pfp_rect, buf);
+                        } else if !cache.contains(&key) && !cache.is_pending(&key) {
+                            cache.mark_pending(key.clone());
+                            if let Some(ref tx) = self.state.image_fetch_tx {
+                                let _ = tx.send((key, url));
+                            }
+                        }
+                    }
+                }
+
                 // Render name
                 let name_color = theme.role_color(&m.id.user);
-                let mut nx = start_x + 2;
-                for ch in name.chars().take(max_w.saturating_sub(3)) {
+                let mut nx = start_x + 5;
+                for ch in name.chars().take(max_w.saturating_sub(6)) {
                     buf[(nx, cur_y)]
                         .set_char(ch)
                         .set_fg(name_color);

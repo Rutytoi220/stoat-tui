@@ -453,4 +453,19 @@ impl DeltaClient {
             .with_context(|| format!("Failed to parse join_call response JSON: {}", body))?;
         Ok(join_resp)
     }
+
+    pub async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch asset from {}", url))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(anyhow!("Asset fetch returned HTTP {}", status));
+        }
+        let bytes = resp.bytes().await.context("Failed to read asset bytes")?;
+        Ok(bytes.to_vec())
+    }
 }

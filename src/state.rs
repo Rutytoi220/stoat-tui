@@ -157,6 +157,11 @@ pub struct AppState {
     pub pending_user_fetches: Arc<Mutex<HashSet<String>>>,
     pub user_fetch_tx: Option<mpsc::UnboundedSender<String>>,
 
+    // Autumn CDN & Async Image Cache
+    pub autumn_url: String,
+    pub image_cache: Option<crate::ui::images::ImageCache>,
+    pub image_fetch_tx: Option<mpsc::UnboundedSender<(String, String)>>, // (key, url)
+
     // Precision hit-test rects from last render frame
     pub rect_rail: Rect,
     pub rect_server_items: Vec<(Option<String>, Rect)>, // None = DMs button, Some(id) = server
@@ -169,6 +174,11 @@ pub struct AppState {
     pub rect_call_banner: Option<Rect>,
     pub rect_member_toggle: Rect,
     pub rect_command_palette: Rect,
+
+    // Login Modal Hit-Testing
+    pub rect_login_tabs: Vec<(LoginTab, Rect)>,
+    pub rect_login_fields: Vec<(usize, Rect)>,
+    pub rect_login_submit_btn: Option<Rect>,
 
     // Should quit
     pub should_quit: bool,
@@ -239,6 +249,10 @@ impl AppState {
             pending_user_fetches: Arc::new(Mutex::new(HashSet::new())),
             user_fetch_tx: None,
 
+            autumn_url: "https://cdn.stoatusercontent.com".to_string(),
+            image_cache: None,
+            image_fetch_tx: None,
+
             rect_rail: Rect::default(),
             rect_server_items: Vec::new(),
             rect_channels: Rect::default(),
@@ -250,6 +264,10 @@ impl AppState {
             rect_call_banner: None,
             rect_member_toggle: Rect::default(),
             rect_command_palette: Rect::default(),
+
+            rect_login_tabs: Vec::new(),
+            rect_login_fields: Vec::new(),
+            rect_login_submit_btn: None,
 
             should_quit: false,
         };
@@ -788,5 +806,28 @@ impl AppState {
         self.active_server_id = Some("srv_stoat".to_string());
         self.active_channel_id = Some("ch_stoat_general".to_string());
         self.gateway_status = GatewayStatus::Connected { latency_ms: 18 };
+    }
+
+    pub fn avatar_url_for_user(&self, user: &User) -> String {
+        if let Some(ref av) = user.avatar {
+            format!("{}/avatars/{}?max_side=128", self.autumn_url.trim_end_matches('/'), av.id)
+        } else {
+            format!("{}/users/{}/default_avatar", self.config.api_url.trim_end_matches('/'), user.id)
+        }
+    }
+
+    pub fn attachment_image_url(&self, file_id: &str) -> String {
+        format!("{}/attachments/{}?max_side=800", self.autumn_url.trim_end_matches('/'), file_id)
+    }
+
+    pub fn request_image(&mut self, key: String, url: String) {
+        if let Some(ref mut cache) = self.image_cache {
+            if !cache.contains(&key) && !cache.is_pending(&key) {
+                cache.mark_pending(key.clone());
+                if let Some(ref tx) = self.image_fetch_tx {
+                    let _ = tx.send((key, url));
+                }
+            }
+        }
     }
 }
