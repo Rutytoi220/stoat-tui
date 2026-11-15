@@ -130,6 +130,7 @@ pub struct AppState {
     pub command_palette_selected: usize,
 
     pub show_login_modal: bool,
+    pub is_demo_mode: bool,
     pub login_tab: LoginTab,
     pub login_step: LoginStep,
     pub login_field_index: usize, // 0 = email/token, 1 = password
@@ -221,6 +222,7 @@ impl AppState {
             command_palette_selected: 0,
 
             show_login_modal: show_login,
+            is_demo_mode: false,
             login_tab: LoginTab::EmailPassword,
             login_step: LoginStep::Credentials,
             login_field_index: 0,
@@ -312,6 +314,7 @@ impl AppState {
 
     /// Clear all mock demo data (servers, channels, mock messages, demo users) on real authentication
     pub fn clear_mock_data(&mut self) {
+        self.is_demo_mode = false;
         self.servers.retain(|s| s.id != "srv_stoat" && s.id != "srv_rust");
         self.channels.retain(|id, _| !id.starts_with("ch_stoat_") && !id.starts_with("ch_rust_") && !id.starts_with("dm_"));
         self.server_channels.retain(|sid, _| sid != "srv_stoat" && sid != "srv_rust");
@@ -527,6 +530,7 @@ impl AppState {
     }
 
     pub fn load_demo_data(&mut self) {
+        self.is_demo_mode = true;
         self.users.clear();
         self.servers.clear();
         self.channels.clear();

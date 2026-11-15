@@ -37,6 +37,9 @@ pub struct Config {
 
     #[serde(default)]
     pub theme: ThemeConfig,
+
+    #[serde(skip)]
+    pub explicit_token_cleared: bool,
 }
 
 fn default_api_url() -> String {
@@ -108,6 +111,7 @@ impl Default for Config {
             last_server_id: None,
             last_channel_id: None,
             theme: ThemeConfig::default(),
+            explicit_token_cleared: false,
         }
     }
 }
@@ -133,6 +137,11 @@ impl Config {
         } else {
             self.api_url = DEFAULT_REVOLT_API.to_string();
         }
+    }
+
+    pub fn clear_token(&mut self) {
+        self.token = None;
+        self.explicit_token_cleared = true;
     }
 
     pub fn config_dir() -> PathBuf {
@@ -172,7 +181,26 @@ impl Config {
         fs::create_dir_all(&dir)
             .with_context(|| format!("Failed to create config directory {:?}", dir))?;
         let path = Self::config_path();
-        let toml_str = toml::to_string_pretty(config)
+
+        let mut config_to_write = config.clone();
+
+        // Enforce token disk preservation:
+        // If current in-memory token is None, but config.toml on disk currently contains a non-empty token,
+        // and clear_token() was NOT explicitly called, preserve the existing token from disk.
+        if config_to_write.token.is_none() && !config_to_write.explicit_token_cleared && path.exists() {
+            if let Ok(existing_str) = fs::read_to_string(&path) {
+                if let Ok(existing_cfg) = toml::from_str::<Config>(&existing_str) {
+                    if let Some(existing_tok) = existing_cfg.token {
+                        if !existing_tok.trim().is_empty() {
+                            crate::log_info!("Preserving existing token from disk in config.toml");
+                            config_to_write.token = Some(existing_tok);
+                        }
+                    }
+                }
+            }
+        }
+
+        let toml_str = toml::to_string_pretty(&config_to_write)
             .context("Failed to serialize config to TOML")?;
         fs::write(&path, toml_str)
             .with_context(|| format!("Failed to write config file to {:?}", path))?;
@@ -188,8 +216,14 @@ impl Config {
             }
         }
 
-        let has_token = config.token.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false);
-        crate::log_info!("Saved config to {:?} (token.is_some()={})", path, has_token);
+        let has_token = config_to_write.token.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false);
+        crate::log_info!(
+            "Saving config: has_token={}, last_in_dm={}, last_server_id={:?}, last_channel_id={:?}",
+            has_token,
+            config_to_write.last_in_dm,
+            config_to_write.last_server_id,
+            config_to_write.last_channel_id
+        );
 
         Ok(())
     }

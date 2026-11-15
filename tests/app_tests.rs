@@ -898,3 +898,26 @@ async fn test_pending_attachment_and_clear_shortcuts() {
     app.handle_event(AppEvent::Key(esc_key)).await;
     assert!(app.state.pending_attachments.is_empty());
 }
+
+#[tokio::test]
+async fn test_no_mock_data_persisted_to_config() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let mut config = Config::default();
+    config.token = Some("valid_token".to_string());
+    config.last_server_id = Some("srv_REAL".to_string());
+    config.last_channel_id = Some("chan_REAL".to_string());
+
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(config, tx, picker);
+    app.state.load_demo_data();
+
+    // In demo mode or with mock IDs, switch_to_channel should NOT update config navigation
+    app.switch_to_channel("ch_stoat_general".to_string()).await;
+    assert_eq!(app.state.config.last_server_id.as_deref(), Some("srv_REAL"));
+    assert_eq!(app.state.config.last_channel_id.as_deref(), Some("chan_REAL"));
+
+    // switch_to_server with mock server ID should NOT update config navigation
+    app.switch_to_server(Some("srv_stoat".to_string())).await;
+    assert_eq!(app.state.config.last_server_id.as_deref(), Some("srv_REAL"));
+    assert_eq!(app.state.config.last_channel_id.as_deref(), Some("chan_REAL"));
+}

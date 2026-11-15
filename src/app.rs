@@ -259,8 +259,11 @@ impl App {
                 // 3. Overwrite config.token with new session token, save config.toml
                 self.state.config.token = Some(trimmed_token.clone());
                 self.state.config.is_bot = is_bot;
-                if let Err(e) = self.state.config.save() {
-                    log_error!("Failed to save config after login: {}", e);
+                self.state.config.explicit_token_cleared = false;
+                self.state.is_demo_mode = false;
+                match self.state.config.save() {
+                    Ok(_) => log_info!("Saved new token to config.toml successfully"),
+                    Err(e) => log_error!("Failed to save config after login: {}", e),
                 }
 
                 {
@@ -318,7 +321,7 @@ impl App {
             }
             AppEvent::ApiSessionExpired => {
                 log_warn!("Handling ApiSessionExpired: Invalidating session token, showing login modal");
-                self.state.config.token = None;
+                self.state.config.clear_token();
                 let _ = self.state.config.save();
                 self.state.current_user = None;
                 self.state.login_loading = false;
@@ -1636,11 +1639,15 @@ impl App {
             self.state.selected_channel_index = pos;
         }
 
-        // Persist session navigation state
-        self.state.config.last_in_dm = self.state.active_server_id.is_none();
-        self.state.config.last_server_id = self.state.active_server_id.clone();
-        self.state.config.last_channel_id = Some(channel_id.clone());
-        let _ = self.state.config.save();
+        // Persist session navigation state only if authenticated and not in demo/mock mode
+        let is_mock_server = self.state.active_server_id.as_deref().map(|s| s.starts_with("srv_stoat") || s.starts_with("srv_rust")).unwrap_or(false);
+        let is_mock_channel = channel_id.starts_with("ch_");
+        if self.state.config.token.is_some() && !self.state.is_demo_mode && !is_mock_server && !is_mock_channel {
+            self.state.config.last_in_dm = self.state.active_server_id.is_none();
+            self.state.config.last_server_id = self.state.active_server_id.clone();
+            self.state.config.last_channel_id = Some(channel_id.clone());
+            let _ = self.state.config.save();
+        }
 
         self.fetch_channel_messages(channel_id).await;
     }
@@ -1686,10 +1693,13 @@ impl App {
             } else {
                 self.state.active_channel_id = None;
                 self.state.chat_scroll_offset = 0;
-                self.state.config.last_in_dm = false;
-                self.state.config.last_server_id = Some(sid.clone());
-                self.state.config.last_channel_id = None;
-                let _ = self.state.config.save();
+                let is_mock_server = sid.starts_with("srv_stoat") || sid.starts_with("srv_rust");
+                if self.state.config.token.is_some() && !self.state.is_demo_mode && !is_mock_server {
+                    self.state.config.last_in_dm = false;
+                    self.state.config.last_server_id = Some(sid.clone());
+                    self.state.config.last_channel_id = None;
+                    let _ = self.state.config.save();
+                }
             }
         } else {
             self.state.active_rail = ActiveRail::DirectMessages;
@@ -1701,10 +1711,12 @@ impl App {
             } else {
                 self.state.active_channel_id = None;
                 self.state.chat_scroll_offset = 0;
-                self.state.config.last_in_dm = true;
-                self.state.config.last_server_id = None;
-                self.state.config.last_channel_id = None;
-                let _ = self.state.config.save();
+                if self.state.config.token.is_some() && !self.state.is_demo_mode {
+                    self.state.config.last_in_dm = true;
+                    self.state.config.last_server_id = None;
+                    self.state.config.last_channel_id = None;
+                    let _ = self.state.config.save();
+                }
             }
         }
     }
