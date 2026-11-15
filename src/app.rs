@@ -187,21 +187,25 @@ impl App {
             AppEvent::Tick => {}
             AppEvent::Gateway(gw) => self.handle_gateway(gw).await,
             AppEvent::ApiLoginSuccess { token, is_bot } | AppEvent::LoginSuccess { token, is_bot } => {
+                let trimmed_token = token.trim().to_string();
+                log_info!("Authentication succeeded! Updating session token and persisting config...");
                 self.state.login_loading = false;
                 self.state.login_error = None;
                 self.state.login_step = LoginStep::Credentials;
                 self.state.show_login_modal = false;
                 self.state.clear_mock_data();
-                self.state.config.token = Some(token.clone());
+                self.state.config.token = Some(trimmed_token.clone());
                 self.state.config.is_bot = is_bot;
-                let _ = self.state.config.save();
+                if let Err(e) = self.state.config.save() {
+                    log_error!("Failed to save config after login: {}", e);
+                }
 
                 {
                     let mut api = self.api_client.lock().await;
-                    api.set_token(token.clone(), is_bot);
+                    api.set_token(trimmed_token.clone(), is_bot);
                 }
 
-                self.start_gateway(token, self.state.config.gateway_url.clone());
+                self.start_gateway(trimmed_token, self.state.config.gateway_url.clone());
                 self.fetch_initial_data().await;
             }
             AppEvent::ApiMfaRequired { ticket, allowed_methods: _ } => {
@@ -410,8 +414,10 @@ impl App {
                             let client = api.lock().await;
                             match client.verify_mfa_totp(&ticket_clone, &code).await {
                                 Ok(LoginResponse::Success { token, .. }) => {
+                                    let trimmed = token.trim().to_string();
+                                    log_info!("MFA TOTP verification succeeded! Emitting LoginSuccess event.");
                                     let _ = tx.send(AppEvent::LoginSuccess {
-                                        token,
+                                        token: trimmed,
                                         is_bot: false,
                                     }).await;
                                 }
@@ -483,8 +489,10 @@ impl App {
                                 let client = api.lock().await;
                                 match client.login(&email, &password).await {
                                     Ok(LoginResponse::Success { token, .. }) => {
+                                        let trimmed = token.trim().to_string();
+                                        log_info!("Password login succeeded! Emitting ApiLoginSuccess event.");
                                         let _ = tx.send(AppEvent::ApiLoginSuccess {
-                                            token,
+                                            token: trimmed,
                                             is_bot: false,
                                         }).await;
                                     }
@@ -511,6 +519,7 @@ impl App {
                             }
                             self.state.login_loading = true;
                             self.state.login_error = None;
+                            log_info!("Manual token tab submitted! Emitting ApiLoginSuccess event.");
                             let _ = self.event_tx.send(AppEvent::ApiLoginSuccess {
                                 token,
                                 is_bot: false,

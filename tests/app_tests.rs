@@ -726,3 +726,22 @@ fn test_bonfire_url_construction() {
     let u4 = build_gateway_url("wss://api.revolt.chat/ws").unwrap();
     assert_eq!(u4.as_str(), "wss://api.revolt.chat/ws?format=json");
 }
+
+#[test]
+fn test_config_token_serialization_and_persistence() {
+    let mut config = Config::default();
+    assert!(config.token.is_none());
+
+    // When token is None, skip_serializing_if omits it
+    let toml_none = toml::to_string_pretty(&config).unwrap();
+    assert!(!toml_none.contains("token ="));
+
+    // When token is Some, it must be serialized cleanly
+    config.token = Some("test_session_token_12345".to_string());
+    let toml_some = toml::to_string_pretty(&config).unwrap();
+    assert!(toml_some.contains(r#"token = "test_session_token_12345""#));
+
+    // Deserialization check
+    let parsed: Config = toml::from_str(&toml_some).unwrap();
+    assert_eq!(parsed.token.as_deref(), Some("test_session_token_12345"));
+}

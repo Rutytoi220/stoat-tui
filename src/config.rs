@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 pub const DEFAULT_STOAT_API: &str = "https://api.stoat.chat";
 pub const DEFAULT_REVOLT_API: &str = "https://api.revolt.chat";
 
@@ -14,10 +17,10 @@ pub struct Config {
     #[serde(default = "default_api_url")]
     pub api_url: String,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_url: Option<String>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
 
     #[serde(default)]
@@ -161,6 +164,21 @@ impl Config {
             .context("Failed to serialize config to TOML")?;
         fs::write(&path, toml_str)
             .with_context(|| format!("Failed to write config file to {:?}", path))?;
+
+        #[cfg(unix)]
+        {
+            if let Ok(metadata) = fs::metadata(&path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o600);
+                if let Err(e) = fs::set_permissions(&path, perms) {
+                    crate::log_warn!("Failed to set 0600 permissions on config file {:?}: {}", path, e);
+                }
+            }
+        }
+
+        let has_token = config.token.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false);
+        crate::log_info!("Saved config to {:?} (token.is_some()={})", path, has_token);
+
         Ok(())
     }
 }
