@@ -812,21 +812,74 @@ impl DeltaClient {
             .await
     }
 
+    fn parse_retry_after_ms(headers: &HeaderMap, raw_body: &str) -> u64 {
+        for key in ["retry-after", "x-ratelimit-reset-after"] {
+            if let Some(val) = headers.get(key).and_then(|v| v.to_str().ok()) {
+                if let Ok(secs) = val.trim().parse::<f64>() {
+                    if secs.is_finite() && secs >= 0.0 {
+                        return ((secs * 1000.0).round() as u64).clamp(50, 5000);
+                    }
+                }
+            }
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw_body) {
+            if let Some(ms) = val.get("retry_after").and_then(|v| v.as_u64()) {
+                return ms.clamp(50, 5000);
+            }
+            if let Some(ms_f) = val.get("retry_after").and_then(|v| v.as_f64()) {
+                if ms_f.is_finite() && ms_f >= 0.0 {
+                    return (ms_f.round() as u64).clamp(50, 5000);
+                }
+            }
+        }
+        1500
+    }
+
+    async fn patch_json_with_429_retry<T: serde::Serialize + ?Sized>(
+        &self,
+        url: &str,
+        payload: &T,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let mut attempt = 0u8;
+        loop {
+            let resp = self
+                .client
+                .patch(url)
+                .headers(self.headers())
+                .json(payload)
+                .send()
+                .await
+                .with_context(|| format!("Failed to PATCH {}", url))?;
+
+            let status = resp.status();
+            let resp_headers = resp.headers().clone();
+            let body = resp.text().await.unwrap_or_default();
+            log_debug!("PATCH {} -> HTTP {}", url, status);
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let wait_ms = Self::parse_retry_after_ms(&resp_headers, &body);
+                if attempt == 0 {
+                    attempt += 1;
+                    log_warn!(
+                        "PATCH {} hit HTTP 429; waiting {}ms before automatic retry...",
+                        url,
+                        wait_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                    continue;
+                }
+                let secs = ((wait_ms as f64) / 1000.0).ceil().max(1.0) as u64;
+                return Err(anyhow!("Rate limited — try again in {}s", secs));
+            }
+
+            return Ok((status, body));
+        }
+    }
+
     pub async fn edit_user(&self, user_id: &str, payload: EditUserRequest) -> Result<User> {
         let url = format!("{}/users/{}", self.api_url.trim_end_matches('/'), user_id);
         log_info!("PATCH {} (editing user profile)", url);
-        let resp = self
-            .client
-            .patch(&url)
-            .headers(self.headers())
-            .json(&payload)
-            .send()
-            .await
-            .with_context(|| format!("Failed to PATCH {}", url))?;
-
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        log_debug!("PATCH {} -> HTTP {}", url, status);
+        let (status, body) = self.patch_json_with_429_retry(&url, &payload).await?;
 
         if !status.is_success() {
             log_warn!("PATCH {} failed (HTTP {}): {}", url, status, body);
@@ -849,18 +902,7 @@ impl DeltaClient {
             "password": password,
         });
 
-        let resp = self
-            .client
-            .patch(&url)
-            .headers(self.headers())
-            .json(&payload)
-            .send()
-            .await
-            .with_context(|| format!("Failed to PATCH {}", url))?;
-
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        log_debug!("PATCH {} -> HTTP {}", url, status);
+        let (status, body) = self.patch_json_with_429_retry(&url, &payload).await?;
 
         if !status.is_success() {
             log_warn!("PATCH {} failed (HTTP {}): {}", url, status, body);

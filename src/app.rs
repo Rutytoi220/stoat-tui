@@ -540,7 +540,9 @@ impl App {
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse).await,
             AppEvent::Paste(text) => self.handle_paste(text).await,
             AppEvent::Resize(_, _) => {}
-            AppEvent::Tick => {}
+            AppEvent::Tick => {
+                self.flush_pending_presence_if_due(false);
+            }
             AppEvent::Gateway(gw) => self.handle_gateway_for_account(account_id, gw).await,
             AppEvent::ApiLoginSuccess { token, is_bot } | AppEvent::LoginSuccess { token, is_bot } => {
                 let api_url = self.state.config.api_url.clone();
@@ -1329,10 +1331,12 @@ impl App {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('S') => {
                     self.state.show_settings_modal = false;
+                    self.flush_pending_presence_if_due(true);
                     let _ = self.state.config.save();
                 }
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     self.state.show_settings_modal = false;
+                    self.flush_pending_presence_if_due(true);
                     let _ = self.state.config.save();
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -3370,7 +3374,7 @@ impl App {
 
     fn cycle_profile_presence(&mut self, delta: i32) {
         let acc_id = self.settings_profile_account_id();
-        let Some(user) = self.state.current_user_for_account(&acc_id).cloned() else {
+        let Some(mut user) = self.state.current_user_for_account(&acc_id).cloned() else {
             self.state.settings_profile_status = Some("⚠ Not logged in on this account".to_string());
             return;
         };
@@ -3381,23 +3385,58 @@ impl App {
             Presence::Busy,
             Presence::Invisible,
         ];
-        let cur_pres = user
-            .status
+        let cur_pres = self
+            .state
+            .pending_presence_update
             .as_ref()
-            .and_then(|s| s.presence.clone())
+            .filter(|(a, _, _, _, _)| a == &acc_id)
+            .map(|(_, _, p, _, _)| p.clone())
+            .or_else(|| user.status.as_ref().and_then(|s| s.presence.clone()))
             .unwrap_or(Presence::Online);
         let cur_idx = PRESENCES.iter().position(|p| *p == cur_pres).unwrap_or(0) as i32;
         let next_pres = PRESENCES[(cur_idx + delta).rem_euclid(PRESENCES.len() as i32) as usize].clone();
-        let existing_text = user.status.and_then(|s| s.text);
+        let existing_text = user.status.as_ref().and_then(|s| s.text.clone());
 
-        let payload = EditUserRequest {
-            status: Some(UserStatus {
-                presence: Some(next_pres.clone()),
-                text: existing_text,
-            }),
-            ..Default::default()
-        };
-        self.spawn_edit_user(acc_id, user.id, payload);
+        // Optimistically update displayed presence immediately
+        let mut st = user.status.unwrap_or_default();
+        st.presence = Some(next_pres.clone());
+        user.status = Some(st);
+        self.state.account_users.insert(acc_id.clone(), user.clone());
+        self.state.users.insert(user.id.clone(), user.clone());
+        if acc_id == self.state.active_account_id {
+            self.state.current_user = Some(user.clone());
+        }
+
+        self.state.pending_presence_update = Some((
+            acc_id,
+            user.id,
+            next_pres.clone(),
+            existing_text,
+            std::time::Instant::now() + std::time::Duration::from_millis(800),
+        ));
+        self.state.settings_profile_status = Some(format!("Presence: {} (saving...)", next_pres.as_str()));
+    }
+
+    pub fn flush_pending_presence_if_due(&mut self, force: bool) {
+        let is_due = self
+            .state
+            .pending_presence_update
+            .as_ref()
+            .map(|(_, _, _, _, deadline)| force || std::time::Instant::now() >= *deadline)
+            .unwrap_or(false);
+        if !is_due {
+            return;
+        }
+        if let Some((acc_id, user_id, presence, text, _)) = self.state.pending_presence_update.take() {
+            let payload = EditUserRequest {
+                status: Some(UserStatus {
+                    presence: Some(presence),
+                    text,
+                }),
+                ..Default::default()
+            };
+            self.spawn_edit_user(acc_id, user_id, payload);
+        }
     }
 
     fn spawn_edit_user(&mut self, acc_id: String, user_id: String, payload: EditUserRequest) {

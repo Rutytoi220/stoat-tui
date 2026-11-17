@@ -149,6 +149,7 @@ pub struct AppState {
     pub settings_input_buffer: String,
     pub settings_pending_username: String,
     pub settings_profile_status: Option<String>,
+    pub pending_presence_update: Option<(String, String, Presence, Option<String>, std::time::Instant)>,
 
     pub show_screen_picker_modal: bool,
     pub screen_picker_targets: Vec<crate::voice::screen::ScreenShareTarget>,
@@ -297,6 +298,7 @@ impl AppState {
             settings_input_buffer: String::new(),
             settings_pending_username: String::new(),
             settings_profile_status: None,
+            pending_presence_update: None,
 
             show_screen_picker_modal: false,
             screen_picker_targets: Vec::new(),

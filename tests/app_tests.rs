@@ -3417,3 +3417,149 @@ async fn test_settings_modal_profile_editor_render_and_user_profile_updated() {
         .unwrap();
     assert_eq!(saved_alpha.username.as_deref(), Some("ruty_renamed"));
 }
+
+#[tokio::test]
+async fn test_presence_cycling_debounce_coalesces_single_patch() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use stoat_tui::api::models::{Presence, User};
+    use stoat_tui::event::AppEvent;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let req_count = Arc::new(AtomicUsize::new(0));
+    let req_count_srv = req_count.clone();
+
+    let server_handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        req_count_srv.fetch_add(1, Ordering::SeqCst);
+        let mut buf = [0u8; 4096];
+        let n = socket.read(&mut buf).await.unwrap();
+        let req = String::from_utf8_lossy(&buf[..n]);
+        assert!(req.contains("PATCH /users/01ME HTTP/1.1"), "Unexpected req:\n{}", req);
+        let body_part = req.split("\r\n\r\n").nth(1).unwrap_or("");
+        let parsed: serde_json::Value = serde_json::from_str(body_part).unwrap();
+        assert_eq!(parsed["status"]["presence"], "Busy");
+
+        let resp_body = r#"{"_id":"01ME","username":"me","status":{"presence":"Busy"}}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            resp_body.len(),
+            resp_body
+        );
+        socket.write_all(resp.as_bytes()).await.unwrap();
+    });
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let (mut cfg, _guard) = isolated_config(Some("tok_deb"));
+    cfg.api_url = server_url.clone();
+    cfg.upsert_account(server_url, "tok_deb".to_string(), false, true);
+    let picker = Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
+    app.state.focus = Focus::Chat;
+
+    app.handle_event(AppEvent::AccountScoped {
+        account_id: "primary".to_string(),
+        event: Box::new(AppEvent::ApiCurrentUser(User {
+            id: "01ME".to_string(),
+            username: "me".to_string(),
+            ..Default::default()
+        })),
+    })
+    .await;
+
+    // Open Settings modal and move to Presence (idx 1)
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT))).await;
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))).await;
+
+    // Rapidly cycle 3 times: Online -> Idle -> Focus -> Busy
+    for _ in 0..3 {
+        app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))).await;
+    }
+
+    assert!(app.state.pending_presence_update.is_some());
+    assert_eq!(
+        app.state.account_users["primary"]
+            .status
+            .as_ref()
+            .and_then(|s| s.presence.clone()),
+        Some(Presence::Busy)
+    );
+
+    // Tick before 800ms must NOT fire any HTTP request
+    app.handle_event(AppEvent::Tick).await;
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert_eq!(req_count.load(Ordering::SeqCst), 0, "Must debounce intermediate presence changes");
+
+    // Closing modal flushes the single coalesced PATCH immediately
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))).await;
+    server_handle.await.unwrap();
+    assert_eq!(req_count.load(Ordering::SeqCst), 1);
+
+    let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+        .await
+        .expect("Should receive UserProfileUpdated")
+        .unwrap();
+    assert!(matches!(ev, AppEvent::UserProfileUpdated { .. }));
+}
+
+#[tokio::test]
+async fn test_edit_user_retries_once_on_http_429_retry_after() {
+    use stoat_tui::api::models::{EditUserRequest, Presence, UserStatus};
+    use stoat_tui::api::DeltaClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+
+    let server_handle = tokio::spawn(async move {
+        // Request 1 -> HTTP 429 with retry_after: 60ms
+        {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await.unwrap();
+            let err_body = r#"{"type":"TooManyRequests","retry_after":60}"#;
+            let resp = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                err_body.len(),
+                err_body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        }
+        // Request 2 -> HTTP 200 OK
+        {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await.unwrap();
+            let ok_body = r#"{"_id":"01ME","username":"me","status":{"presence":"Idle"}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                ok_body.len(),
+                ok_body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        }
+    });
+
+    let client = DeltaClient::new(api_url, Some("tok_429".to_string()), false);
+    let updated = client
+        .edit_user(
+            "01ME",
+            EditUserRequest {
+                status: Some(UserStatus {
+                    presence: Some(Presence::Idle),
+                    text: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("edit_user should retry after 429 and succeed");
+
+    assert_eq!(updated.presence_str(), "Idle");
+    server_handle.await.unwrap();
+}
