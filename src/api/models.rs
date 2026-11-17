@@ -396,6 +396,28 @@ pub struct UserProfile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UserProfileUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EditUserRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<UserStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<UserProfileUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MemberId {
     #[serde(default)]
     pub server: String,

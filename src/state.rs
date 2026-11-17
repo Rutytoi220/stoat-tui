@@ -10,6 +10,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsEditTarget {
+    StatusText,
+    DisplayName,
+    Username,
+    UsernamePassword,
+    Bio,
+    AvatarPath,
+    BannerPath,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingAttachment {
     pub id: String,
@@ -133,6 +144,11 @@ pub struct AppState {
 
     pub show_settings_modal: bool,
     pub settings_selected_index: usize,
+    pub settings_profile_account_id: String,
+    pub settings_editing_field: Option<SettingsEditTarget>,
+    pub settings_input_buffer: String,
+    pub settings_pending_username: String,
+    pub settings_profile_status: Option<String>,
 
     pub show_screen_picker_modal: bool,
     pub screen_picker_targets: Vec<crate::voice::screen::ScreenShareTarget>,
@@ -276,6 +292,11 @@ impl AppState {
 
             show_settings_modal: false,
             settings_selected_index: 0,
+            settings_profile_account_id: active_account_id.clone(),
+            settings_editing_field: None,
+            settings_input_buffer: String::new(),
+            settings_pending_username: String::new(),
+            settings_profile_status: None,
 
             show_screen_picker_modal: false,
             screen_picker_targets: Vec::new(),

@@ -1,10 +1,10 @@
-use crate::api::models::{LoginResponse, Message};
+use crate::api::models::{EditUserRequest, LoginResponse, Message, Presence, UserProfileUpdate, UserStatus};
 use crate::api::DeltaClient;
 use crate::config::{Config, SavedAccount};
 use crate::event::AppEvent;
 use crate::gateway::messages::ServerMessage;
 use crate::gateway::{BonfireClient, GatewayEvent};
-use crate::state::{ActiveRail, AppState, Focus, GatewayStatus, LoginStep, LoginTab, PaletteItemType};
+use crate::state::{ActiveRail, AppState, Focus, GatewayStatus, LoginStep, LoginTab, PaletteItemType, SettingsEditTarget};
 use crate::{log_debug, log_error, log_info, log_warn};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::collections::HashMap;
@@ -959,6 +959,52 @@ impl App {
             AppEvent::AttachmentUploadFailed(err) => {
                 self.state.set_status(format!("❌ Upload failed: {}", err));
             }
+            AppEvent::UserProfileUpdated {
+                account_id: upd_acc_id,
+                user,
+            } => {
+                self.state
+                    .user_accounts
+                    .insert(user.id.clone(), upd_acc_id.clone());
+                self.state
+                    .account_users
+                    .insert(upd_acc_id.clone(), user.clone());
+                self.state.users.insert(user.id.clone(), user.clone());
+                if upd_acc_id == self.state.active_account_id {
+                    self.state.current_user = Some(user.clone());
+                }
+                let mut config_changed = false;
+                if let Some(acc) = self
+                    .state
+                    .config
+                    .accounts
+                    .iter_mut()
+                    .find(|a| a.id == upd_acc_id)
+                {
+                    if acc.username.as_deref() != Some(user.username.as_str()) {
+                        acc.username = Some(user.username.clone());
+                        config_changed = true;
+                    }
+                    acc.user_id = Some(user.id.clone());
+                }
+                if config_changed {
+                    let _ = self.state.config.save();
+                }
+                if let Some(ref mut cache) = self.state.image_cache {
+                    cache.remove_matching(&user.id);
+                }
+                let ok_msg = format!("✓ Profile updated (@{})", user.username);
+                self.state.settings_profile_status = Some(ok_msg.clone());
+                self.state.set_status(ok_msg);
+            }
+            AppEvent::ProfileEditFailed(err) => {
+                let msg = crate::ui::components::status_bar::sanitize_status_text(&format!(
+                    "⚠ {}",
+                    err
+                ));
+                self.state.settings_profile_status = Some(msg.clone());
+                self.state.set_status(msg);
+            }
             AppEvent::AutumnUrlResolved(url) => {
                 let trimmed = url.trim().trim_end_matches('/').to_string();
                 if !trimmed.is_empty() {
@@ -1253,8 +1299,32 @@ impl App {
 
         // 1c. If Settings Modal is open
         if self.state.show_settings_modal {
-            use crate::ui::modals::settings::SETTINGS_ITEM_COUNT;
-            let count = SETTINGS_ITEM_COUNT + self.state.config.accounts.len();
+            use crate::ui::modals::settings::{PROFILE_ITEM_COUNT, SETTINGS_ITEM_COUNT};
+            if let Some(edit_target) = self.state.settings_editing_field {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state.settings_editing_field = None;
+                        self.state.settings_input_buffer.clear();
+                        self.state.settings_pending_username.clear();
+                    }
+                    KeyCode::Backspace => {
+                        self.state.settings_input_buffer.pop();
+                    }
+                    KeyCode::Char(c)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        self.state.settings_input_buffer.push(c);
+                    }
+                    KeyCode::Enter => {
+                        self.submit_settings_profile_edit(edit_target);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
+            let count = PROFILE_ITEM_COUNT + SETTINGS_ITEM_COUNT + self.state.config.accounts.len();
             let idx = self.state.settings_selected_index.min(count.saturating_sub(1));
             match key.code {
                 KeyCode::Esc | KeyCode::Char('S') => {
@@ -1644,6 +1714,12 @@ impl App {
         {
             self.state.show_settings_modal = true;
             self.state.settings_selected_index = 0;
+            self.state.settings_profile_account_id =
+                self.state.account_for_active_channel().to_string();
+            self.state.settings_editing_field = None;
+            self.state.settings_input_buffer.clear();
+            self.state.settings_pending_username.clear();
+            self.state.settings_profile_status = None;
             return;
         }
 
@@ -3261,8 +3337,296 @@ impl App {
         self.state.set_status(format!("📞 Connecting to call in channel {}... [c: Cancel]", channel_id));
     }
 
+    fn settings_profile_account_id(&self) -> String {
+        if !self.state.settings_profile_account_id.is_empty() {
+            self.state.settings_profile_account_id.clone()
+        } else {
+            self.state.active_account_id.clone()
+        }
+    }
+
+    fn cycle_settings_profile_account(&mut self, delta: i32) {
+        let mut ids: Vec<String> = self
+            .state
+            .config
+            .accounts
+            .iter()
+            .map(|a| a.id.clone())
+            .collect();
+        for k in self.state.account_users.keys() {
+            if !ids.contains(k) {
+                ids.push(k.clone());
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        let cur = self.settings_profile_account_id();
+        let pos = ids.iter().position(|id| id == &cur).unwrap_or(0) as i32;
+        let next = (pos + delta).rem_euclid(ids.len() as i32) as usize;
+        self.state.settings_profile_account_id = ids[next].clone();
+        self.state.settings_profile_status = None;
+    }
+
+    fn cycle_profile_presence(&mut self, delta: i32) {
+        let acc_id = self.settings_profile_account_id();
+        let Some(user) = self.state.current_user_for_account(&acc_id).cloned() else {
+            self.state.settings_profile_status = Some("⚠ Not logged in on this account".to_string());
+            return;
+        };
+        const PRESENCES: [Presence; 5] = [
+            Presence::Online,
+            Presence::Idle,
+            Presence::Focus,
+            Presence::Busy,
+            Presence::Invisible,
+        ];
+        let cur_pres = user
+            .status
+            .as_ref()
+            .and_then(|s| s.presence.clone())
+            .unwrap_or(Presence::Online);
+        let cur_idx = PRESENCES.iter().position(|p| *p == cur_pres).unwrap_or(0) as i32;
+        let next_pres = PRESENCES[(cur_idx + delta).rem_euclid(PRESENCES.len() as i32) as usize].clone();
+        let existing_text = user.status.and_then(|s| s.text);
+
+        let payload = EditUserRequest {
+            status: Some(UserStatus {
+                presence: Some(next_pres.clone()),
+                text: existing_text,
+            }),
+            ..Default::default()
+        };
+        self.spawn_edit_user(acc_id, user.id, payload);
+    }
+
+    fn spawn_edit_user(&mut self, acc_id: String, user_id: String, payload: EditUserRequest) {
+        let api = self.client_for_account_arc(&acc_id);
+        let tx = self.event_tx.clone();
+        self.state.settings_profile_status = Some("Saving profile...".to_string());
+        tokio::spawn(async move {
+            let client = api.lock().await.clone();
+            match client.edit_user(&user_id, payload).await {
+                Ok(user) => {
+                    let _ = tx
+                        .send(AppEvent::UserProfileUpdated {
+                            account_id: acc_id,
+                            user,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::ProfileEditFailed(e.to_string())).await;
+                }
+            }
+        });
+    }
+
+    fn expand_tilde_path(raw: &str) -> std::path::PathBuf {
+        let trimmed = raw.trim();
+        if let Some(rest) = trimmed.strip_prefix("~/") {
+            if let Some(dirs) = directories::BaseDirs::new() {
+                return dirs.home_dir().join(rest);
+            }
+        }
+        std::path::PathBuf::from(trimmed)
+    }
+
+    fn spawn_profile_asset_upload(&mut self, tag: &'static str, explicit_path: Option<String>) {
+        let acc_id = self.settings_profile_account_id();
+        let Some(user) = self.state.current_user_for_account(&acc_id).cloned() else {
+            self.state.settings_profile_status = Some("⚠ Not logged in on this account".to_string());
+            return;
+        };
+        let autumn_url = self.state.autumn_url_for_account(&acc_id);
+        let api = self.client_for_account_arc(&acc_id);
+        let tx = self.event_tx.clone();
+        let user_id = user.id;
+
+        self.state.settings_profile_status = Some(if explicit_path.is_some() {
+            format!("Uploading {}...", tag)
+        } else {
+            "Opening file picker...".to_string()
+        });
+
+        tokio::task::spawn_blocking(move || {
+            let path_opt = match explicit_path {
+                Some(raw) => Some(Self::expand_tilde_path(&raw)),
+                None => rfd::FileDialog::new()
+                    .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif"])
+                    .pick_file(),
+            };
+            let Some(path) = path_opt else {
+                return;
+            };
+            let rt = tokio::runtime::Handle::current();
+            rt.spawn(async move {
+                let client = api.lock().await.clone();
+                match client.upload_autumn_tag(&autumn_url, tag, &path).await {
+                    Ok(asset_id) => {
+                        let payload = if tag == "avatars" {
+                            EditUserRequest {
+                                avatar: Some(asset_id),
+                                ..Default::default()
+                            }
+                        } else {
+                            EditUserRequest {
+                                profile: Some(UserProfileUpdate {
+                                    content: None,
+                                    background: Some(asset_id),
+                                }),
+                                ..Default::default()
+                            }
+                        };
+                        match client.edit_user(&user_id, payload).await {
+                            Ok(updated) => {
+                                let _ = tx
+                                    .send(AppEvent::UserProfileUpdated {
+                                        account_id: acc_id,
+                                        user: updated,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx.send(AppEvent::ProfileEditFailed(e.to_string())).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::ProfileEditFailed(e.to_string())).await;
+                    }
+                }
+            });
+        });
+    }
+
+    fn submit_settings_profile_edit(&mut self, target: SettingsEditTarget) {
+        let acc_id = self.settings_profile_account_id();
+        let val = self.state.settings_input_buffer.clone();
+        self.state.settings_input_buffer.clear();
+
+        if target == SettingsEditTarget::Username {
+            let trimmed = val.trim().to_string();
+            if trimmed.is_empty() {
+                self.state.settings_editing_field = None;
+                self.state.settings_profile_status = Some("⚠ Username cannot be empty".to_string());
+                return;
+            }
+            self.state.settings_pending_username = trimmed;
+            self.state.settings_editing_field = Some(SettingsEditTarget::UsernamePassword);
+            self.state.settings_profile_status = Some("Enter password to confirm username change".to_string());
+            return;
+        }
+
+        self.state.settings_editing_field = None;
+
+        if target == SettingsEditTarget::UsernamePassword {
+            let new_username = std::mem::take(&mut self.state.settings_pending_username);
+            let password = val;
+            if new_username.is_empty() || password.is_empty() {
+                self.state.settings_profile_status = Some("⚠ Password required to change username".to_string());
+                return;
+            }
+            let api = self.client_for_account_arc(&acc_id);
+            let tx = self.event_tx.clone();
+            self.state.settings_profile_status = Some("Updating username...".to_string());
+            tokio::spawn(async move {
+                let client = api.lock().await.clone();
+                match client.change_username(&new_username, &password).await {
+                    Ok(user) => {
+                        let _ = tx
+                            .send(AppEvent::UserProfileUpdated {
+                                account_id: acc_id,
+                                user,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::ProfileEditFailed(e.to_string())).await;
+                    }
+                }
+            });
+            return;
+        }
+
+        if target == SettingsEditTarget::AvatarPath || target == SettingsEditTarget::BannerPath {
+            let tag = if target == SettingsEditTarget::AvatarPath {
+                "avatars"
+            } else {
+                "backgrounds"
+            };
+            let trimmed = val.trim().to_string();
+            let path_opt = (!trimmed.is_empty()).then_some(trimmed);
+            self.spawn_profile_asset_upload(tag, path_opt);
+            return;
+        }
+
+        let Some(user) = self.state.current_user_for_account(&acc_id).cloned() else {
+            self.state.settings_profile_status = Some("⚠ Not logged in on this account".to_string());
+            return;
+        };
+
+        let trimmed = val.trim().to_string();
+        match target {
+            SettingsEditTarget::StatusText => {
+                let presence = user
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.presence.clone())
+                    .or(Some(Presence::Online));
+                let payload = EditUserRequest {
+                    status: Some(UserStatus {
+                        presence,
+                        text: (!trimmed.is_empty()).then_some(trimmed),
+                    }),
+                    ..Default::default()
+                };
+                self.spawn_edit_user(acc_id, user.id, payload);
+            }
+            SettingsEditTarget::DisplayName => {
+                let payload = if trimmed.is_empty() {
+                    EditUserRequest {
+                        remove: Some(vec!["DisplayName".to_string()]),
+                        ..Default::default()
+                    }
+                } else {
+                    EditUserRequest {
+                        display_name: Some(trimmed),
+                        ..Default::default()
+                    }
+                };
+                self.spawn_edit_user(acc_id, user.id, payload);
+            }
+            SettingsEditTarget::Bio => {
+                let payload = EditUserRequest {
+                    profile: Some(UserProfileUpdate {
+                        content: Some(trimmed.clone()),
+                        background: None,
+                    }),
+                    ..Default::default()
+                };
+                let prof = self.state.user_profiles.entry(user.id.clone()).or_default();
+                prof.content = Some(trimmed);
+                self.spawn_edit_user(acc_id, user.id, payload);
+            }
+            _ => {}
+        }
+    }
+
     fn adjust_setting(&mut self, idx: usize, delta: i32) {
-        match idx {
+        use crate::ui::modals::settings::PROFILE_ITEM_COUNT;
+        if idx == 0 {
+            self.cycle_settings_profile_account(delta);
+            return;
+        }
+        if idx == 1 {
+            self.cycle_profile_presence(delta);
+            return;
+        }
+        if idx < PROFILE_ITEM_COUNT {
+            return;
+        }
+        match idx - PROFILE_ITEM_COUNT {
             0 => {
                 self.state.config.call_sounds_enabled = !self.state.config.call_sounds_enabled;
                 crate::voice::sounds::set_enabled(self.state.config.call_sounds_enabled);
@@ -3293,7 +3657,58 @@ impl App {
     }
 
     fn activate_setting(&mut self, idx: usize) {
-        match idx {
+        use crate::ui::modals::settings::PROFILE_ITEM_COUNT;
+        if idx < PROFILE_ITEM_COUNT {
+            let acc_id = self.settings_profile_account_id();
+            let user_opt = self.state.current_user_for_account(&acc_id).cloned();
+            match idx {
+                0 => self.cycle_settings_profile_account(1),
+                1 => self.cycle_profile_presence(1),
+                2 => {
+                    self.state.settings_editing_field = Some(SettingsEditTarget::StatusText);
+                    self.state.settings_input_buffer = user_opt
+                        .and_then(|u| u.status)
+                        .and_then(|s| s.text)
+                        .unwrap_or_default();
+                }
+                3 => {
+                    self.state.settings_editing_field = Some(SettingsEditTarget::DisplayName);
+                    self.state.settings_input_buffer = user_opt
+                        .and_then(|u| u.display_name)
+                        .unwrap_or_default();
+                }
+                4 => {
+                    self.state.settings_editing_field = Some(SettingsEditTarget::Username);
+                    self.state.settings_input_buffer = user_opt
+                        .map(|u| u.username)
+                        .unwrap_or_default();
+                    self.state.settings_pending_username.clear();
+                }
+                5 => {
+                    self.state.settings_editing_field = Some(SettingsEditTarget::Bio);
+                    self.state.settings_input_buffer = user_opt
+                        .and_then(|u| self.state.user_profiles.get(&u.id))
+                        .and_then(|p| p.content.clone())
+                        .unwrap_or_default();
+                }
+                6 => {
+                    self.state.settings_editing_field = Some(SettingsEditTarget::AvatarPath);
+                    self.state.settings_input_buffer.clear();
+                    self.state.settings_profile_status =
+                        Some("Type image path (~ supported) or press Enter for picker".to_string());
+                }
+                7 => {
+                    self.state.settings_editing_field = Some(SettingsEditTarget::BannerPath);
+                    self.state.settings_input_buffer.clear();
+                    self.state.settings_profile_status =
+                        Some("Type banner path (~ supported) or press Enter for picker".to_string());
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match idx - PROFILE_ITEM_COUNT {
             0 | 2 | 3 => self.adjust_setting(idx, 1),
             1 => {
                 let next = if self.state.left_sidebar_width >= 52 {
@@ -3360,7 +3775,9 @@ impl App {
         } else {
             self.logout_current_session();
         }
-        let max_idx = 6 + self.state.config.accounts.len();
+        let max_idx = crate::ui::modals::settings::PROFILE_ITEM_COUNT
+            + crate::ui::modals::settings::SETTINGS_ITEM_COUNT
+            + self.state.config.accounts.len();
         if self.state.settings_selected_index >= max_idx {
             self.state.settings_selected_index = max_idx.saturating_sub(1);
         }

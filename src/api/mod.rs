@@ -725,31 +725,49 @@ impl DeltaClient {
         Ok(msg)
     }
 
-    pub async fn upload_autumn_attachment(
+    pub async fn upload_autumn_bytes(
         &self,
         autumn_url: &str,
+        tag: &str,
         filename: String,
         bytes: Vec<u8>,
     ) -> Result<String> {
-        let url = format!("{}/attachments", autumn_url.trim_end_matches('/'));
-        log_info!("Uploading file '{}' ({} bytes) to Autumn at {}...", filename, bytes.len(), url);
+        let url = format!(
+            "{}/{}",
+            autumn_url.trim_end_matches('/'),
+            tag.trim_matches('/')
+        );
+        log_info!(
+            "Uploading file '{}' ({} bytes) to Autumn at {}...",
+            filename,
+            bytes.len(),
+            url
+        );
 
-        let part = reqwest::multipart::Part::bytes(bytes)
-            .file_name(filename.clone());
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(filename.clone());
         let form = reqwest::multipart::Form::new().part("file", part);
 
-        let resp = self
-            .client
-            .post(&url)
-            .multipart(form)
+        let mut req = self.client.post(&url).multipart(form);
+        if let Some(ref token) = self.token {
+            let header_key = if self.is_bot {
+                "x-bot-token"
+            } else {
+                "x-session-token"
+            };
+            if let Ok(val) = HeaderValue::from_str(token.trim()) {
+                req = req.header(header_key, val);
+            }
+        }
+
+        let resp = req
             .send()
             .await
-            .with_context(|| format!("Failed to upload attachment to {}", url))?;
+            .with_context(|| format!("Failed to upload {} to {}", tag, url))?;
 
         let status = resp.status();
         if !status.is_success() {
             let err_text = resp.text().await.unwrap_or_default();
-            log_error!("Autumn upload failed (HTTP {}): {}", status, err_text);
+            log_error!("Autumn upload ({}) failed (HTTP {}): {}", tag, status, err_text);
             return Err(anyhow!("Autumn upload returned HTTP {}: {}", status, err_text));
         }
 
@@ -757,8 +775,103 @@ impl DeltaClient {
             .json()
             .await
             .context("Failed to parse Autumn upload response")?;
-        log_info!("Autumn file '{}' uploaded successfully with id {}", filename, upload_resp.id);
+        log_info!(
+            "Autumn file '{}' uploaded to {} successfully with id {}",
+            filename,
+            tag,
+            upload_resp.id
+        );
         Ok(upload_resp.id)
+    }
+
+    pub async fn upload_autumn_attachment(
+        &self,
+        autumn_url: &str,
+        filename: String,
+        bytes: Vec<u8>,
+    ) -> Result<String> {
+        self.upload_autumn_bytes(autumn_url, "attachments", filename, bytes)
+            .await
+    }
+
+    pub async fn upload_autumn_tag(
+        &self,
+        autumn_url: &str,
+        tag: &str,
+        file_path: &std::path::Path,
+    ) -> Result<String> {
+        let filename = file_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("upload.png")
+            .to_string();
+        let bytes = tokio::fs::read(file_path)
+            .await
+            .with_context(|| format!("Failed to read file {}", file_path.display()))?;
+        self.upload_autumn_bytes(autumn_url, tag, filename, bytes)
+            .await
+    }
+
+    pub async fn edit_user(&self, user_id: &str, payload: EditUserRequest) -> Result<User> {
+        let url = format!("{}/users/{}", self.api_url.trim_end_matches('/'), user_id);
+        log_info!("PATCH {} (editing user profile)", url);
+        let resp = self
+            .client
+            .patch(&url)
+            .headers(self.headers())
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| format!("Failed to PATCH {}", url))?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        log_debug!("PATCH {} -> HTTP {}", url, status);
+
+        if !status.is_success() {
+            log_warn!("PATCH {} failed (HTTP {}): {}", url, status, body);
+            if let Some(structured) = Self::format_structured_auth_error(status, &body) {
+                return Err(anyhow!(structured));
+            }
+            return Err(anyhow!("Profile update failed (HTTP {}): {}", status, body));
+        }
+
+        let user: User = serde_json::from_str(&body).context("Failed to parse updated User JSON")?;
+        Ok(user)
+    }
+
+    pub async fn change_username(&self, new_username: &str, password: &str) -> Result<User> {
+        let url = format!("{}/users/@me/username", self.api_url.trim_end_matches('/'));
+        let trimmed = new_username.trim();
+        log_info!("PATCH {} (changing username to '{}')", url, trimmed);
+        let payload = serde_json::json!({
+            "username": trimmed,
+            "password": password,
+        });
+
+        let resp = self
+            .client
+            .patch(&url)
+            .headers(self.headers())
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| format!("Failed to PATCH {}", url))?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        log_debug!("PATCH {} -> HTTP {}", url, status);
+
+        if !status.is_success() {
+            log_warn!("PATCH {} failed (HTTP {}): {}", url, status, body);
+            if let Some(structured) = Self::format_structured_auth_error(status, &body) {
+                return Err(anyhow!(structured));
+            }
+            return Err(anyhow!("Username change failed (HTTP {}): {}", status, body));
+        }
+
+        let user: User = serde_json::from_str(&body).context("Failed to parse updated User JSON")?;
+        Ok(user)
     }
 
     pub async fn fetch_server_members(&self, server_id: &str) -> Result<ServerMembersResponse> {

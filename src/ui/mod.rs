@@ -136,8 +136,8 @@ fn render_modals(f: &mut Frame, state: &mut AppState, size: Rect) {
         let modal_rect = if size.width < 36 || size.height < 14 {
             size
         } else {
-            let modal_w = 60.min(size.width.saturating_sub(4));
-            let modal_h = (18 + (state.config.accounts.len() as u16) * 2).min(size.height.saturating_sub(2));
+            let modal_w = 68.min(size.width.saturating_sub(4));
+            let modal_h = (22 + (state.config.accounts.len() as u16) * 2).min(size.height.saturating_sub(2));
             Rect {
                 x: size.width.saturating_sub(modal_w) / 2,
                 y: size.height.saturating_sub(modal_h) / 2,

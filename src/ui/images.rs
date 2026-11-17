@@ -81,4 +81,10 @@ impl ImageCache {
             self.lru_order.remove(pos);
         }
     }
+
+    pub fn remove_matching(&mut self, needle: &str) {
+        self.pending_fetches.retain(|k| !k.contains(needle));
+        self.protocols.retain(|k, _| !k.contains(needle));
+        self.lru_order.retain(|k| !k.contains(needle));
+    }
 }

@@ -55,6 +55,8 @@ pub enum AppEvent {
     PickerResolved(std::sync::Arc<ratatui_image::picker::Picker>),
     ServerMembersFetched { server_id: String, members: Vec<Member>, users: Vec<User> },
     UserProfileFetched { user_id: String, profile: UserProfile },
+    UserProfileUpdated { account_id: String, user: User },
+    ProfileEditFailed(String),
 }
 
 pub struct EventHandler {

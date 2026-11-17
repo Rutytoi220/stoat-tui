@@ -2155,28 +2155,33 @@ async fn test_settings_modal_shift_s_persistence_and_10x10_render() {
     app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT))).await;
     assert!(app.state.show_settings_modal);
 
-    // Toggle Call Sound Effects (idx 0 -> false)
+    // Move past the 8 My Profile items to Call Sound Effects
+    for _ in 0..stoat_tui::ui::modals::settings::PROFILE_ITEM_COUNT {
+        app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))).await;
+    }
+
+    // Toggle Call Sound Effects (false)
     app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))).await;
     assert!(!app.state.config.call_sounds_enabled);
 
-    // Move to Left Sidebar Width (idx 1) and expand (+2 -> 28)
+    // Move to Left Sidebar Width and expand (+2 -> 28)
     app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))).await;
     app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))).await;
     assert_eq!(app.state.left_sidebar_width, 28);
     assert_eq!(app.state.config.left_sidebar_width, 28);
 
-    // Move to Compact Mode (idx 2) and toggle ON
+    // Move to Compact Mode and toggle ON
     app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))).await;
     app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))).await;
     assert!(app.state.config.compact_mode);
 
-    // Move to Accent Color Preset (idx 3) and cycle to Blurple
+    // Move to Accent Color Preset and cycle to Blurple
     app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))).await;
     app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))).await;
     assert_eq!(app.state.config.theme.primary, ACCENT_PRESETS[1].1);
 
-    // Render Settings modal at 80x24 and 10x10
-    let mut term80 = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    // Render Settings modal at 80x28 and 10x10
+    let mut term80 = Terminal::new(TestBackend::new(80, 28)).unwrap();
     term80.draw(|f| ui::render(f, &mut app.state)).unwrap();
     let txt80: String = term80.backend().buffer().content().iter().map(|c| c.symbol()).collect();
     assert!(txt80.contains("Call Sound Effects"));
@@ -3196,4 +3201,219 @@ async fn test_secondary_account_custom_avatar_uses_instance_autumn_url() {
         app.state.autumn_url_for_account("alpha-node"),
         "https://alpha-node.example.ts.net/autumn"
     );
+}
+
+#[tokio::test]
+async fn test_profile_api_upload_edit_user_and_change_username() {
+    use stoat_tui::api::models::{EditUserRequest, Presence, UserProfileUpdate, UserStatus};
+    use stoat_tui::api::DeltaClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // 1. Test DeltaClient::upload_autumn_tag (multipart POST /avatars)
+    let tmp_img = std::env::temp_dir().join(format!("stoat_pfp_{}.png", std::process::id()));
+    std::fs::write(&tmp_img, b"PNG_FAKE_BYTES").unwrap();
+
+    let autumn_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let autumn_url = format!("http://127.0.0.1:{}", autumn_listener.local_addr().unwrap().port());
+    let h_autumn = tokio::spawn(async move {
+        let (mut socket, _) = autumn_listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let n = socket.read(&mut buf).await.unwrap();
+        let req = String::from_utf8_lossy(&buf[..n]);
+        assert!(req.contains("POST /avatars HTTP/1.1"), "Expected POST /avatars, got:\n{}", req);
+        assert!(
+            req.to_ascii_lowercase().contains("multipart/form-data"),
+            "Expected multipart/form-data header"
+        );
+        assert!(req.contains("PNG_FAKE_BYTES"), "Missing file bytes in multipart body");
+        let body = r#"{"id":"01AUTUMN_PFP_ID"}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket.write_all(resp.as_bytes()).await.unwrap();
+    });
+
+    let api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_url = format!("http://127.0.0.1:{}", api_listener.local_addr().unwrap().port());
+    let h_api = tokio::spawn(async move {
+        // Request 1: PATCH /users/01ME
+        {
+            let (mut socket, _) = api_listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.contains("PATCH /users/01ME HTTP/1.1"), "Expected PATCH /users/01ME, got:\n{}", req);
+            let body_part = req.split("\r\n\r\n").nth(1).unwrap_or("");
+            let parsed: serde_json::Value = serde_json::from_str(body_part).unwrap();
+            assert_eq!(parsed["display_name"], "Ruty Updated");
+            assert_eq!(parsed["avatar"], "01AUTUMN_PFP_ID");
+            assert_eq!(parsed["status"]["presence"], "Focus");
+            assert_eq!(parsed["status"]["text"], "Coding in Rust");
+            assert_eq!(parsed["profile"]["content"], "TUI enjoyer");
+
+            let resp_body = r#"{"_id":"01ME","username":"rutytoi","display_name":"Ruty Updated","avatar":{"_id":"01AUTUMN_PFP_ID","tag":"avatars","filename":"pfp.png"},"status":{"presence":"Focus","text":"Coding in Rust"}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        }
+        // Request 2: PATCH /users/@me/username
+        {
+            let (mut socket, _) = api_listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.contains("PATCH /users/@me/username HTTP/1.1"),
+                "Expected PATCH /users/@me/username, got:\n{}",
+                req
+            );
+            let body_part = req.split("\r\n\r\n").nth(1).unwrap_or("");
+            let parsed: serde_json::Value = serde_json::from_str(body_part).unwrap();
+            assert_eq!(parsed["username"], "ruty_new");
+            assert_eq!(parsed["password"], "pw_secret");
+
+            let resp_body = r#"{"_id":"01ME","username":"ruty_new"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        }
+    });
+
+    let client = DeltaClient::new(api_url, Some("tok_prof".to_string()), false);
+    let uploaded_id = client
+        .upload_autumn_tag(&autumn_url, "avatars", &tmp_img)
+        .await
+        .expect("upload_autumn_tag should succeed");
+    assert_eq!(uploaded_id, "01AUTUMN_PFP_ID");
+    let _ = std::fs::remove_file(&tmp_img);
+    h_autumn.await.unwrap();
+
+    let updated_user = client
+        .edit_user(
+            "01ME",
+            EditUserRequest {
+                display_name: Some("Ruty Updated".to_string()),
+                avatar: Some(uploaded_id),
+                status: Some(UserStatus {
+                    presence: Some(Presence::Focus),
+                    text: Some("Coding in Rust".to_string()),
+                }),
+                profile: Some(UserProfileUpdate {
+                    content: Some("TUI enjoyer".to_string()),
+                    background: None,
+                }),
+                remove: None,
+            },
+        )
+        .await
+        .expect("edit_user should succeed");
+    assert_eq!(updated_user.display_name.as_deref(), Some("Ruty Updated"));
+    assert_eq!(updated_user.avatar.as_ref().map(|a| a.id.as_str()), Some("01AUTUMN_PFP_ID"));
+
+    let renamed_user = client
+        .change_username("  ruty_new  ", "pw_secret")
+        .await
+        .expect("change_username should succeed");
+    assert_eq!(renamed_user.username, "ruty_new");
+    h_api.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_settings_modal_profile_editor_render_and_user_profile_updated() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use stoat_tui::api::models::{FileObject, User};
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::ui;
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (mut cfg, _guard) = isolated_config(Some("tok_prof_ui"));
+    let alpha_id = cfg.upsert_account(
+        "https://alpha-node.example.ts.net/api".to_string(),
+        "tok_alpha".to_string(),
+        false,
+        false,
+    );
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
+    app.state.focus = Focus::Chat;
+
+    // Seed alpha-node user and stale cached default avatar
+    app.handle_event(AppEvent::AccountScoped {
+        account_id: alpha_id.clone(),
+        event: Box::new(AppEvent::ApiCurrentUser(User {
+            id: "01ALPHA_ME".to_string(),
+            username: "ruty_old".to_string(),
+            ..Default::default()
+        })),
+    })
+    .await;
+    if let Some(ref mut cache) = app.state.image_cache {
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2));
+        cache.insert(format!("avatar:{}:01ALPHA_ME:default", alpha_id), img);
+    }
+
+    // Open Settings modal and render at 80x30
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT))).await;
+    assert!(app.state.show_settings_modal);
+
+    let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+    term.draw(|f| ui::render(f, &mut app.state)).unwrap();
+    let txt: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+    assert!(txt.contains("My Profile: Account"), "Missing Account row: {}", txt);
+    assert!(txt.contains("My Profile: Presence"), "Missing Presence row: {}", txt);
+    assert!(txt.contains("My Profile: Display Name"), "Missing Display Name row: {}", txt);
+    assert!(txt.contains("My Profile: Upload PFP"), "Missing Upload PFP row: {}", txt);
+    assert!(txt.contains("My Profile: Upload Banner"), "Missing Upload Banner row: {}", txt);
+
+    // Dispatch UserProfileUpdated and verify state + ImageCache busting + SavedAccount sync
+    app.handle_event(AppEvent::UserProfileUpdated {
+        account_id: alpha_id.clone(),
+        user: User {
+            id: "01ALPHA_ME".to_string(),
+            username: "ruty_renamed".to_string(),
+            display_name: Some("Ruty Alpha".to_string()),
+            avatar: Some(FileObject {
+                id: "01NEW_AVATAR".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    })
+    .await;
+
+    assert_eq!(
+        app.state.account_users[&alpha_id].username,
+        "ruty_renamed"
+    );
+    assert_eq!(
+        app.state.users["01ALPHA_ME"].display_name.as_deref(),
+        Some("Ruty Alpha")
+    );
+    assert!(
+        !app.state
+            .image_cache
+            .as_ref()
+            .unwrap()
+            .contains(&format!("avatar:{}:01ALPHA_ME:default", alpha_id)),
+        "Stale default avatar cache entry must be busted on UserProfileUpdated"
+    );
+    let saved_alpha = app
+        .state
+        .config
+        .accounts
+        .iter()
+        .find(|a| a.id == alpha_id)
+        .unwrap();
+    assert_eq!(saved_alpha.username.as_deref(), Some("ruty_renamed"));
 }
