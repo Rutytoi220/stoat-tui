@@ -5,19 +5,24 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Widget};
 
 pub struct ServersRail<'a> {
-    state: &'a AppState,
+    state: &'a mut AppState,
 }
 
 impl<'a> ServersRail<'a> {
-    pub fn new(state: &'a AppState) -> Self {
+    pub fn new(state: &'a mut AppState) -> Self {
         Self { state }
     }
 }
 
 impl<'a> Widget for ServersRail<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
         let is_focused = self.state.focus == Focus::Servers;
-        let theme = &self.state.theme;
+        let theme = self.state.theme.clone();
+        let borderless = area.width < 24 || area.height < 10;
 
         // Render rail background
         for y in area.top()..area.bottom() {
@@ -28,19 +33,30 @@ impl<'a> Widget for ServersRail<'a> {
             }
         }
 
-        // Draw border if focused or subtle separator
-        let block = Block::default()
-            .borders(Borders::RIGHT)
-            .border_style(theme.focused_border_style(is_focused));
-        block.render(area, buf);
+        // Draw border only when space permits (non-compact rail)
+        let inner_width = if borderless && area.width > 7 {
+            area.width
+        } else if area.width >= 3 {
+            let block = Block::default()
+                .borders(Borders::RIGHT)
+                .border_style(theme.focused_border_style(is_focused));
+            block.render(area, buf);
+            area.width.saturating_sub(1)
+        } else {
+            area.width
+        };
 
-        if area.width < 3 || area.height < 4 {
+        if area.width < 2 || area.height < 1 {
             return;
         }
 
-        let inner_width = area.width.saturating_sub(1); // Exclude right border
         let start_x = area.left();
-        let mut cur_y = area.top() + 1;
+        let mut cur_y = if borderless { area.top() } else { area.top() + 1 };
+        let y_step: u16 = if area.height < 10 { 1 } else { 2 };
+
+        if cur_y >= area.bottom() {
+            return;
+        }
 
         // 1. Direct Messages Icon button (@)
         let is_dm_active = matches!(self.state.active_rail, ActiveRail::DirectMessages);
@@ -52,46 +68,47 @@ impl<'a> Widget for ServersRail<'a> {
             Style::default().fg(theme.muted).bg(theme.rail_bg)
         };
 
-        // Left indicator bar for active item
         if is_dm_active {
-            buf[(start_x, cur_y)]
-                .set_char('▌')
-                .set_fg(theme.primary)
-                .set_style(Modifier::BOLD);
+            crate::ui::put_cell(buf, area, start_x, cur_y, '▌', Style::default().fg(theme.primary).add_modifier(Modifier::BOLD));
         }
 
-        let dm_text = if inner_width >= 6 { "  @   " } else { " @ " };
-        let text_start_x = start_x + 1;
-        let mut col_x = text_start_x;
-        for ch in dm_text.chars() {
-            if col_x < start_x + inner_width {
-                buf[(col_x, cur_y)]
-                    .set_char(ch)
-                    .set_style(dm_style);
-                col_x += 1;
-            }
-        }
+        let dm_text = if borderless && inner_width >= 10 {
+            " @ DMs"
+        } else if inner_width >= 6 {
+            "  @   "
+        } else {
+            "@"
+        };
+        let text_start_x = if inner_width >= 3 { start_x + 1 } else { start_x };
+        crate::ui::write_str(
+            buf,
+            Rect { x: area.left(), y: area.top(), width: inner_width, height: area.height },
+            text_start_x,
+            cur_y,
+            dm_text,
+            dm_style,
+        );
 
         // DM Unread pill
-        if dm_unread > 0 && start_x + inner_width > start_x + 4 {
-            buf[(start_x + inner_width - 1, cur_y)]
-                .set_char('●')
-                .set_fg(theme.unread_badge);
+        if dm_unread > 0 && inner_width > 4 {
+            crate::ui::put_cell(buf, area, start_x + inner_width - 1, cur_y, '●', Style::default().fg(theme.unread_badge));
         }
 
-        cur_y += 2;
+        cur_y += y_step;
 
-        // 2. Horizontal separator line
-        for x in (start_x + 1)..(start_x + inner_width) {
-            buf[(x, cur_y)]
-                .set_char('─')
-                .set_fg(Color::Rgb(40, 40, 45));
+        // 2. Horizontal separator line (when tall enough)
+        if !borderless && cur_y < area.bottom() {
+            for x in (start_x + 1)..(start_x + inner_width) {
+                crate::ui::put_cell(buf, area, x, cur_y, '─', Style::default().fg(Color::Rgb(40, 40, 45)));
+            }
+            cur_y += 2;
         }
-        cur_y += 2;
 
         // 3. Server list
-        for (idx, server) in self.state.servers.iter().enumerate() {
-            if cur_y >= area.bottom() - 1 {
+        let servers = self.state.servers.clone();
+        let bottom_limit = if borderless { area.bottom() } else { area.bottom().saturating_sub(1) };
+        for (idx, server) in servers.iter().enumerate() {
+            if cur_y >= bottom_limit {
                 break;
             }
 
@@ -100,10 +117,8 @@ impl<'a> Widget for ServersRail<'a> {
                 _ => false,
             };
 
-            let is_selected = is_focused && self.state.selected_server_index == idx;
+            let is_selected = is_focused && self.state.selected_server_index == idx + 1;
 
-            // Generate 2-letter abbreviation badge: initials for multi-word (e.g. "Stoat Official" -> "SO"),
-            // or first 2 characters for single-word / short names (e.g. "Zero" -> "ZE", "Origin" -> "OR")
             let words: Vec<&str> = server.name.split_whitespace().collect();
             let label = if words.len() >= 2 {
                 let first = words[0].chars().next().unwrap_or('?');
@@ -130,27 +145,50 @@ impl<'a> Widget for ServersRail<'a> {
                 Style::default().fg(theme.muted).bg(theme.rail_bg)
             };
 
-            // Left indicator bar
             if is_server_active {
-                buf[(start_x, cur_y)]
-                    .set_char('▌')
-                    .set_fg(theme.primary)
-                    .set_style(Modifier::BOLD);
+                crate::ui::put_cell(buf, area, start_x, cur_y, '▌', Style::default().fg(theme.primary).add_modifier(Modifier::BOLD));
             }
 
-            let server_box = if inner_width >= 6 {
+            let server_box = if borderless && inner_width >= 10 {
+                format!(" [{}] {}", label, server.name)
+            } else if inner_width >= 6 {
                 format!(" [{}] ", label)
             } else {
                 format!("[{}]", label)
             };
 
-            let mut col_x = start_x + 1;
-            for ch in server_box.chars() {
-                if col_x < start_x + inner_width {
-                    buf[(col_x, cur_y)]
-                        .set_char(ch)
-                        .set_style(item_style);
-                    col_x += 1;
+            let col_start = if inner_width >= 3 { start_x + 1 } else { start_x };
+            crate::ui::write_str(
+                buf,
+                Rect { x: area.left(), y: area.top(), width: inner_width, height: area.height },
+                col_start,
+                cur_y,
+                &server_box,
+                item_style,
+            );
+
+            // Enqueue server icon image over the 2-char badge area if icon is set and width allows
+            if inner_width >= 5 {
+                if let Some(icon_url) = self.state.server_icon_url(server) {
+                    let icon_x = if borderless && inner_width >= 10 {
+                        start_x + 3
+                    } else if inner_width >= 6 {
+                        start_x + 3
+                    } else {
+                        start_x + 2
+                    };
+                    let icon_w = 2.min((start_x + inner_width).saturating_sub(icon_x));
+                    if icon_w > 0 {
+                        let icon_rect = Rect {
+                            x: icon_x,
+                            y: cur_y,
+                            width: icon_w,
+                            height: 1,
+                        };
+                        let key = format!("server_icon_{}", server.id);
+                        self.state.deferred_image_renders.push((icon_rect, key.clone()));
+                        self.state.request_image(key, icon_url);
+                    }
                 }
             }
 
@@ -161,13 +199,11 @@ impl<'a> Widget for ServersRail<'a> {
                     srv_unreads += self.state.unread_counts.get(cid).copied().unwrap_or(0);
                 }
             }
-            if srv_unreads > 0 && start_x + inner_width > start_x + 4 {
-                buf[(start_x + inner_width - 1, cur_y)]
-                    .set_char('●')
-                    .set_fg(theme.unread_badge);
+            if srv_unreads > 0 && inner_width > 4 {
+                crate::ui::put_cell(buf, area, start_x + inner_width - 1, cur_y, '●', Style::default().fg(theme.unread_badge));
             }
 
-            cur_y += 2;
+            cur_y += y_step;
         }
     }
 }

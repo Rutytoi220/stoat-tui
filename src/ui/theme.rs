@@ -74,6 +74,12 @@ impl Theme {
         PALETTE[(hash as usize) % PALETTE.len()]
     }
 
+    pub fn user_initials_color(&self, user_id: &str) -> (Color, Color) {
+        // Background color and foreground text color for avatar initials badge
+        let bg = self.role_color(user_id);
+        (bg, Color::White)
+    }
+
     pub fn focused_border_style(&self, is_focused: bool) -> Style {
         if is_focused {
             Style::default().fg(self.border_focused).add_modifier(Modifier::BOLD)

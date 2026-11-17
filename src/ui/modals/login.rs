@@ -16,11 +16,12 @@ impl<'a> LoginModal<'a> {
 
 impl<'a> Widget for LoginModal<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if !self.state.show_login_modal {
+        if !self.state.show_login_modal || area.width == 0 || area.height == 0 {
             return;
         }
 
         let theme = &self.state.theme;
+        let borderless = area.width < 36 || area.height < 14;
 
         // Clear modal area
         Clear.render(area, buf);
@@ -36,27 +37,150 @@ impl<'a> Widget for LoginModal<'a> {
 
         let is_totp = matches!(self.state.login_step, LoginStep::TotpChallenge { .. });
 
-        let title = if is_totp {
-            " Two-Factor Authentication "
+        let inner = if borderless {
+            area
         } else {
-            " Welcome to Stoat TUI "
+            let title = if is_totp {
+                " Two-Factor Authentication "
+            } else {
+                " Welcome to Stoat TUI "
+            };
+
+            let bottom_title = if is_totp {
+                " Enter: Verify Code • Esc: Back to Login "
+            } else {
+                " Alt+1/2/3 or Click: Switch Tab • Tab: Next Field • Enter: Submit • Esc: Close "
+            };
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
+                .title(title)
+                .title_bottom(bottom_title);
+
+            let inner = block.inner(area);
+            block.render(area, buf);
+            inner
         };
 
-        let bottom_title = if is_totp {
-            " Enter: Verify Code • Esc: Back to Login "
-        } else {
-            " Alt+1/2/3 or Click: Switch Tab • Tab: Next Field • Enter: Submit • Esc: Close "
-        };
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
-            .title(title)
-            .title_bottom(bottom_title);
+        // Compact borderless login modal for tiny terminals (e.g. 10x10)
+        if borderless {
+            self.state.rect_login_tabs.clear();
+            self.state.rect_login_fields.clear();
+            self.state.rect_login_submit_btn = None;
 
-        let inner = block.inner(area);
-        block.render(area, buf);
+            let mut cy = inner.top();
+            if is_totp {
+                crate::ui::write_str(
+                    buf,
+                    inner,
+                    inner.left(),
+                    cy,
+                    "2FA Code:",
+                    Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+                );
+                cy += 1;
+                if cy < inner.bottom() {
+                    let next_x = crate::ui::write_str(
+                        buf,
+                        inner,
+                        inner.left(),
+                        cy,
+                        &self.state.login_totp_input,
+                        Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 45)),
+                    );
+                    crate::ui::put_cell(buf, inner, next_x, cy, ' ', Style::default().bg(Color::White).fg(Color::Black));
+                    cy += 1;
+                }
+            } else {
+                let title_line = match self.state.login_tab {
+                    LoginTab::EmailPassword => "Login:1-Em",
+                    LoginTab::Token => "Login:2-Tk",
+                    LoginTab::Demo => "Login:3-Dm",
+                };
+                crate::ui::write_str(
+                    buf,
+                    inner,
+                    inner.left(),
+                    cy,
+                    title_line,
+                    Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+                );
+                cy += 1;
+
+                match self.state.login_tab {
+                    LoginTab::EmailPassword => {
+                        if cy < inner.bottom() {
+                            let lbl = if self.state.login_field_index == 0 { ">Email:" } else { "Email:" };
+                            crate::ui::write_str(buf, inner, inner.left(), cy, lbl, Style::default().fg(Color::White));
+                            cy += 1;
+                        }
+                        if cy < inner.bottom() {
+                            let val = &self.state.login_email_input;
+                            let nx = crate::ui::write_str(buf, inner, inner.left(), cy, val, Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 40)));
+                            if self.state.login_field_index == 0 {
+                                crate::ui::put_cell(buf, inner, nx, cy, ' ', Style::default().bg(Color::White).fg(Color::Black));
+                            }
+                            cy += 1;
+                        }
+                        if cy < inner.bottom() {
+                            let lbl = if self.state.login_field_index == 1 { ">Pass:" } else { "Pass:" };
+                            crate::ui::write_str(buf, inner, inner.left(), cy, lbl, Style::default().fg(Color::White));
+                            cy += 1;
+                        }
+                        if cy < inner.bottom() {
+                            let masked: String = self.state.login_password_input.chars().map(|_| '•').collect();
+                            let nx = crate::ui::write_str(buf, inner, inner.left(), cy, &masked, Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 40)));
+                            if self.state.login_field_index == 1 {
+                                crate::ui::put_cell(buf, inner, nx, cy, ' ', Style::default().bg(Color::White).fg(Color::Black));
+                            }
+                            cy += 1;
+                        }
+                    }
+                    LoginTab::Token => {
+                        if cy < inner.bottom() {
+                            crate::ui::write_str(buf, inner, inner.left(), cy, "Token:", Style::default().fg(Color::White));
+                            cy += 1;
+                        }
+                        if cy < inner.bottom() {
+                            let nx = crate::ui::write_str(
+                                buf,
+                                inner,
+                                inner.left(),
+                                cy,
+                                &self.state.login_token_input,
+                                Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 40)),
+                            );
+                            crate::ui::put_cell(buf, inner, nx, cy, ' ', Style::default().bg(Color::White).fg(Color::Black));
+                            cy += 1;
+                        }
+                    }
+                    LoginTab::Demo => {
+                        if cy < inner.bottom() {
+                            crate::ui::write_str(buf, inner, inner.left(), cy, "Demo Mode", Style::default().fg(theme.status_online).add_modifier(Modifier::BOLD));
+                            cy += 1;
+                        }
+                    }
+                }
+            }
+
+            if cy < inner.bottom() {
+                let act = if self.state.login_loading { "Wait..." } else { "[Enter]Go" };
+                crate::ui::write_str(buf, inner, inner.left(), cy, act, Style::default().fg(theme.primary).add_modifier(Modifier::BOLD));
+                cy += 1;
+            }
+            if cy < inner.bottom() {
+                if let Some(ref err) = self.state.login_error {
+                    crate::ui::write_str(buf, inner, inner.left(), cy, err, Style::default().fg(Color::Rgb(255, 80, 80)));
+                }
+            }
+            return;
+        }
 
         if inner.height < 8 || inner.width < 20 {
             return;
@@ -67,26 +191,26 @@ impl<'a> Widget for LoginModal<'a> {
 
         if is_totp {
             // TOTP 2FA Challenge Screen
-            let header = "Two-Factor Authentication";
-            for (i, ch) in header.chars().enumerate() {
-                buf[(start_x + i as u16, cur_y)]
-                    .set_char(ch)
-                    .set_fg(Color::White)
-                    .set_style(Modifier::BOLD);
-            }
+            crate::ui::write_str(
+                buf,
+                inner,
+                start_x,
+                cur_y,
+                "Two-Factor Authentication",
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            );
             cur_y += 2;
 
-            let subtitle = "Enter the 6-digit code from your authenticator app:";
-            for (i, ch) in subtitle.chars().enumerate() {
-                if (start_x + i as u16) < inner.right().saturating_sub(2) {
-                    buf[(start_x + i as u16, cur_y)]
-                        .set_char(ch)
-                        .set_fg(theme.muted);
-                }
-            }
+            crate::ui::write_str(
+                buf,
+                inner,
+                start_x,
+                cur_y,
+                "Enter the 6-digit code from your authenticator app:",
+                Style::default().fg(theme.muted),
+            );
             cur_y += 2;
 
-            // Box for TOTP code (styled with space separation for clarity)
             let box_w = 24.min(inner.width.saturating_sub(4));
             let has_error = self.state.login_error.is_some();
             let box_bg = if has_error {
@@ -96,81 +220,49 @@ impl<'a> Widget for LoginModal<'a> {
             };
 
             for bx in start_x..(start_x + box_w) {
-                buf[(bx, cur_y)]
-                    .set_char(' ')
-                    .set_bg(box_bg);
+                crate::ui::put_cell(buf, inner, bx, cur_y, ' ', Style::default().bg(box_bg));
             }
 
             let code = &self.state.login_totp_input;
             let mut cx = start_x + 2;
 
-            // Render digits formatted nicely (e.g. 1 2 3   4 5 6)
             for (idx, ch) in code.chars().enumerate() {
                 if idx == 3 && cx + 1 < start_x + box_w {
-                    cx += 2; // Spacing between 3-digit groups
+                    cx += 2;
                 }
                 if cx < start_x + box_w {
-                    buf[(cx, cur_y)]
-                        .set_char(ch)
-                        .set_fg(if has_error { Color::Rgb(255, 120, 120) } else { Color::White })
-                        .set_style(Modifier::BOLD);
+                    let fg = if has_error { Color::Rgb(255, 120, 120) } else { Color::White };
+                    crate::ui::put_cell(buf, inner, cx, cur_y, ch, Style::default().fg(fg).bg(box_bg).add_modifier(Modifier::BOLD));
                     cx += 2;
                 }
             }
 
-            // Blinking/solid cursor if space allows
             if code.len() < 8 && cx < start_x + box_w {
                 if code.len() == 3 {
                     cx += 2;
                 }
-                buf[(cx, cur_y)]
-                    .set_char(' ')
-                    .set_bg(if has_error { Color::Rgb(255, 100, 100) } else { Color::White })
-                    .set_fg(Color::Black);
+                let bg = if has_error { Color::Rgb(255, 100, 100) } else { Color::White };
+                crate::ui::put_cell(buf, inner, cx, cur_y, ' ', Style::default().bg(bg).fg(Color::Black));
             }
 
             cur_y += 3;
 
-            // Action hints / Buttons
             let verify_btn = if self.state.login_loading {
                 "[ Verifying code... Please wait ]"
             } else {
                 "[ Verify Code (Enter) ]"
             };
 
-            for (i, ch) in verify_btn.chars().enumerate() {
-                buf[(start_x + i as u16, cur_y)]
-                    .set_char(ch)
-                    .set_fg(theme.primary)
-                    .set_style(Modifier::BOLD);
-            }
-
-            let back_btn = "  [ Back to Login (Esc) ]";
-            let mut bx = start_x + verify_btn.len() as u16;
-            for ch in back_btn.chars() {
-                if bx < inner.right().saturating_sub(2) {
-                    buf[(bx, cur_y)]
-                        .set_char(ch)
-                        .set_fg(theme.muted);
-                    bx += 1;
-                }
-            }
+            let bx = crate::ui::write_str(
+                buf,
+                inner,
+                start_x,
+                cur_y,
+                verify_btn,
+                Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+            );
+            crate::ui::write_str(buf, inner, bx, cur_y, "  [ Back to Login (Esc) ]", Style::default().fg(theme.muted));
         } else {
-            // 0. API Endpoint indicator
-            let api_pfx = "Server API: ";
-            let mut ax = start_x;
-            for ch in api_pfx.chars() {
-                buf[(ax, cur_y)].set_char(ch).set_fg(theme.muted);
-                ax += 1;
-            }
-            for ch in self.state.config.api_url.chars() {
-                if ax < inner.right().saturating_sub(2) {
-                    buf[(ax, cur_y)].set_char(ch).set_fg(Color::Cyan);
-                    ax += 1;
-                }
-            }
-            cur_y += 2;
-
             // 1. Tab Bar
             let tabs = [
                 (LoginTab::EmailPassword, "[ 1. Email & Pass ]"),
@@ -197,44 +289,42 @@ impl<'a> Widget for LoginModal<'a> {
                     Rect {
                         x: tx,
                         y: cur_y,
-                        width: tab_len,
+                        width: tab_len.min(inner.right().saturating_sub(tx)),
                         height: 1,
                     },
                 ));
 
-                for ch in label.chars() {
-                    buf[(tx, cur_y)].set_char(ch).set_style(tab_style);
-                    tx += 1;
-                }
+                tx = crate::ui::write_str(buf, inner, tx, cur_y, label, tab_style);
                 tx += 2;
             }
 
-            cur_y += 2;
+            cur_y += 1;
 
             // Divider
             for dx in inner.left()..inner.right() {
-                buf[(dx, cur_y)]
-                    .set_char('─')
-                    .set_fg(Color::Rgb(50, 50, 60));
+                crate::ui::put_cell(buf, inner, dx, cur_y, '─', Style::default().fg(Color::Rgb(50, 50, 60)));
             }
 
             cur_y += 2;
 
+            let input_w = inner.width.saturating_sub(6);
+
             match self.state.login_tab {
                 LoginTab::EmailPassword => {
-                    // Email field
+                    // Field 0: Email
                     let is_email_focused = self.state.login_field_index == 0;
-                    let email_lbl = "Email Address:";
-                    for (i, ch) in email_lbl.chars().enumerate() {
-                        buf[(start_x + i as u16, cur_y)]
-                            .set_char(ch)
-                            .set_fg(if is_email_focused { Color::White } else { theme.muted })
-                            .set_style(Modifier::BOLD);
-                    }
+                    crate::ui::write_str(
+                        buf,
+                        inner,
+                        start_x,
+                        cur_y,
+                        "Email Address:",
+                        Style::default()
+                            .fg(if is_email_focused { Color::White } else { theme.muted })
+                            .add_modifier(Modifier::BOLD),
+                    );
                     cur_y += 1;
 
-                    // Box for email
-                    let input_w = inner.width.saturating_sub(6);
                     self.state.rect_login_fields.push((
                         0,
                         Rect {
@@ -245,32 +335,36 @@ impl<'a> Widget for LoginModal<'a> {
                         },
                     ));
 
+                    let email_bg = if is_email_focused { Color::Rgb(30, 30, 40) } else { Color::Rgb(20, 20, 25) };
                     for bx in start_x..(start_x + input_w) {
-                        buf[(bx, cur_y)]
-                            .set_char(' ')
-                            .set_bg(if is_email_focused { Color::Rgb(30, 30, 40) } else { Color::Rgb(20, 20, 25) });
+                        crate::ui::put_cell(buf, inner, bx, cur_y, ' ', Style::default().bg(email_bg));
                     }
 
-                    let mut ex = start_x + 1;
-                    for ch in self.state.login_email_input.chars() {
-                        buf[(ex, cur_y)].set_char(ch).set_fg(Color::White);
-                        ex += 1;
-                    }
+                    let field_limit = Rect {
+                        x: start_x,
+                        y: cur_y,
+                        width: input_w,
+                        height: 1,
+                    };
+                    let ex = crate::ui::write_str(buf, field_limit, start_x + 1, cur_y, &self.state.login_email_input, Style::default().fg(Color::White).bg(email_bg));
                     if is_email_focused {
-                        buf[(ex, cur_y)].set_char(' ').set_bg(Color::White).set_fg(Color::Black);
+                        crate::ui::put_cell(buf, field_limit, ex, cur_y, ' ', Style::default().bg(Color::White).fg(Color::Black));
                     }
 
                     cur_y += 2;
 
-                    // Password field
+                    // Field 1: Password
                     let is_pwd_focused = self.state.login_field_index == 1;
-                    let pwd_lbl = "Password:";
-                    for (i, ch) in pwd_lbl.chars().enumerate() {
-                        buf[(start_x + i as u16, cur_y)]
-                            .set_char(ch)
-                            .set_fg(if is_pwd_focused { Color::White } else { theme.muted })
-                            .set_style(Modifier::BOLD);
-                    }
+                    crate::ui::write_str(
+                        buf,
+                        inner,
+                        start_x,
+                        cur_y,
+                        "Password:",
+                        Style::default()
+                            .fg(if is_pwd_focused { Color::White } else { theme.muted })
+                            .add_modifier(Modifier::BOLD),
+                    );
                     cur_y += 1;
 
                     self.state.rect_login_fields.push((
@@ -283,24 +377,92 @@ impl<'a> Widget for LoginModal<'a> {
                         },
                     ));
 
+                    let pwd_bg = if is_pwd_focused { Color::Rgb(30, 30, 40) } else { Color::Rgb(20, 20, 25) };
                     for bx in start_x..(start_x + input_w) {
-                        buf[(bx, cur_y)]
-                            .set_char(' ')
-                            .set_bg(if is_pwd_focused { Color::Rgb(30, 30, 40) } else { Color::Rgb(20, 20, 25) });
+                        crate::ui::put_cell(buf, inner, bx, cur_y, ' ', Style::default().bg(pwd_bg));
                     }
 
-                    let mut px = start_x + 1;
-                    for _ in self.state.login_password_input.chars() {
-                        buf[(px, cur_y)].set_char('•').set_fg(Color::White);
-                        px += 1;
-                    }
+                    let pwd_limit = Rect {
+                        x: start_x,
+                        y: cur_y,
+                        width: input_w,
+                        height: 1,
+                    };
+                    let masked: String = self.state.login_password_input.chars().map(|_| '•').collect();
+                    let px = crate::ui::write_str(buf, pwd_limit, start_x + 1, cur_y, &masked, Style::default().fg(Color::White).bg(pwd_bg));
                     if is_pwd_focused {
-                        buf[(px, cur_y)].set_char(' ').set_bg(Color::White).set_fg(Color::Black);
+                        crate::ui::put_cell(buf, pwd_limit, px, cur_y, ' ', Style::default().bg(Color::White).fg(Color::Black));
                     }
 
-                    cur_y += 3;
+                    cur_y += 2;
 
-                    // Action hint / button
+                    // Field 2: Server API URL
+                    let is_api_focused = self.state.login_field_index == 2;
+                    crate::ui::write_str(
+                        buf,
+                        inner,
+                        start_x,
+                        cur_y,
+                        "Server API URL:",
+                        Style::default()
+                            .fg(if is_api_focused { Color::Cyan } else { theme.muted })
+                            .add_modifier(Modifier::BOLD),
+                    );
+                    cur_y += 1;
+
+                    self.state.rect_login_fields.push((
+                        2,
+                        Rect {
+                            x: start_x,
+                            y: cur_y,
+                            width: input_w,
+                            height: 1,
+                        },
+                    ));
+
+                    let api_bg = if is_api_focused { Color::Rgb(30, 35, 48) } else { Color::Rgb(20, 20, 25) };
+                    for bx in start_x..(start_x + input_w) {
+                        crate::ui::put_cell(buf, inner, bx, cur_y, ' ', Style::default().bg(api_bg));
+                    }
+                    let api_limit = Rect {
+                        x: start_x,
+                        y: cur_y,
+                        width: input_w,
+                        height: 1,
+                    };
+                    let ax = crate::ui::write_str(buf, api_limit, start_x + 1, cur_y, &self.state.login_api_input, Style::default().fg(Color::Cyan).bg(api_bg));
+                    if is_api_focused {
+                        crate::ui::put_cell(buf, api_limit, ax, cur_y, ' ', Style::default().bg(Color::White).fg(Color::Black));
+                    }
+
+                    cur_y += 2;
+
+                    // Field 3: Mode Selector
+                    let is_mode_focused = self.state.login_field_index == 3;
+                    let mode_label = if self.state.login_add_account {
+                        "[ Add Account (Keep Existing) ]"
+                    } else {
+                        "[ Replace Primary ]"
+                    };
+                    self.state.rect_login_fields.push((
+                        3,
+                        Rect {
+                            x: start_x,
+                            y: cur_y,
+                            width: mode_label.chars().count() as u16,
+                            height: 1,
+                        },
+                    ));
+                    let mode_style = if is_mode_focused {
+                        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Cyan)
+                    };
+                    let mx_end = crate::ui::write_str(buf, inner, start_x, cur_y, mode_label, mode_style);
+                    crate::ui::write_str(buf, inner, mx_end + 1, cur_y, "(Space/←/→)", Style::default().fg(theme.muted));
+
+                    cur_y += 2;
+
                     let hint = if self.state.login_loading {
                         "Logging in... Please wait."
                     } else {
@@ -314,24 +476,28 @@ impl<'a> Widget for LoginModal<'a> {
                         height: 1,
                     });
 
-                    for (i, ch) in hint.chars().enumerate() {
-                        buf[(start_x + i as u16, cur_y)]
-                            .set_char(ch)
-                            .set_fg(theme.primary)
-                            .set_style(Modifier::BOLD);
-                    }
+                    crate::ui::write_str(
+                        buf,
+                        inner,
+                        start_x,
+                        cur_y,
+                        hint,
+                        Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+                    );
                 }
                 LoginTab::Token => {
-                    let token_lbl = "Session or Bot Token:";
-                    for (i, ch) in token_lbl.chars().enumerate() {
-                        buf[(start_x + i as u16, cur_y)]
-                            .set_char(ch)
-                            .set_fg(Color::White)
-                            .set_style(Modifier::BOLD);
-                    }
+                    // Field 0: Session / Bot Token
+                    let is_tok_focused = self.state.login_field_index == 0;
+                    crate::ui::write_str(
+                        buf,
+                        inner,
+                        start_x,
+                        cur_y,
+                        "Session or Bot Token:",
+                        Style::default().fg(if is_tok_focused { Color::White } else { theme.muted }).add_modifier(Modifier::BOLD),
+                    );
                     cur_y += 1;
 
-                    let input_w = inner.width.saturating_sub(6);
                     self.state.rect_login_fields.push((
                         0,
                         Rect {
@@ -342,34 +508,111 @@ impl<'a> Widget for LoginModal<'a> {
                         },
                     ));
 
+                    let tok_bg = if is_tok_focused { Color::Rgb(30, 30, 40) } else { Color::Rgb(20, 20, 25) };
                     for bx in start_x..(start_x + input_w) {
-                        buf[(bx, cur_y)]
-                            .set_char(' ')
-                            .set_bg(Color::Rgb(30, 30, 40));
+                        crate::ui::put_cell(buf, inner, bx, cur_y, ' ', Style::default().bg(tok_bg));
                     }
 
-                    let mut tx = start_x + 1;
+                    let tok_limit = Rect {
+                        x: start_x,
+                        y: cur_y,
+                        width: input_w,
+                        height: 1,
+                    };
                     if self.state.login_token_input.is_empty() {
-                        let placeholder = "Paste x-session-token or bot token here...";
-                        for ch in placeholder.chars() {
-                            if tx < start_x + input_w {
-                                buf[(tx, cur_y)].set_char(ch).set_fg(Color::Rgb(90, 90, 105));
-                                tx += 1;
-                            }
+                        crate::ui::write_str(
+                            buf,
+                            tok_limit,
+                            start_x + 1,
+                            cur_y,
+                            "Paste x-session-token or bot token here...",
+                            Style::default().fg(Color::Rgb(90, 90, 105)).bg(tok_bg),
+                        );
+                        if is_tok_focused {
+                            crate::ui::put_cell(buf, tok_limit, start_x + 1, cur_y, ' ', Style::default().bg(Color::White).fg(Color::Black));
                         }
                     } else {
-                        for ch in self.state.login_token_input.chars() {
-                            if tx < start_x + input_w {
-                                buf[(tx, cur_y)].set_char(ch).set_fg(Color::White);
-                                tx += 1;
-                            }
-                        }
-                        if tx < start_x + input_w {
-                            buf[(tx, cur_y)].set_char(' ').set_bg(Color::White).set_fg(Color::Black);
+                        let tx = crate::ui::write_str(
+                            buf,
+                            tok_limit,
+                            start_x + 1,
+                            cur_y,
+                            &self.state.login_token_input,
+                            Style::default().fg(Color::White).bg(tok_bg),
+                        );
+                        if is_tok_focused {
+                            crate::ui::put_cell(buf, tok_limit, tx, cur_y, ' ', Style::default().bg(Color::White).fg(Color::Black));
                         }
                     }
 
-                    cur_y += 3;
+                    cur_y += 2;
+
+                    // Field 1: Server API URL
+                    let is_api_focused = self.state.login_field_index == 1;
+                    crate::ui::write_str(
+                        buf,
+                        inner,
+                        start_x,
+                        cur_y,
+                        "Server API URL:",
+                        Style::default()
+                            .fg(if is_api_focused { Color::Cyan } else { theme.muted })
+                            .add_modifier(Modifier::BOLD),
+                    );
+                    cur_y += 1;
+
+                    self.state.rect_login_fields.push((
+                        1,
+                        Rect {
+                            x: start_x,
+                            y: cur_y,
+                            width: input_w,
+                            height: 1,
+                        },
+                    ));
+
+                    let api_bg = if is_api_focused { Color::Rgb(30, 35, 48) } else { Color::Rgb(20, 20, 25) };
+                    for bx in start_x..(start_x + input_w) {
+                        crate::ui::put_cell(buf, inner, bx, cur_y, ' ', Style::default().bg(api_bg));
+                    }
+                    let api_limit = Rect {
+                        x: start_x,
+                        y: cur_y,
+                        width: input_w,
+                        height: 1,
+                    };
+                    let ax = crate::ui::write_str(buf, api_limit, start_x + 1, cur_y, &self.state.login_api_input, Style::default().fg(Color::Cyan).bg(api_bg));
+                    if is_api_focused {
+                        crate::ui::put_cell(buf, api_limit, ax, cur_y, ' ', Style::default().bg(Color::White).fg(Color::Black));
+                    }
+
+                    cur_y += 2;
+
+                    // Field 2: Mode Selector
+                    let is_mode_focused = self.state.login_field_index == 2;
+                    let mode_label = if self.state.login_add_account {
+                        "[ Add Account (Keep Existing) ]"
+                    } else {
+                        "[ Replace Primary ]"
+                    };
+                    self.state.rect_login_fields.push((
+                        2,
+                        Rect {
+                            x: start_x,
+                            y: cur_y,
+                            width: mode_label.chars().count() as u16,
+                            height: 1,
+                        },
+                    ));
+                    let mode_style = if is_mode_focused {
+                        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Cyan)
+                    };
+                    let mx_end = crate::ui::write_str(buf, inner, start_x, cur_y, mode_label, mode_style);
+                    crate::ui::write_str(buf, inner, mx_end + 1, cur_y, "(Space/←/→)", Style::default().fg(theme.muted));
+
+                    cur_y += 2;
 
                     let hint = if self.state.login_loading {
                         "Connecting with token... Please wait."
@@ -384,36 +627,43 @@ impl<'a> Widget for LoginModal<'a> {
                         height: 1,
                     });
 
-                    for (i, ch) in hint.chars().enumerate() {
-                        buf[(start_x + i as u16, cur_y)]
-                            .set_char(ch)
-                            .set_fg(theme.primary)
-                            .set_style(Modifier::BOLD);
-                    }
+                    crate::ui::write_str(
+                        buf,
+                        inner,
+                        start_x,
+                        cur_y,
+                        hint,
+                        Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+                    );
                 }
                 LoginTab::Demo => {
-                    let text1 = "Instant Offline Demo Mode";
-                    for (i, ch) in text1.chars().enumerate() {
-                        buf[(start_x + i as u16, cur_y)]
-                            .set_char(ch)
-                            .set_fg(Color::White)
-                            .set_style(Modifier::BOLD);
-                    }
+                    crate::ui::write_str(
+                        buf,
+                        inner,
+                        start_x,
+                        cur_y,
+                        "Instant Offline Demo Mode",
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    );
                     cur_y += 2;
 
-                    let text2 = "Experience Stoat TUI with preloaded community servers, channels,";
-                    let text3 = "full markdown chat, reactions, online members, and quick switcher.";
-                    for (i, ch) in text2.chars().enumerate() {
-                        buf[(start_x + i as u16, cur_y)]
-                            .set_char(ch)
-                            .set_fg(theme.muted);
-                    }
+                    crate::ui::write_str(
+                        buf,
+                        inner,
+                        start_x,
+                        cur_y,
+                        "Experience Stoat TUI with preloaded community servers, channels,",
+                        Style::default().fg(theme.muted),
+                    );
                     cur_y += 1;
-                    for (i, ch) in text3.chars().enumerate() {
-                        buf[(start_x + i as u16, cur_y)]
-                            .set_char(ch)
-                            .set_fg(theme.muted);
-                    }
+                    crate::ui::write_str(
+                        buf,
+                        inner,
+                        start_x,
+                        cur_y,
+                        "full markdown chat, reactions, online members, and quick switcher.",
+                        Style::default().fg(theme.muted),
+                    );
                     cur_y += 3;
 
                     let hint = "[ Press Enter to Launch Demo Mode ]";
@@ -425,12 +675,14 @@ impl<'a> Widget for LoginModal<'a> {
                         height: 1,
                     });
 
-                    for (i, ch) in hint.chars().enumerate() {
-                        buf[(start_x + i as u16, cur_y)]
-                            .set_char(ch)
-                            .set_fg(theme.status_online)
-                            .set_style(Modifier::BOLD);
-                    }
+                    crate::ui::write_str(
+                        buf,
+                        inner,
+                        start_x,
+                        cur_y,
+                        hint,
+                        Style::default().fg(theme.status_online).add_modifier(Modifier::BOLD),
+                    );
                 }
             }
         }
@@ -446,7 +698,6 @@ impl<'a> Widget for LoginModal<'a> {
                 format!("⚠ {}", err)
             };
 
-            // Word wrap error across available width
             let max_err_w = inner.width.saturating_sub(4) as usize;
             let words: Vec<&str> = err_label.split_whitespace().collect();
             let mut line = String::new();
@@ -469,16 +720,14 @@ impl<'a> Widget for LoginModal<'a> {
 
             for err_line in err_lines.iter().take(4) {
                 if cur_y < inner.bottom() {
-                    let mut ex = start_x;
-                    for ch in err_line.chars() {
-                        if ex < inner.right() {
-                            buf[(ex, cur_y)]
-                                .set_char(ch)
-                                .set_fg(Color::Rgb(255, 80, 80))
-                                .set_style(Modifier::BOLD);
-                            ex += 1;
-                        }
-                    }
+                    crate::ui::write_str(
+                        buf,
+                        inner,
+                        start_x,
+                        cur_y,
+                        err_line,
+                        Style::default().fg(Color::Rgb(255, 80, 80)).add_modifier(Modifier::BOLD),
+                    );
                     cur_y += 1;
                 }
             }

@@ -3,6 +3,36 @@ use stoat_tui::gateway::messages::{ClientMessage, ServerMessage};
 use stoat_tui::state::{AppState, Focus, PaletteItemType};
 use stoat_tui::ui::markdown::MarkdownParser;
 use ratatui::style::Color;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEST_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct TempConfigGuard {
+    path: PathBuf,
+}
+
+impl Drop for TempConfigGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::remove_file(parent.join("nav_cache.json"));
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+}
+
+fn isolated_config(token: Option<&str>) -> (Config, TempConfigGuard) {
+    let idx = TEST_CONFIG_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("stoat-tui-test-{}-{}", std::process::id(), idx));
+    let path = dir.join("config.toml");
+    let cfg = Config {
+        token: token.map(|t| t.to_string()),
+        custom_path: Some(path.clone()),
+        ..Default::default()
+    };
+    (cfg, TempConfigGuard { path })
+}
 
 #[test]
 fn test_config_defaults_and_hex_color() {
@@ -128,7 +158,8 @@ fn test_login_response_and_error_serde() {
 fn test_mfa_login_step_transitions() {
     use stoat_tui::state::LoginStep;
 
-    let mut state = AppState::new(Config::default());
+    let (cfg, _guard) = isolated_config(None);
+    let mut state = AppState::new(cfg);
     assert_eq!(state.login_step, LoginStep::Credentials);
     assert_eq!(state.login_totp_input, "");
 
@@ -225,7 +256,8 @@ fn test_focus_cycling() {
 
 #[test]
 fn test_input_buffer_operations() {
-    let mut state = AppState::new(Config::default());
+    let (cfg, _guard) = isolated_config(None);
+    let mut state = AppState::new(cfg);
     assert_eq!(state.input_buffer, "");
     assert_eq!(state.input_cursor, 0);
 
@@ -256,7 +288,8 @@ fn test_input_buffer_operations() {
 
 #[test]
 fn test_state_demo_data_and_palette() {
-    let mut state = AppState::new(Config::default());
+    let (cfg, _guard) = isolated_config(None);
+    let mut state = AppState::new(cfg);
     state.load_demo_data();
 
     assert_eq!(state.servers.len(), 2);
@@ -366,7 +399,8 @@ fn test_gateway_messages_serde() {
 async fn test_fast_keyboard_navigation_logic() {
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
     let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
-    let mut app = stoat_tui::app::App::new(Config::default(), tx, picker);
+    let (cfg, _guard) = isolated_config(None);
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
     app.state.load_demo_data();
 
     // Verify initial demo state
@@ -420,7 +454,7 @@ async fn test_startup_auth_modal_and_session_check() {
 
     // Case 1: Token is None
     let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
-    let config_none = Config { token: None, ..Default::default() };
+    let (config_none, _g1) = isolated_config(None);
     let (tx1, _rx1) = tokio::sync::mpsc::channel(64);
     let mut app_none = stoat_tui::app::App::new(config_none, tx1, picker.clone());
     app_none.startup();
@@ -432,7 +466,7 @@ async fn test_startup_auth_modal_and_session_check() {
     );
 
     // Case 2: Token is whitespace / empty
-    let config_empty = Config { token: Some("   ".to_string()), ..Default::default() };
+    let (config_empty, _g2) = isolated_config(Some("   "));
     let (tx2, _rx2) = tokio::sync::mpsc::channel(64);
     let mut app_empty = stoat_tui::app::App::new(config_empty, tx2, picker.clone());
     app_empty.startup();
@@ -440,7 +474,7 @@ async fn test_startup_auth_modal_and_session_check() {
     assert!(matches!(app_empty.state.gateway_status, GatewayStatus::Disconnected(_)));
 
     // Case 3: Token is valid non-empty string
-    let config_token = Config { token: Some("valid_secret_token".to_string()), ..Default::default() };
+    let (config_token, _g3) = isolated_config(Some("valid_secret_token"));
     let (tx3, mut rx3) = tokio::sync::mpsc::channel(64);
     let mut app_token = stoat_tui::app::App::new(config_token, tx3, picker.clone());
     app_token.startup();
@@ -461,7 +495,7 @@ async fn test_manual_login_modal_keybindings_f2_ctrl_l() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
-    let config = Config { token: Some("test_tok".to_string()), ..Default::default() };
+    let (config, _guard) = isolated_config(Some("test_tok"));
     let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
     let mut app = stoat_tui::app::App::new(config, tx, picker);
 
@@ -478,9 +512,9 @@ async fn test_manual_login_modal_keybindings_f2_ctrl_l() {
     app.handle_event(stoat_tui::event::AppEvent::Key(esc_key)).await;
     assert!(!app.state.show_login_modal);
 
-    // Press Ctrl+L -> opens login modal
-    let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
-    app.handle_event(stoat_tui::event::AppEvent::Key(ctrl_l)).await;
+    // Press Alt+Shift+L -> opens login modal (Ctrl+L is reserved for sidebar expand)
+    let alt_shift_l = KeyEvent::new(KeyCode::Char('L'), KeyModifiers::ALT | KeyModifiers::SHIFT);
+    app.handle_event(stoat_tui::event::AppEvent::Key(alt_shift_l)).await;
     assert!(app.state.show_login_modal);
 }
 
@@ -491,7 +525,8 @@ async fn test_api_session_expired_event() {
     use stoat_tui::state::GatewayStatus;
 
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
-    let config = Config { token: Some("expired_tok_123".to_string()), ..Default::default() };
+    let (config, guard) = isolated_config(Some("expired_tok_123"));
+    config.save().expect("Save initial temp config");
     let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
     let mut app = stoat_tui::app::App::new(config, tx, picker);
 
@@ -509,8 +544,10 @@ async fn test_api_session_expired_event() {
     // Dispatch ApiSessionExpired
     app.handle_event(AppEvent::ApiSessionExpired).await;
 
-    // Token must be cleared from config
-    assert!(app.state.config.token.is_none());
+    // Token is NOT wiped from config or disk on session expired
+    assert_eq!(app.state.config.token.as_deref(), Some("expired_tok_123"));
+    let reloaded = Config::load_from(&guard.path);
+    assert_eq!(reloaded.token.as_deref(), Some("expired_tok_123"));
     // Current user reset
     assert!(app.state.current_user.is_none());
     // Login modal auto-shown
@@ -531,7 +568,8 @@ async fn test_ready_and_authenticated_gateway_sync() {
 
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
     let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
-    let mut app = stoat_tui::app::App::new(Config::default(), tx, picker);
+    let (cfg, _guard) = isolated_config(None);
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
 
     // Authenticated event sets Connected with latency and ● Online
     app.handle_event(stoat_tui::event::AppEvent::Gateway(GatewayEvent::Authenticated)).await;
@@ -571,7 +609,8 @@ async fn test_user_resolution_and_background_fetch() {
 
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
     let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
-    let mut app = stoat_tui::app::App::new(Config::default(), tx, picker);
+    let (cfg, _guard) = isolated_config(None);
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
 
     // Initial query for unknown user triggers background fetch
     let user_opt = app.state.resolve_user("01HMISSINGUSER");
@@ -669,7 +708,8 @@ fn test_server_badge_abbreviations() {
 fn test_purge_mock_servers() {
     use stoat_tui::api::models::Server;
 
-    let mut state = AppState::new(Config::default());
+    let (cfg, _guard) = isolated_config(None);
+    let mut state = AppState::new(cfg);
     state.load_demo_data();
 
     // Verify mock servers are initially present in demo state
@@ -825,7 +865,7 @@ async fn test_login_modal_reset_on_f2_and_account_switch_cleanup() {
     use stoat_tui::state::LoginStep;
 
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
-    let config = Config { token: Some("old_token".to_string()), ..Default::default() };
+    let (config, _guard) = isolated_config(Some("old_token"));
     let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
     let mut app = stoat_tui::app::App::new(config, tx, picker);
 
@@ -869,7 +909,7 @@ async fn test_pending_attachment_and_clear_shortcuts() {
     use stoat_tui::state::{Focus, PendingAttachment};
 
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
-    let config = Config { token: Some("tok_123".to_string()), ..Default::default() };
+    let (config, _guard) = isolated_config(Some("tok_123"));
     let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
     let mut app = stoat_tui::app::App::new(config, tx, picker);
     app.state.show_login_modal = false;
@@ -902,8 +942,7 @@ async fn test_pending_attachment_and_clear_shortcuts() {
 #[tokio::test]
 async fn test_no_mock_data_persisted_to_config() {
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
-    let mut config = Config::default();
-    config.token = Some("valid_token".to_string());
+    let (mut config, _guard) = isolated_config(Some("valid_token"));
     config.last_server_id = Some("srv_REAL".to_string());
     config.last_channel_id = Some("chan_REAL".to_string());
 
@@ -920,4 +959,1648 @@ async fn test_no_mock_data_persisted_to_config() {
     app.switch_to_server(Some("srv_stoat".to_string())).await;
     assert_eq!(app.state.config.last_server_id.as_deref(), Some("srv_REAL"));
     assert_eq!(app.state.config.last_channel_id.as_deref(), Some("chan_REAL"));
+}
+
+#[tokio::test]
+async fn test_left_sidebar_width_resizing_and_member_rail_toggle() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use stoat_tui::event::AppEvent;
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (mut config, _guard) = isolated_config(Some("valid_token"));
+    config.left_sidebar_width = 26;
+
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(config, tx, picker);
+    app.state.show_login_modal = false;
+
+    assert_eq!(app.state.left_sidebar_width, 26);
+
+    // Ctrl+H shrinks sidebar by 2 (min 16)
+    let ctrl_h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
+    app.handle_event(AppEvent::Key(ctrl_h)).await;
+    assert_eq!(app.state.left_sidebar_width, 24);
+    assert_eq!(app.state.config.left_sidebar_width, 24);
+
+    // Ctrl+L expands sidebar by 2 (max 52)
+    let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+    app.handle_event(AppEvent::Key(ctrl_l)).await;
+    assert_eq!(app.state.left_sidebar_width, 26);
+    assert_eq!(app.state.config.left_sidebar_width, 26);
+
+    // Test Alt+M toggles member rail when not in a call
+    assert!(app.state.show_member_rail);
+    let alt_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT);
+    app.handle_event(AppEvent::Key(alt_m)).await;
+    assert!(!app.state.show_member_rail);
+    app.handle_event(AppEvent::Key(alt_m)).await;
+    assert!(app.state.show_member_rail);
+}
+
+#[test]
+fn test_config_sidebar_width_serde() {
+    let toml_str = r#"
+api_url = "https://api.stoat.chat"
+token = "tok_abc"
+left_sidebar_width = 34
+"#;
+    let config: Config = toml::from_str(toml_str).expect("Failed to deserialize config with left_sidebar_width");
+    assert_eq!(config.left_sidebar_width, 34);
+
+    let serialized = toml::to_string(&config).expect("Failed to serialize config");
+    assert!(serialized.contains("left_sidebar_width = 34"));
+}
+
+#[tokio::test]
+async fn test_fetch_me_sends_session_token_header() {
+    use stoat_tui::api::DeltaClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+
+    let server_handle = tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = [0u8; 2048];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+
+            // Assert that the request contains the expected x-session-token header
+            assert!(
+                req.contains("x-session-token: valid_session_token_xyz")
+                    || req.contains("x-session-token:valid_session_token_xyz"),
+                "Request headers missing x-session-token: {}",
+                req
+            );
+
+            let body = r#"{"_id":"01JUSER","username":"stoatuser","online":true}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+
+    let client = DeltaClient::new(server_url, Some("valid_session_token_xyz".to_string()), false);
+    let user = client.fetch_me("valid_session_token_xyz").await.expect("fetch_me should succeed");
+
+    assert_eq!(user.id, "01JUSER");
+    assert_eq!(user.username, "stoatuser");
+
+    server_handle.await.unwrap();
+}
+
+#[test]
+fn test_attachment_resilient_deserialization_and_autumn_urls() {
+    use stoat_tui::api::models::{Attachment, Server, User};
+    use stoat_tui::state::AppState;
+
+    // Minimal Attachment JSON missing optional fields (filename, metadata, deleted, reported)
+    let user_json = r#"{
+        "_id": "01JUSER123",
+        "username": "alice",
+        "avatar": {
+            "_id": "01JAVATAR999",
+            "tag": "avatars"
+        }
+    }"#;
+    let user: User = serde_json::from_str(user_json).expect("User with minimal avatar should deserialize");
+    let av: &Attachment = user.avatar.as_ref().expect("User.avatar must not be dropped");
+    assert_eq!(av.id, "01JAVATAR999");
+
+    // Minimal Server icon JSON
+    let server_json = r#"{
+        "_id": "01JSRV123",
+        "name": "Zero",
+        "icon": {
+            "_id": "01JICON777",
+            "deleted": false,
+            "reported": false
+        }
+    }"#;
+    let srv: Server = serde_json::from_str(server_json).expect("Server with minimal icon should deserialize");
+    assert_eq!(srv.icon.as_ref().unwrap().id, "01JICON777");
+
+    let (mut state_cfg, _guard) = isolated_config(None);
+    state_cfg.api_url = "https://api.stoat.chat/".to_string();
+    let mut state = AppState::new(state_cfg);
+    state.autumn_url = "https://cdn.example.com".to_string();
+
+    assert_eq!(
+        state.avatar_url_for_user(&user),
+        "https://cdn.example.com/avatars/01JAVATAR999?max_side=128"
+    );
+
+    let user_no_av = User {
+        id: "01JNOAV".to_string(),
+        username: "bob".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(
+        state.avatar_url_for_user(&user_no_av),
+        "https://api.stoat.chat/users/01JNOAV/default_avatar"
+    );
+
+    assert_eq!(
+        state.server_icon_url(&srv).as_deref(),
+        Some("https://cdn.example.com/icons/01JICON777?max_side=128")
+    );
+}
+
+#[tokio::test]
+async fn test_autumn_url_resolved_event_and_sidebar_pfp_enqueue() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use stoat_tui::api::models::{Channel, FileObject, Server, User};
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::state::ActiveRail;
+    use stoat_tui::ui;
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (config, _guard) = isolated_config(Some("tok_123"));
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(config, tx, picker);
+    app.state.show_login_modal = false;
+
+    app.handle_event(AppEvent::AutumnUrlResolved("https://autumn.stoat.chat/".to_string())).await;
+    assert_eq!(app.state.autumn_url, "https://autumn.stoat.chat");
+
+    // Populate a DM and a server with an icon, and insert a cached image for the DM user
+    app.state.current_user = Some(User {
+        id: "me_1".to_string(),
+        username: "me".to_string(),
+        ..Default::default()
+    });
+    app.state.users.insert(
+        "friend_1".to_string(),
+        User {
+            id: "friend_1".to_string(),
+            username: "friend_alice".to_string(),
+            avatar: Some(FileObject {
+                id: "av_friend_1".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    app.state.dms.push(Channel {
+        id: "dm_1".to_string(),
+        channel_type: "DirectMessage".to_string(),
+        recipients: Some(vec!["me_1".to_string(), "friend_1".to_string()]),
+        ..Default::default()
+    });
+    app.state.servers.push(Server {
+        id: "srv_1".to_string(),
+        name: "Zero".to_string(),
+        icon: Some(FileObject {
+            id: "ic_srv_1".to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    app.state.active_rail = ActiveRail::DirectMessages;
+    app.state.active_server_id = None;
+
+    // Insert a tiny 2x2 image for friend_1 into cache so deferred pass renders it via StatefulImage
+    let img = image::DynamicImage::new_rgba8(4, 4);
+    if let Some(ref mut cache) = app.state.image_cache {
+        cache.insert("avatar_friend_1".to_string(), img);
+    }
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| ui::render(f, &mut app.state))
+        .expect("Render with DM PFPs and server icons should succeed");
+
+    // After render, image_fetch_tx should have marked server_icon_srv_1 as pending
+    let cache = app.state.image_cache.as_ref().unwrap();
+    assert!(cache.is_pending("server_icon_srv_1"));
+}
+
+#[test]
+fn test_config_custom_path_and_token_preservation() {
+    let (cfg, guard) = isolated_config(Some("disk_secret_token"));
+    cfg.save_to(&guard.path).expect("save_to should succeed");
+
+    let loaded = Config::load_from(&guard.path);
+    assert_eq!(loaded.token.as_deref(), Some("disk_secret_token"));
+    assert_eq!(loaded.custom_path.as_deref(), Some(guard.path.as_path()));
+
+    // Saving a config with token: None and explicit_token_cleared == false must preserve disk token
+    let mut cfg_without_token = Config {
+        token: None,
+        left_sidebar_width: 30,
+        custom_path: Some(guard.path.clone()),
+        ..Default::default()
+    };
+    cfg_without_token.save().expect("save via custom_path should succeed");
+
+    let after_preserve = Config::load_from(&guard.path);
+    assert_eq!(after_preserve.token.as_deref(), Some("disk_secret_token"));
+    assert_eq!(after_preserve.left_sidebar_width, 30);
+
+    // Explicit clear_token() removes token from disk on save
+    cfg_without_token.clear_token();
+    cfg_without_token.save().expect("save after clear_token should succeed");
+
+    let after_clear = Config::load_from(&guard.path);
+    assert!(after_clear.token.is_none());
+}
+
+#[test]
+fn test_config_env_dir_override() {
+    let prev = std::env::var("STOAT_TUI_CONFIG_DIR").ok();
+    let custom_dir = std::env::temp_dir().join(format!("stoat-tui-env-test-{}", std::process::id()));
+    std::env::set_var("STOAT_TUI_CONFIG_DIR", &custom_dir);
+
+    let resolved = Config::config_path();
+    assert_eq!(resolved, custom_dir.join("config.toml"));
+
+    if let Some(val) = prev {
+        std::env::set_var("STOAT_TUI_CONFIG_DIR", val);
+    } else {
+        std::env::remove_var("STOAT_TUI_CONFIG_DIR");
+    }
+}
+
+#[test]
+fn test_metadata_livekit_and_voice_feature_parsing() {
+    use stoat_tui::api::models::ServerMetadata;
+
+    let json_livekit = r#"{
+        "ws": "wss://events.stoat.chat",
+        "features": {
+            "autumn": { "enabled": true, "url": "https://cdn.stoatusercontent.com" },
+            "livekit": { "enabled": true, "url": "wss://livekit.stoat.chat" }
+        }
+    }"#;
+    let meta1: ServerMetadata = serde_json::from_str(json_livekit).unwrap();
+    let lk1 = meta1
+        .features
+        .as_ref()
+        .and_then(|f| f.livekit.as_ref().or(f.voice.as_ref()))
+        .and_then(|lk| lk.resolved_url());
+    assert_eq!(lk1.as_deref(), Some("wss://livekit.stoat.chat"));
+
+    let json_voice_nodes = r#"{
+        "ws": "wss://events.stoat.chat",
+        "features": {
+            "voice": {
+                "enabled": true,
+                "nodes": [ { "name": "eu-west", "url": "wss://voice-eu.stoat.chat" } ]
+            }
+        }
+    }"#;
+    let meta2: ServerMetadata = serde_json::from_str(json_voice_nodes).unwrap();
+    let lk2 = meta2
+        .features
+        .as_ref()
+        .and_then(|f| f.livekit.as_ref().or(f.voice.as_ref()))
+        .and_then(|lk| lk.resolved_url());
+    assert_eq!(lk2.as_deref(), Some("wss://voice-eu.stoat.chat"));
+}
+
+#[tokio::test]
+async fn test_join_call_and_ring_channel_http_signaling() {
+    use stoat_tui::api::DeltaClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+
+    let server_handle = tokio::spawn(async move {
+        // Expect 2 requests: POST /channels/ch_dm_1/join_call, then POST /channels/ch_dm_1/ring
+        for expected_path in ["/channels/ch_dm_1/join_call", "/channels/ch_dm_1/ring"] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.contains(&format!("POST {} ", expected_path)),
+                "Unexpected request path: {}",
+                req
+            );
+            assert!(
+                req.contains("x-session-token: call_tok_123")
+                    || req.contains("x-session-token:call_tok_123"),
+                "Missing x-session-token header: {}",
+                req
+            );
+            let expected_body = if expected_path.ends_with("/join_call") {
+                r#"{"node":"worldwide"}"#
+            } else {
+                "{}"
+            };
+            assert!(
+                req.to_ascii_lowercase().contains("content-type: application/json")
+                    && req.ends_with(expected_body),
+                "Expected Content-Type: application/json and {} body, got: {}",
+                expected_body,
+                req
+            );
+
+            let (status_line, body) = if expected_path.ends_with("/join_call") {
+                (
+                    "HTTP/1.1 200 OK",
+                    r#"{"token":"eyJ_mock_jwt_secret","url":"wss://lk.example.com"}"#,
+                )
+            } else {
+                ("HTTP/1.1 204 No Content", "")
+            };
+            let resp = format!(
+                "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status_line,
+                body.len(),
+                body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        }
+    });
+
+    let client = DeltaClient::new(server_url, Some("call_tok_123".to_string()), false);
+    let join_res = client.join_call("ch_dm_1", None).await.expect("join_call should succeed");
+    assert_eq!(join_res.token, "eyJ_mock_jwt_secret");
+    assert_eq!(join_res.url.as_deref(), Some("wss://lk.example.com"));
+
+    client.ring_channel("ch_dm_1").await;
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_call_events_lifecycle_and_active_speakers() {
+    use stoat_tui::api::models::User;
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::voice::{ActiveCallState, CallStatus};
+
+    std::env::set_var("STOAT_TUI_DISABLE_AUDIO", "1");
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (cfg, _guard) = isolated_config(Some("tok_call"));
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
+
+    app.state.current_user = Some(User {
+        id: "u_me".to_string(),
+        username: "me".to_string(),
+        ..Default::default()
+    });
+
+    // Resolve LiveKit node & URL
+    app.handle_event(AppEvent::LivekitNodeResolved {
+        node_name: "worldwide".to_string(),
+        url: Some("wss://livekit.stoat.chat".to_string()),
+    }).await;
+    assert_eq!(app.state.livekit_node_name.as_deref(), Some("worldwide"));
+    assert_eq!(app.state.livekit_url.as_deref(), Some("wss://livekit.stoat.chat"));
+
+    // Start call in Connecting state
+    app.state.active_call = Some(ActiveCallState::new("ch_voice_1".to_string()));
+    assert_eq!(app.state.active_call.as_ref().unwrap().status, CallStatus::Connecting);
+
+    // Connect succeeds
+    app.handle_event(AppEvent::CallConnected { channel_id: "ch_voice_1".to_string() }).await;
+    assert_eq!(app.state.active_call.as_ref().unwrap().status, CallStatus::Connected);
+
+    // Remote participant joins & speaks
+    app.handle_event(AppEvent::CallParticipantJoined {
+        channel_id: "ch_voice_1".to_string(),
+        user_id: "u_friend".to_string(),
+    }).await;
+    assert_eq!(app.state.active_call.as_ref().unwrap().participants.len(), 1);
+
+    app.handle_event(AppEvent::CallActiveSpeakers {
+        channel_id: "ch_voice_1".to_string(),
+        speaker_ids: vec!["u_me".to_string(), "u_friend".to_string()],
+    }).await;
+    assert!(app.state.active_call.as_ref().unwrap().local_speaking);
+    assert!(app.state.active_call.as_ref().unwrap().participants[0].is_speaking);
+
+    // Remote participant leaves
+    app.handle_event(AppEvent::CallParticipantLeft {
+        channel_id: "ch_voice_1".to_string(),
+        user_id: "u_friend".to_string(),
+    }).await;
+    assert!(app.state.active_call.as_ref().unwrap().participants.is_empty());
+
+    // Call failure closes active_call and displays error status
+    app.handle_event(AppEvent::CallFailed {
+        channel_id: "ch_voice_1".to_string(),
+        error: "SFU unreachable".to_string(),
+    }).await;
+    assert!(app.state.active_call.is_none());
+    let (msg, _) = app.state.status_message.as_ref().unwrap();
+    assert!(msg.contains("Call failed: SFU unreachable"));
+}
+
+#[test]
+fn test_voice_resampler_and_synthesized_call_sounds() {
+    use stoat_tui::voice::sounds::{
+        synthesize_deafen_sound, synthesize_join_sound, synthesize_leave_sound,
+        synthesize_mute_sound, SOUND_SAMPLE_RATE,
+    };
+    use stoat_tui::voice::Mono48kResampler;
+
+    // 1. Resampler from 44.1kHz -> 48kHz (100ms = 4410 -> ~4800 samples)
+    let mut resampler = Mono48kResampler::new(44_100);
+    let input_44k: Vec<f32> = (0..4410)
+        .map(|i| (2.0 * std::f32::consts::PI * 440.0 * (i as f32 / 44_100.0)).sin() * 0.5)
+        .collect();
+    let mut out_48k = Vec::new();
+    resampler.push(&input_44k, &mut out_48k);
+    assert!((4795..=4805).contains(&out_48k.len()), "Expected ~4800 samples, got {}", out_48k.len());
+
+    // 2. Synthesized sound effects
+    let join = synthesize_join_sound();
+    let leave = synthesize_leave_sound();
+    let mute_on = synthesize_mute_sound(true);
+    let mute_off = synthesize_mute_sound(false);
+    let deaf_on = synthesize_deafen_sound(true);
+    let deaf_off = synthesize_deafen_sound(false);
+
+    // Join & leave ~180ms at 48kHz (~8640 samples)
+    assert!((8000..=9200).contains(&join.len()));
+    assert!((8000..=9200).contains(&leave.len()));
+    // Mute ~80ms at 48kHz (~3840 samples)
+    assert!((3500..=4200).contains(&mute_on.len()));
+    assert!((3500..=4200).contains(&mute_off.len()));
+    // Deafen ~110ms at 48kHz (~5280 samples)
+    assert!((4800..=5800).contains(&deaf_on.len()));
+    assert!((4800..=5800).contains(&deaf_off.len()));
+    assert_eq!(SOUND_SAMPLE_RATE, 48_000);
+
+    for buf in [&join, &leave, &mute_on, &mute_off, &deaf_on, &deaf_off] {
+        assert!(buf.iter().all(|&s| s.is_finite() && (-1.0..=1.0).contains(&s)));
+        assert!(buf.iter().any(|&s| s.abs() > 0.05));
+    }
+}
+
+#[tokio::test]
+async fn test_sanitize_status_text_and_join_call_fallback() {
+    use stoat_tui::api::DeltaClient;
+    use stoat_tui::ui::components::status_bar::sanitize_status_text;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // 1. Multi-line HTML error sanitization
+    let raw_html_err = "❌ Call failed: Join call error (HTTP 400 Bad Request): <!DOCTYPE html>\r\n<html>\n  <head><title>400 Bad Request</title></head>\n  <body><h1>400 Bad Request</h1></body>\n</html>";
+    let clean = sanitize_status_text(raw_html_err);
+    assert!(!clean.contains('\n'));
+    assert!(!clean.contains('\r'));
+    assert!(!clean.to_ascii_lowercase().contains("<!doctype"));
+    assert!(!clean.to_ascii_lowercase().contains("<html>"));
+    assert!(clean.contains("Unexpected HTML response from server (check debug.log)"));
+    assert!(clean.starts_with("❌ Call failed: Join call error (HTTP 400 Bad Request):"));
+
+    let plain_multiline = "Line 1\r\n   Line 2\n\n  Line 3  ";
+    assert_eq!(sanitize_status_text(plain_multiline), "Line 1 Line 2 Line 3");
+
+    // 2. Fallback from 400 HTML on /join_call -> GET / metadata -> POST /call with {} JSON
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+
+    let server_handle = tokio::spawn(async move {
+        // Request 1: POST /channels/c1/join_call -> 400 HTML
+        {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.contains("POST /channels/c1/join_call "));
+            assert!(req.ends_with(r#"{"node":"worldwide"}"#));
+            let html = "<!DOCTYPE html><html><body>400 Bad Request</body></html>";
+            let resp = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                html.len(),
+                html
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        }
+        // Request 2: GET / -> metadata with livekit url
+        {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.contains("GET / "));
+            let meta = r#"{"features":{"livekit":{"enabled":true,"url":"wss://meta-lk.example.com"}}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                meta.len(),
+                meta
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        }
+        // Request 3: POST /channels/c1/call -> 200 OK with token
+        {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.contains("POST /channels/c1/call "));
+            assert!(req.ends_with(r#"{"node":"worldwide"}"#));
+            let body = r#"{"token":"fallback_jwt_tok"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        }
+    });
+
+    let client = DeltaClient::new(server_url, Some("tok_fb".to_string()), false);
+    let res = client.join_call("c1", None).await.expect("Fallback /call should succeed");
+    assert_eq!(res.token, "fallback_jwt_tok");
+    assert_eq!(res.url.as_deref(), Some("wss://meta-lk.example.com"));
+
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_livekit_nodes_parsing_and_join_call_node_payload() {
+    use stoat_tui::api::models::ServerMetadata;
+    use stoat_tui::api::DeltaClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // 1. Parse features.livekit.nodes with name, url, lat, lon and "id" alias
+    let root_json = r#"{
+        "features": {
+            "livekit": {
+                "enabled": true,
+                "nodes": [
+                    { "name": "europe", "url": "wss://europe.voice.stoat.chat", "lat": 50.1, "lon": 8.6 },
+                    { "id": "us-east", "url": "wss://us.voice.stoat.chat", "lat": 39.0, "lon": -77.5 }
+                ]
+            }
+        }
+    }"#;
+    let meta: ServerMetadata = serde_json::from_str(root_json).unwrap();
+    let lk = meta.features.as_ref().unwrap().livekit.as_ref().unwrap();
+    assert_eq!(lk.nodes.as_ref().unwrap().len(), 2);
+    assert_eq!(lk.nodes.as_ref().unwrap()[1].name, "us-east");
+    assert_eq!(lk.nodes.as_ref().unwrap()[0].lat, Some(50.1));
+    assert_eq!(lk.nodes.as_ref().unwrap()[0].lon, Some(8.6));
+
+    let (node_name, node_url) = lk.resolved_node();
+    assert_eq!(node_name.as_deref(), Some("europe"));
+    assert_eq!(node_url.as_deref(), Some("wss://europe.voice.stoat.chat"));
+
+    // Empty nodes falls back to "worldwide"
+    let empty_nodes_json = r#"{"features":{"livekit":{"enabled":true,"nodes":[]}}}"#;
+    let meta_empty: ServerMetadata = serde_json::from_str(empty_nodes_json).unwrap();
+    let (def_node, _) = meta_empty.features.unwrap().livekit.unwrap().resolved_node();
+    assert_eq!(def_node.as_deref(), Some("worldwide"));
+
+    // 2. Verify join_call sends {"node": "europe"} in POST body
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+
+    let server_handle = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 2048];
+        let n = sock.read(&mut buf).await.unwrap();
+        let req = String::from_utf8_lossy(&buf[..n]);
+        assert!(req.contains("POST /channels/ch_eu_1/join_call "));
+        assert!(
+            req.ends_with(r#"{"node":"europe"}"#),
+            "Expected {{\"node\":\"europe\"}} payload, got: {}",
+            req
+        );
+
+        let body = r#"{"token":"eu_jwt_token_abc"}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        sock.write_all(resp.as_bytes()).await.unwrap();
+    });
+
+    let client = DeltaClient::new(server_url, Some("sess_eu".to_string()), false);
+    let join_res = client
+        .join_call("ch_eu_1", node_name.as_deref())
+        .await
+        .expect("join_call with node_name should succeed");
+    assert_eq!(join_res.token, "eu_jwt_token_abc");
+
+    server_handle.await.unwrap();
+}
+
+#[test]
+fn test_screen_capture_ppm_downscale_and_i420_roundtrip() {
+    use livekit::webrtc::video_frame::{BoxVideoBuffer, VideoFrame, VideoRotation};
+    use pipewire::spa::param::video::VideoFormat;
+    use stoat_tui::voice::screen::{convert_pipewire_to_rgba, downscale_rgba_even, parse_ppm_p6};
+    use stoat_tui::voice::{rgba_to_i420_buffer, video_frame_to_rgba};
+
+    // 1. Parse PPM P6 with comment
+    let mut ppm = b"P6\n# grim screenshot\n4 2\n255\n".to_vec();
+    for _ in 0..8 {
+        ppm.extend_from_slice(&[200, 40, 20]);
+    }
+    let (w, h, rgba) = parse_ppm_p6(&ppm).expect("Valid P6 PPM should parse");
+    assert_eq!((w, h), (4, 2));
+    assert_eq!(&rgba[0..4], &[200, 40, 20, 255]);
+
+    // 2. Convert PipeWire BGRx -> RGBA
+    let bgrx = [10u8, 20, 30, 0, 40, 50, 60, 0];
+    let pw_rgba = convert_pipewire_to_rgba(VideoFormat::BGRx, &bgrx, 8, 2, 1).unwrap();
+    assert_eq!(&pw_rgba[0..4], &[30, 20, 10, 255]);
+    assert_eq!(&pw_rgba[4..8], &[60, 50, 40, 255]);
+
+    // 3. Downscale 2560x1440 -> 1280x720 (even dims)
+    let large = vec![128u8; 2560 * 1440 * 4];
+    let (dw, dh, scaled) = downscale_rgba_even(&large, 2560, 1440, 1280, 720);
+    assert_eq!((dw, dh), (1280, 720));
+    assert_eq!(dw % 2, 0);
+    assert_eq!(dh % 2, 0);
+    assert_eq!(scaled.len(), 1280 * 720 * 4);
+
+    // 4. RGBA -> I420 -> BoxVideoFrame -> RGBA roundtrip preserves dominant red channel
+    let mut red_rgba = Vec::with_capacity(4 * 4 * 4);
+    for _ in 0..16 {
+        red_rgba.extend_from_slice(&[240, 10, 10, 255]);
+    }
+    let i420 = rgba_to_i420_buffer(&red_rgba, 4, 4);
+    let box_buf: BoxVideoBuffer = Box::new(i420);
+    let vf = VideoFrame::new(VideoRotation::VideoRotation0, box_buf);
+    let (rw, rh, out_rgba) = video_frame_to_rgba(&vf).expect("Roundtrip should succeed");
+    assert_eq!((rw, rh), (4, 4));
+    assert!(out_rgba[0] > 200 && out_rgba[1] < 40 && out_rgba[2] < 40, "Unexpected RGB: {:?}", &out_rgba[0..4]);
+}
+
+#[tokio::test]
+async fn test_call_stage_video_streaming_and_screen_share_failed() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use stoat_tui::api::models::User;
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::ui;
+    use stoat_tui::voice::{ActiveCallState, CallStatus, VideoFrameSnapshot};
+
+    std::env::set_var("STOAT_TUI_DISABLE_AUDIO", "1");
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (cfg, _guard) = isolated_config(Some("tok_vid"));
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
+    app.state.show_login_modal = false;
+
+    app.state.users.insert(
+        "u_sharer".to_string(),
+        User {
+            id: "u_sharer".to_string(),
+            username: "sharer".to_string(),
+            display_name: Some("Alice Stream".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let mut call = ActiveCallState::new("ch_v1".to_string());
+    call.status = CallStatus::Connected;
+    call.connected_at = Some(std::time::Instant::now());
+    call.screensharing.store(true, std::sync::atomic::Ordering::SeqCst);
+    *call.latest_video_frame.lock().await = Some(VideoFrameSnapshot {
+        image: image::DynamicImage::new_rgba8(16, 16),
+        owner_id: "u_sharer".to_string(),
+        fps: 20,
+        is_remote: true,
+    });
+    app.state.active_call = Some(call);
+
+    app.handle_event(AppEvent::VideoFrameReady).await;
+    assert!(app.state.image_cache.as_ref().unwrap().contains("active_call_video"));
+
+    // Render normal and fullscreen modes via TestBackend
+    let backend = TestBackend::new(110, 34);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app.state)).expect("Normal render with video should succeed");
+
+    // Check streaming badge text appears in buffer
+    let buf_text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        buf_text.contains("STREAMING • 20fps • Alice Stream"),
+        "Missing streaming badge in buffer"
+    );
+
+    // Test fullscreen render
+    app.state.call_fullscreen = true;
+    terminal.draw(|f| ui::render(f, &mut app.state)).expect("Fullscreen render with video should succeed");
+    app.state.call_fullscreen = false;
+
+    // Test `v` toggles local preview
+    let v_key = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE);
+    app.handle_event(AppEvent::Key(v_key)).await;
+    assert!(!app.state.active_call.as_ref().unwrap().show_local_preview);
+
+    // ScreenShareFailed resets screensharing flag and sets sanitized red status
+    app.handle_event(AppEvent::ScreenShareFailed {
+        channel_id: "ch_v1".to_string(),
+        error: "Portal denied\n<html>err</html>".to_string(),
+    }).await;
+    assert!(!app.state.active_call.as_ref().unwrap().is_screensharing());
+    let (status_msg, _) = app.state.status_message.as_ref().unwrap();
+    assert!(status_msg.contains("Screen share failed:"));
+    assert!(!status_msg.contains('\n'));
+}
+
+#[test]
+fn test_tiny_10x10_render_all_views_and_modals() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use stoat_tui::api::models::{Channel, Message, Server, User};
+    use stoat_tui::state::{LoginStep, LoginTab};
+    use stoat_tui::ui;
+    use stoat_tui::voice::{ActiveCallState, CallStatus};
+
+    let (cfg, _guard) = isolated_config(Some("tok_tiny"));
+    let mut state = AppState::new(cfg);
+    state.show_login_modal = false;
+
+    state.users.insert(
+        "u1".to_string(),
+        User {
+            id: "u1".to_string(),
+            username: "alice".to_string(),
+            display_name: Some("Alice".to_string()),
+            ..Default::default()
+        },
+    );
+    state.servers.push(Server {
+        id: "srv1".to_string(),
+        name: "Stoat".to_string(),
+        channels: vec!["ch1".to_string()],
+        ..Default::default()
+    });
+    state.channels.insert(
+        "ch1".to_string(),
+        Channel {
+            id: "ch1".to_string(),
+            channel_type: "TextChannel".to_string(),
+            server: Some("srv1".to_string()),
+            name: Some("general".to_string()),
+            ..Default::default()
+        },
+    );
+    state.server_channels.insert("srv1".to_string(), vec!["ch1".to_string()]);
+    state.active_server_id = Some("srv1".to_string());
+    state.active_rail = stoat_tui::state::ActiveRail::Server("srv1".to_string());
+    state.active_channel_id = Some("ch1".to_string());
+    state.messages.insert(
+        "ch1".to_string(),
+        vec![Message {
+            id: "01J00000000000000000000001".to_string(),
+            channel: "ch1".to_string(),
+            author: "u1".to_string(),
+            content: Some("Hello tiny!".to_string()),
+            ..Default::default()
+        }],
+    );
+
+    let read_buf = |term: &Terminal<TestBackend>| -> String {
+        term.backend().buffer().content().iter().map(|c| c.symbol()).collect()
+    };
+
+    // 1. 10x10 Chat
+    state.focus = Focus::Chat;
+    let mut term = Terminal::new(TestBackend::new(10, 10)).unwrap();
+    term.draw(|f| ui::render(f, &mut state)).unwrap();
+    let txt = read_buf(&term);
+    assert!(txt.contains("#general") || txt.contains("#genera"), "Header missing at 10x10: {}", txt);
+    assert!(txt.contains("Hello"), "Message missing at 10x10 Chat: {}", txt);
+
+    // 2. 10x10 Channels
+    state.focus = Focus::Channels;
+    term.draw(|f| ui::render(f, &mut state)).unwrap();
+    let txt = read_buf(&term);
+    assert!(txt.contains("general") || txt.contains("Stoat"), "Channel missing at 10x10: {}", txt);
+
+    // 3. 10x10 Servers
+    state.focus = Focus::Servers;
+    term.draw(|f| ui::render(f, &mut state)).unwrap();
+    let txt = read_buf(&term);
+    assert!(txt.contains("@") && txt.contains("ST"), "Server badge missing at 10x10: {}", txt);
+
+    // 4. 10x10 Input
+    state.focus = Focus::Input;
+    state.input_buffer = "hi!".to_string();
+    state.input_cursor = 3;
+    term.draw(|f| ui::render(f, &mut state)).unwrap();
+    let txt = read_buf(&term);
+    assert!(txt.contains("hi!"), "Input text missing at 10x10: {}", txt);
+
+    // 5. 10x10 Active Call (split + fullscreen)
+    state.focus = Focus::Chat;
+    let mut call = ActiveCallState::new("ch1".to_string());
+    call.status = CallStatus::Connected;
+    call.connected_at = Some(std::time::Instant::now());
+    state.active_call = Some(call);
+    term.draw(|f| ui::render(f, &mut state)).unwrap();
+    let txt = read_buf(&term);
+    assert!(txt.contains("📞"), "Call icon missing at 10x10: {}", txt);
+    state.call_fullscreen = true;
+    term.draw(|f| ui::render(f, &mut state)).unwrap();
+    state.call_fullscreen = false;
+    state.active_call = None;
+
+    // 6. 10x10 Login Modal (all tabs + TOTP)
+    state.show_login_modal = true;
+    for tab in [LoginTab::EmailPassword, LoginTab::Token, LoginTab::Demo] {
+        state.login_tab = tab;
+        term.draw(|f| ui::render(f, &mut state)).unwrap();
+        let txt = read_buf(&term);
+        assert!(txt.contains("Login"), "Login modal missing at 10x10: {}", txt);
+    }
+    state.login_step = LoginStep::TotpChallenge { ticket: "t".to_string() };
+    term.draw(|f| ui::render(f, &mut state)).unwrap();
+    assert!(read_buf(&term).contains("2FA"));
+    state.show_login_modal = false;
+
+    // 7. 10x10 Command Palette Modal
+    state.show_command_palette = true;
+    state.command_palette_query = "gen".to_string();
+    term.draw(|f| ui::render(f, &mut state)).unwrap();
+    assert!(read_buf(&term).contains("/gen"));
+    state.show_command_palette = false;
+
+    // 8. Extreme tiny edge sizes: 0x0, 1x1, 10x4 (height < 6 pure pane mode)
+    for (w, h) in [(0, 0), (1, 1), (10, 4)] {
+        let mut tiny_term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        state.focus = Focus::Chat;
+        tiny_term.draw(|f| ui::render(f, &mut state)).unwrap();
+    }
+
+    // 9. Medium Mode (width = 60, height = 24): right member rail auto-hidden and center >= 60%
+    let mut med_term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    med_term.draw(|f| ui::render(f, &mut state)).unwrap();
+    assert!(state.rect_chat.width >= 36, "Center width {} must be >= 60% of 60", state.rect_chat.width);
+    assert_eq!(state.rect_members.width, 0, "Member rail should auto-hide in medium mode unless toggled");
+}
+
+#[tokio::test]
+async fn test_nav_cache_hydration_and_tiny_pane_switching() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use stoat_tui::api::models::{Channel, Server, User};
+    use stoat_tui::config::NavCache;
+    use stoat_tui::event::AppEvent;
+
+    let (mut cfg, _guard) = isolated_config(Some("tok_cache"));
+    cfg.last_server_id = Some("s_cache".to_string());
+    cfg.last_channel_id = Some("c_cache".to_string());
+    let cache_path = cfg.nav_cache_path();
+
+    let nav = NavCache {
+        api_url: cfg.api_url.clone(),
+        ws_url: Some("wss://events.cached.test".to_string()),
+        autumn_url: Some("https://cdn.cached.test".to_string()),
+        servers: vec![Server {
+            id: "s_cache".to_string(),
+            name: "CachedGuild".to_string(),
+            channels: vec!["c_cache".to_string()],
+            ..Default::default()
+        }],
+        channels: vec![Channel {
+            id: "c_cache".to_string(),
+            channel_type: "TextChannel".to_string(),
+            server: Some("s_cache".to_string()),
+            name: Some("cached-room".to_string()),
+            ..Default::default()
+        }],
+        dms: Vec::new(),
+        users: vec![User {
+            id: "u_c".to_string(),
+            username: "cached_user".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    nav.save_to(&cache_path).expect("NavCache save should succeed");
+    let loaded = NavCache::load_from(&cache_path).expect("NavCache load should succeed");
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
+    app.state.hydrate_nav_cache(loaded);
+
+    assert_eq!(app.state.servers.len(), 1);
+    assert_eq!(app.state.active_server_id.as_deref(), Some("s_cache"));
+    assert_eq!(app.state.active_channel_id.as_deref(), Some("c_cache"));
+    assert_eq!(app.state.cached_ws_url.as_deref(), Some("wss://events.cached.test"));
+    assert_eq!(app.state.autumn_url, "https://cdn.cached.test");
+
+    // Test bare 1/2/3/4 direct pane jump outside Input + Esc back from Input
+    app.state.focus = Focus::Chat;
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))).await;
+    assert_eq!(app.state.focus, Focus::Servers);
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))).await;
+    assert_eq!(app.state.focus, Focus::Channels);
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE))).await;
+    assert_eq!(app.state.focus, Focus::Chat);
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE))).await;
+    assert_eq!(app.state.focus, Focus::Input);
+    // In Input, '1' types into input buffer rather than switching pane
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))).await;
+    assert_eq!(app.state.focus, Focus::Input);
+    assert_eq!(app.state.input_buffer, "1");
+}
+
+#[tokio::test]
+async fn test_call_participant_deduplication_and_real_resolution() {
+    use stoat_tui::api::models::{Message, User};
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::gateway::messages::ServerMessage;
+    use stoat_tui::gateway::GatewayEvent;
+    use stoat_tui::voice::{normalize_livekit_identity, ActiveCallState, CallStatus};
+
+    assert_eq!(normalize_livekit_identity("01ABCDEF123:desktop"), "01ABCDEF123");
+    assert_eq!(normalize_livekit_identity("01ABCDEF123"), "01ABCDEF123");
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (cfg, _guard) = isolated_config(Some("tok_call"));
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
+
+    app.state.current_user = Some(User {
+        id: "01ME000001".to_string(),
+        username: "me_user".to_string(),
+        display_name: Some("Me".to_string()),
+        ..Default::default()
+    });
+    app.state.users.insert(
+        "01REMOTE01".to_string(),
+        User {
+            id: "01REMOTE01".to_string(),
+            username: "rom_user".to_string(),
+            display_name: Some("Rom".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let mut call = ActiveCallState::new("ch_call_dedup".to_string());
+    call.status = CallStatus::Connected;
+    app.state.active_call = Some(call);
+
+    // Local identity with device suffix must NOT be duplicated in call.participants
+    app.handle_event(AppEvent::CallParticipantJoined {
+        channel_id: "ch_call_dedup".to_string(),
+        user_id: "01ME000001:cli".to_string(),
+    })
+    .await;
+    assert!(app.state.active_call.as_ref().unwrap().participants.is_empty());
+
+    // Remote identity joined from two device suffixes -> deduplicated to 1 entry
+    app.handle_event(AppEvent::CallParticipantJoined {
+        channel_id: "ch_call_dedup".to_string(),
+        user_id: "01REMOTE01:web".to_string(),
+    })
+    .await;
+    app.handle_event(AppEvent::CallParticipantJoined {
+        channel_id: "ch_call_dedup".to_string(),
+        user_id: "01REMOTE01:mobile".to_string(),
+    })
+    .await;
+    assert_eq!(app.state.active_call.as_ref().unwrap().participants.len(), 1);
+    assert_eq!(
+        app.state.active_call.as_ref().unwrap().participants[0].user_id,
+        "01REMOTE01"
+    );
+
+    // Synthetic "caller" or call_started without real user never inserts "caller"
+    app.handle_event(AppEvent::CallParticipantJoined {
+        channel_id: "ch_call_dedup".to_string(),
+        user_id: "caller".to_string(),
+    })
+    .await;
+    app.handle_event(AppEvent::Gateway(GatewayEvent::MessageReceived(
+        ServerMessage::Message(Message {
+            id: "01M1".to_string(),
+            channel: "ch_call_dedup".to_string(),
+            author: "00000000000000000000000000".to_string(),
+            system: Some(serde_json::json!({"type": "call_started"})),
+            ..Default::default()
+        }),
+    )))
+    .await;
+    assert_eq!(app.state.active_call.as_ref().unwrap().participants.len(), 1);
+    assert!(
+        !app.state
+            .voice_channel_participants
+            .get("ch_call_dedup")
+            .unwrap()
+            .iter()
+            .any(|p| p.user_id == "caller")
+    );
+
+    // Resolve names cleanly without "User" prefix
+    assert_eq!(app.state.resolve_call_participant_name("01REMOTE01"), "Rom");
+    assert_eq!(app.state.resolve_call_participant_name("01UNKNWN99"), "01UNKN");
+
+    // LiveKit state event updates fallback_name, muted, and deafened
+    app.handle_event(AppEvent::CallParticipantState {
+        channel_id: "ch_call_dedup".to_string(),
+        user_id: "01UNKNWN99:web".to_string(),
+        fallback_name: Some("Nick".to_string()),
+        is_muted: Some(true),
+        is_deafened: Some(true),
+    })
+    .await;
+    assert_eq!(app.state.resolve_call_participant_name("01UNKNWN99"), "Nick");
+    let p_nick = app
+        .state
+        .active_call
+        .as_ref()
+        .unwrap()
+        .participants
+        .iter()
+        .find(|p| p.user_id == "01UNKNWN99")
+        .unwrap();
+    assert!(p_nick.is_muted);
+    assert!(p_nick.is_deafened);
+}
+
+#[test]
+fn test_call_stage_cards_speaking_border_and_mute_deafen_icons() {
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
+    use ratatui::Terminal;
+    use stoat_tui::api::models::User;
+    use stoat_tui::ui;
+    use stoat_tui::voice::{ActiveCallState, CallStatus, VoiceParticipant};
+
+    let (cfg, _guard) = isolated_config(Some("tok_cards"));
+    let mut state = AppState::new(cfg);
+    state.show_login_modal = false;
+    state.current_user = Some(User {
+        id: "u_me".to_string(),
+        username: "me".to_string(),
+        display_name: Some("Me".to_string()),
+        ..Default::default()
+    });
+    state.users.insert(
+        "u_a".to_string(),
+        User {
+            id: "u_a".to_string(),
+            username: "alice".to_string(),
+            display_name: Some("Alice".to_string()),
+            ..Default::default()
+        },
+    );
+    state.users.insert(
+        "u_b".to_string(),
+        User {
+            id: "u_b".to_string(),
+            username: "bob".to_string(),
+            display_name: Some("Bob".to_string()),
+            ..Default::default()
+        },
+    );
+    state.users.insert(
+        "u_c".to_string(),
+        User {
+            id: "u_c".to_string(),
+            username: "carol".to_string(),
+            display_name: Some("Carol".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let mut call = ActiveCallState::new("ch_cards".to_string());
+    call.status = CallStatus::Connected;
+    call.connected_at = Some(std::time::Instant::now());
+    call.local_speaking = false;
+    call.participants = vec![
+        VoiceParticipant {
+            user_id: "u_a".to_string(),
+            is_speaking: true,
+            is_muted: false,
+            is_deafened: false,
+            is_screensharing: false,
+        },
+        VoiceParticipant {
+            user_id: "u_b".to_string(),
+            is_speaking: false,
+            is_muted: true,
+            is_deafened: false,
+            is_screensharing: false,
+        },
+        VoiceParticipant {
+            user_id: "u_c".to_string(),
+            is_speaking: false,
+            is_muted: true,
+            is_deafened: true,
+            is_screensharing: false,
+        },
+    ];
+    state.active_call = Some(call);
+
+    let mut term = Terminal::new(TestBackend::new(110, 34)).unwrap();
+    term.draw(|f| ui::render(f, &mut state)).unwrap();
+
+    let buf = term.backend().buffer();
+    let txt: String = buf.content().iter().map(|c| c.symbol()).collect();
+
+    assert!(txt.contains("Me (You)"), "Missing local user card: {}", txt);
+    assert!(txt.contains("Alice"), "Missing speaking user card: {}", txt);
+    assert!(
+        txt.contains("Bob [🔇 ]") || txt.contains("Bob [🔇]"),
+        "Missing muted badge on Bob card: {}",
+        txt
+    );
+    assert!(
+        txt.contains("Carol [🔇 🎧 ]") || txt.contains("Carol [🔇🎧]"),
+        "Missing deafened badge on Carol card: {}",
+        txt
+    );
+    assert!(!txt.contains("IDLE"), "Must not render IDLE word");
+    assert!(!txt.contains("SPEAKING"), "Must not render SPEAKING word");
+    assert!(!txt.contains("User caller"), "Must not render User caller");
+
+    // Verify bright green rounded border exists on buffer (for speaking Alice)
+    let green_border_cells = buf
+        .content()
+        .iter()
+        .filter(|c| c.fg == Color::Rgb(35, 165, 90) && matches!(c.symbol(), "╭" | "╮" | "╰" | "╯" | "─" | "│"))
+        .count();
+    assert!(green_border_cells > 0, "Expected green border cells for speaking participant");
+}
+
+#[tokio::test]
+async fn test_settings_modal_shift_s_persistence_and_10x10_render() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use stoat_tui::config::ACCENT_PRESETS;
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::ui;
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (cfg, _guard) = isolated_config(Some("tok_set"));
+    let cfg_path = cfg.custom_path.clone().unwrap();
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
+    app.state.focus = Focus::Chat;
+
+    // Press Shift+S ('S') -> opens Settings modal
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT))).await;
+    assert!(app.state.show_settings_modal);
+
+    // Toggle Call Sound Effects (idx 0 -> false)
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))).await;
+    assert!(!app.state.config.call_sounds_enabled);
+
+    // Move to Left Sidebar Width (idx 1) and expand (+2 -> 28)
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))).await;
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))).await;
+    assert_eq!(app.state.left_sidebar_width, 28);
+    assert_eq!(app.state.config.left_sidebar_width, 28);
+
+    // Move to Compact Mode (idx 2) and toggle ON
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))).await;
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))).await;
+    assert!(app.state.config.compact_mode);
+
+    // Move to Accent Color Preset (idx 3) and cycle to Blurple
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))).await;
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))).await;
+    assert_eq!(app.state.config.theme.primary, ACCENT_PRESETS[1].1);
+
+    // Render Settings modal at 80x24 and 10x10
+    let mut term80 = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term80.draw(|f| ui::render(f, &mut app.state)).unwrap();
+    let txt80: String = term80.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+    assert!(txt80.contains("Call Sound Effects"));
+    assert!(txt80.contains("Compact / Dense Chat"));
+
+    let mut term10 = Terminal::new(TestBackend::new(10, 10)).unwrap();
+    term10.draw(|f| ui::render(f, &mut app.state)).unwrap();
+    let txt10: String = term10.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+    assert!(txt10.contains("Settings"));
+
+    // Close with Esc and verify config persisted cleanly to isolated path
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))).await;
+    assert!(!app.state.show_settings_modal);
+
+    let reloaded = Config::load_from(&cfg_path);
+    assert!(!reloaded.call_sounds_enabled);
+    assert_eq!(reloaded.left_sidebar_width, 28);
+    assert!(reloaded.compact_mode);
+    assert_eq!(reloaded.theme.primary, ACCENT_PRESETS[1].1);
+}
+
+#[test]
+fn test_call_stage_dynamic_desired_height() {
+    use stoat_tui::ui::components::call::CallStage;
+    use stoat_tui::voice::{ActiveCallState, CallStatus, VoiceParticipant};
+
+    let mut call = ActiveCallState::new("ch_dyn".to_string());
+    call.status = CallStatus::Connected;
+    call.participants = vec![
+        VoiceParticipant {
+            user_id: "u_r1".to_string(),
+            is_speaking: false,
+            is_muted: false,
+            is_deafened: false,
+            is_screensharing: false,
+        },
+        VoiceParticipant {
+            user_id: "u_r2".to_string(),
+            is_speaking: true,
+            is_muted: false,
+            is_deafened: false,
+            is_screensharing: false,
+        },
+    ];
+
+    // 3 participants (1 local + 2 remote) on width 60 -> 4 cols/row -> 1 row -> 2 + 1 + 4 = 7 rows
+    assert_eq!(CallStage::desired_height(60, &call), 7);
+
+    // Narrower width 30 -> 2 cols/row -> 2 rows -> 2 + 1 + 8 = 11 rows
+    assert_eq!(CallStage::desired_height(30, &call), 11);
+
+    // When screen sharing is active -> expands to show video canvas
+    call.screensharing.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(CallStage::desired_height(60, &call) >= 14);
+}
+
+#[tokio::test]
+async fn test_multi_account_migration_and_unified_dm_list() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use stoat_tui::api::models::{Channel, Server, User};
+    use stoat_tui::config::short_instance_label;
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::gateway::messages::ServerMessage;
+    use stoat_tui::gateway::GatewayEvent;
+    use stoat_tui::state::ActiveRail;
+    use stoat_tui::ui;
+
+    assert_eq!(short_instance_label("https://api.stoat.chat"), None);
+    assert_eq!(
+        short_instance_label("https://alpha-node.tail1234.ts.net/api"),
+        Some("alpha-node".to_string())
+    );
+
+    // Legacy single-account config migrates into accounts[0]
+    let (cfg, _guard) = isolated_config(Some("tok_primary"));
+    let cfg_path = cfg.custom_path.clone().unwrap();
+    cfg.save().expect("Save initial config");
+    let migrated = Config::load_from(&cfg_path);
+    assert_eq!(migrated.accounts.len(), 1);
+    assert_eq!(migrated.accounts[0].id, "primary");
+    assert_eq!(migrated.accounts[0].api_url, "https://api.stoat.chat");
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(migrated, tx, picker);
+    app.state.show_login_modal = false;
+
+    // Add second self-hosted account (keep existing)
+    app.handle_event(AppEvent::AccountLoginSuccess {
+        api_url: "https://alpha-node.tail1234.ts.net".to_string(),
+        token: "tok_alpha".to_string(),
+        is_bot: false,
+        add_to_existing: true,
+    })
+    .await;
+    assert_eq!(app.state.config.accounts.len(), 2);
+    assert_eq!(app.state.config.accounts[0].api_url, "https://api.stoat.chat");
+    assert_eq!(app.state.config.accounts[1].id, "alpha-node");
+    assert_eq!(app.state.config.accounts[1].label, "alpha-node");
+
+    // Ready from primary account
+    app.handle_event(AppEvent::AccountScoped {
+        account_id: "primary".to_string(),
+        event: Box::new(AppEvent::Gateway(GatewayEvent::MessageReceived(
+            ServerMessage::Ready {
+                users: vec![
+                    User {
+                        id: "u_me_p".to_string(),
+                        username: "me".to_string(),
+                        ..Default::default()
+                    },
+                    User {
+                        id: "u_roman".to_string(),
+                        username: "roman".to_string(),
+                        display_name: Some("Roman".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                servers: vec![Server {
+                    id: "srv_p".to_string(),
+                    name: "Official".to_string(),
+                    channels: vec![],
+                    ..Default::default()
+                }],
+                channels: vec![Channel {
+                    id: "dm_roman".to_string(),
+                    channel_type: "DirectMessage".to_string(),
+                    recipients: Some(vec!["u_me_p".to_string(), "u_roman".to_string()]),
+                    ..Default::default()
+                }],
+                members: vec![],
+            },
+        ))),
+    })
+    .await;
+
+    // Ready from self-hosted alpha-node merges cleanly without wiping primary
+    app.handle_event(AppEvent::AccountScoped {
+        account_id: "alpha-node".to_string(),
+        event: Box::new(AppEvent::Gateway(GatewayEvent::MessageReceived(
+            ServerMessage::Ready {
+                users: vec![
+                    User {
+                        id: "u_me_a".to_string(),
+                        username: "me_alpha".to_string(),
+                        ..Default::default()
+                    },
+                    User {
+                        id: "u_coucou".to_string(),
+                        username: "coucou".to_string(),
+                        display_name: Some("coucou".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                servers: vec![Server {
+                    id: "srv_a".to_string(),
+                    name: "School".to_string(),
+                    channels: vec![],
+                    ..Default::default()
+                }],
+                channels: vec![Channel {
+                    id: "dm_coucou".to_string(),
+                    channel_type: "DirectMessage".to_string(),
+                    recipients: Some(vec!["u_me_a".to_string(), "u_coucou".to_string()]),
+                    ..Default::default()
+                }],
+                members: vec![],
+            },
+        ))),
+    })
+    .await;
+
+    // Set ApiCurrentUser on both accounts so DM recipient filtering identifies self on each instance
+    app.handle_event(AppEvent::AccountScoped {
+        account_id: "primary".to_string(),
+        event: Box::new(AppEvent::ApiCurrentUser(User {
+            id: "u_me_p".to_string(),
+            username: "me".to_string(),
+            ..Default::default()
+        })),
+    })
+    .await;
+    app.handle_event(AppEvent::AccountScoped {
+        account_id: "alpha-node".to_string(),
+        event: Box::new(AppEvent::ApiCurrentUser(User {
+            id: "u_me_a".to_string(),
+            username: "me_alpha".to_string(),
+            ..Default::default()
+        })),
+    })
+    .await;
+
+    assert_eq!(app.state.servers.len(), 2);
+    assert_eq!(app.state.dms.len(), 2);
+    assert_eq!(app.state.account_for_channel("dm_roman"), "primary");
+    assert_eq!(app.state.account_for_channel("dm_coucou"), "alpha-node");
+
+    app.state.active_rail = ActiveRail::DirectMessages;
+    app.state.active_server_id = None;
+    app.state.left_sidebar_width = 34;
+
+    let mut term = Terminal::new(TestBackend::new(110, 30)).unwrap();
+    term.draw(|f| ui::render(f, &mut app.state)).unwrap();
+    let txt: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+    assert!(txt.contains("@ Roman"), "Missing primary DM in unified list: {}", txt);
+    assert!(
+        txt.contains("@ coucou (alpha-node)"),
+        "Missing tagged secondary DM in unified list: {}",
+        txt
+    );
+}
+
+#[tokio::test]
+async fn test_message_deduplication_by_id_and_nonce() {
+    use stoat_tui::api::models::Message;
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::gateway::messages::ServerMessage;
+    use stoat_tui::gateway::GatewayEvent;
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (cfg, _guard) = isolated_config(Some("tok_dedup"));
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
+    let channel_id = "01CH_DEDUP".to_string();
+
+    // 1. Insert optimistic message with nonce = "n1"
+    app.state.upsert_message(
+        &channel_id,
+        Message {
+            id: "optimistic:n1".to_string(),
+            channel: channel_id.clone(),
+            author: "01ME".to_string(),
+            content: Some("Hello dedup".to_string()),
+            nonce: Some("n1".to_string()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(app.state.messages[&channel_id].len(), 1);
+
+    // 2. Receive HTTP POST response (_id = "01REALID", nonce = Some("n1"))
+    app.handle_event(AppEvent::ApiMessageSent(Ok(Message {
+        id: "01REALID".to_string(),
+        channel: channel_id.clone(),
+        author: "01ME".to_string(),
+        content: Some("Hello dedup".to_string()),
+        nonce: Some("n1".to_string()),
+        ..Default::default()
+    })))
+    .await;
+    assert_eq!(app.state.messages[&channel_id].len(), 1);
+    assert_eq!(app.state.messages[&channel_id][0].id, "01REALID");
+
+    // 3. Receive Bonfire WebSocket Message broadcast (_id = "01REALID", nonce = Some("n1"))
+    app.handle_event(AppEvent::Gateway(GatewayEvent::MessageReceived(
+        ServerMessage::Message(Message {
+            id: "01REALID".to_string(),
+            channel: channel_id.clone(),
+            author: "01ME".to_string(),
+            content: Some("Hello dedup".to_string()),
+            nonce: Some("n1".to_string()),
+            ..Default::default()
+        }),
+    )))
+    .await;
+
+    assert_eq!(app.state.messages[&channel_id].len(), 1);
+    assert_eq!(app.state.messages[&channel_id][0].id, "01REALID");
+}
+
+#[tokio::test]
+async fn test_join_call_already_connected_auto_leave_and_retry() {
+    use stoat_tui::api::DeltaClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+
+    let server_handle = tokio::spawn(async move {
+        let steps = [
+            (
+                "POST /channels/ch_ghost/join_call ",
+                r#"{"node":"europe"}"#,
+                "HTTP/1.1 400 Bad Request",
+                r#"{"type":"AlreadyConnected"}"#,
+            ),
+            (
+                "POST /channels/ch_ghost/leave_call ",
+                "{}",
+                "HTTP/1.1 204 No Content",
+                "",
+            ),
+            (
+                "POST /channels/ch_ghost/join_call ",
+                r#"{"node":"europe"}"#,
+                "HTTP/1.1 200 OK",
+                r#"{"token":"jwt_recovered","url":"wss://lk.example.com"}"#,
+            ),
+        ];
+
+        for (expected_line, expected_body, status_line, resp_body) in steps {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.contains(expected_line),
+                "Expected '{}', got:\n{}",
+                expected_line,
+                req
+            );
+            assert!(
+                req.to_ascii_lowercase().contains("x-session-token: ghost_tok")
+                    || req.to_ascii_lowercase().contains("x-session-token:ghost_tok"),
+                "Missing x-session-token header in:\n{}",
+                req
+            );
+            assert!(
+                req.ends_with(expected_body),
+                "Expected body '{}', got:\n{}",
+                expected_body,
+                req
+            );
+
+            let resp = format!(
+                "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status_line,
+                resp_body.len(),
+                resp_body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        }
+    });
+
+    let client = DeltaClient::new(server_url, Some("ghost_tok".to_string()), false);
+    let join_res = client
+        .join_call("ch_ghost", Some("europe"))
+        .await
+        .expect("join_call should recover from AlreadyConnected via leave_call and retry");
+    assert_eq!(join_res.token, "jwt_recovered");
+    assert_eq!(join_res.url.as_deref(), Some("wss://lk.example.com"));
+
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_leave_call_fallback_and_app_shutdown_leaves_call() {
+    use stoat_tui::api::DeltaClient;
+    use stoat_tui::voice::ActiveCallState;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // 1. Test DeltaClient::leave_call fallback chain: 404 /leave_call -> DELETE /ring -> POST /end_ring
+    let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url1 = format!("http://127.0.0.1:{}", listener1.local_addr().unwrap().port());
+    let h1 = tokio::spawn(async move {
+        let steps = [
+            ("POST /channels/c_fb/leave_call ", "HTTP/1.1 404 Not Found"),
+            ("DELETE /channels/c_fb/ring ", "HTTP/1.1 404 Not Found"),
+            ("POST /channels/c_fb/end_ring ", "HTTP/1.1 204 No Content"),
+        ];
+        for (expected_line, status_line) in steps {
+            let (mut socket, _) = listener1.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.contains(expected_line),
+                "Expected '{}', got:\n{}",
+                expected_line,
+                req
+            );
+            let resp = format!("{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status_line);
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        }
+    });
+
+    let client = DeltaClient::new(url1, Some("tok_fb".to_string()), false);
+    client.leave_call("c_fb").await;
+    h1.await.unwrap();
+
+    // 2. Test App::shutdown cleanly invokes POST /channels/ch_exit/leave_call
+    let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url2 = format!("http://127.0.0.1:{}", listener2.local_addr().unwrap().port());
+    let h2 = tokio::spawn(async move {
+        let (mut socket, _) = listener2.accept().await.unwrap();
+        let mut buf = [0u8; 2048];
+        let n = socket.read(&mut buf).await.unwrap();
+        let req = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            req.contains("POST /channels/ch_exit/leave_call "),
+            "Expected POST /leave_call on App::shutdown, got:\n{}",
+            req
+        );
+        let resp = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        socket.write_all(resp.as_bytes()).await.unwrap();
+    });
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (mut cfg, _guard) = isolated_config(Some("tok_exit"));
+    cfg.api_url = url2.clone();
+    cfg.accounts = vec![stoat_tui::config::SavedAccount {
+        id: "primary".to_string(),
+        label: "".to_string(),
+        api_url: url2,
+        token: "tok_exit".to_string(),
+        is_bot: false,
+        user_id: None,
+        username: None,
+    }];
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
+    app.state.channel_accounts.insert("ch_exit".to_string(), "primary".to_string());
+    app.state.active_call = Some(ActiveCallState::new("ch_exit".to_string()));
+
+    app.shutdown().await;
+    assert!(app.state.active_call.is_none());
+    h2.await.unwrap();
 }

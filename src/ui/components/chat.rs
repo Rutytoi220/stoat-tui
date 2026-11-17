@@ -101,9 +101,14 @@ enum ChatRenderItem {
 
 impl<'a> Widget for ChatFeed<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
         let is_focused = self.state.focus == Focus::Chat;
-        let theme = &self.state.theme;
+        let theme = self.state.theme.clone();
         let parser = MarkdownParser::default();
+        let is_compact = area.width < 24 || area.height < 8;
 
         // Fill background
         for y in area.top()..area.bottom() {
@@ -114,25 +119,30 @@ impl<'a> Widget for ChatFeed<'a> {
             }
         }
 
-        // Draw border if focused
-        if is_focused {
+        // Draw border if focused (non-compact only; Borders::NONE is a no-op anyway)
+        if is_focused && !is_compact {
             let block = Block::default()
                 .borders(Borders::NONE)
                 .border_style(theme.focused_border_style(is_focused));
             block.render(area, buf);
         }
 
-        if area.width < 10 || area.height < 2 {
+        if area.width < 2 || area.height < 1 {
             return;
         }
+
+        let pad_x: u16 = if is_compact && area.width <= 14 { 0 } else { 1 };
+        let line_x = area.left() + pad_x;
+        let max_line_w = area.width.saturating_sub(pad_x.saturating_mul(2));
 
         let channel_id = match &self.state.active_channel_id {
             Some(cid) => cid,
             None => {
-                let empty_line = Line::from(vec![
-                    Span::styled("No channel selected. Select a channel from the left sidebar.", Style::default().fg(theme.muted)),
-                ]);
-                buf.set_line(area.left() + 2, area.top() + 2, &empty_line, area.width - 4);
+                let msg = if is_compact { "No ch" } else { "No channel selected. Select a channel from the left sidebar." };
+                let y = area.top() + if area.height >= 4 { 1 } else { 0 };
+                if y < area.bottom() && max_line_w > 0 {
+                    buf.set_line(line_x, y, &Line::from(Span::styled(msg, Style::default().fg(theme.muted))), max_line_w);
+                }
                 return;
             }
         };
@@ -143,14 +153,26 @@ impl<'a> Widget for ChatFeed<'a> {
 
         if msgs.is_empty() {
             let ch_name = self.state.active_channel().map(|c| c.display_name(&self.state.users, self.state.current_user.as_ref().map(|u| u.id.as_str()))).unwrap_or_else(|| "this channel".to_string());
-            let line1 = Line::from(vec![
-                Span::styled(format!("Welcome to #{}!", ch_name), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            ]);
-            let line2 = Line::from(vec![
-                Span::styled("This is the start of the channel history. Send a message below to begin chatting!", Style::default().fg(theme.muted)),
-            ]);
-            buf.set_line(area.left() + 2, area.top() + 2, &line1, area.width - 4);
-            buf.set_line(area.left() + 2, area.top() + 4, &line2, area.width - 4);
+            let y1 = area.top() + if area.height >= 4 { 1 } else { 0 };
+            if y1 < area.bottom() && max_line_w > 0 {
+                let title = if is_compact { format!("#{}", ch_name) } else { format!("Welcome to #{}!", ch_name) };
+                buf.set_line(
+                    line_x,
+                    y1,
+                    &Line::from(Span::styled(title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+                    max_line_w,
+                );
+            }
+            let y2 = y1 + 1;
+            if y2 < area.bottom() && max_line_w > 0 {
+                let sub = if is_compact { "No msgs" } else { "This is the start of the channel history. Send a message below to begin chatting!" };
+                buf.set_line(
+                    line_x,
+                    y2,
+                    &Line::from(Span::styled(sub, Style::default().fg(theme.muted))),
+                    max_line_w,
+                );
+            }
             return;
         }
 
@@ -201,29 +223,21 @@ impl<'a> Widget for ChatFeed<'a> {
 
             let author_color = theme.role_color(&msg.author);
 
-            // Trigger avatar fetch if missing
-            if let Some(ref u) = user {
-                let key = format!("avatar_{}", u.id);
-                let url = self.state.avatar_url_for_user(u);
-                if let Some(ref mut cache) = self.state.image_cache {
-                    if !cache.contains(&key) && !cache.is_pending(&key) {
-                        cache.mark_pending(key.clone());
-                        if let Some(ref tx) = self.state.image_fetch_tx {
-                            let _ = tx.send((key, url));
-                        }
-                    }
-                }
-            }
-
-            let mut header_spans = vec![
-                Span::styled(format!("[{}] ", time_str), Style::default().fg(Color::Rgb(90, 90, 100))),
-                Span::styled(author_name, Style::default().fg(author_color).add_modifier(Modifier::BOLD)),
-            ];
+            let mut header_spans = if is_compact {
+                vec![Span::styled(author_name, Style::default().fg(author_color).add_modifier(Modifier::BOLD))]
+            } else {
+                vec![
+                    Span::styled(format!("[{}] ", time_str), Style::default().fg(Color::Rgb(90, 90, 100))),
+                    Span::styled(author_name, Style::default().fg(author_color).add_modifier(Modifier::BOLD)),
+                ]
+            };
 
             // Bot badge
-            if let Some(ref u) = user {
-                if u.bot.is_some() {
-                    header_spans.push(Span::styled(" BOT", Style::default().fg(Color::White).bg(theme.accent).add_modifier(Modifier::BOLD)));
+            if !is_compact {
+                if let Some(ref u) = user {
+                    if u.bot.is_some() {
+                        header_spans.push(Span::styled(" BOT", Style::default().fg(Color::White).bg(theme.accent).add_modifier(Modifier::BOLD)));
+                    }
                 }
             }
 
@@ -237,9 +251,15 @@ impl<'a> Widget for ChatFeed<'a> {
             if !content.trim().is_empty() {
                 let content_lines = parser.parse_message(content);
                 for mut cl in content_lines {
-                    let mut indented = vec![Span::styled("    ", Style::default())];
-                    indented.append(&mut cl.spans);
-                    rendered_items.push(ChatRenderItem::Line(Line::from(indented)));
+                    if is_compact {
+                        let mut prefixed = vec![Span::styled(" ", Style::default())];
+                        prefixed.append(&mut cl.spans);
+                        rendered_items.push(ChatRenderItem::Line(Line::from(prefixed)));
+                    } else {
+                        let mut indented = vec![Span::styled("    ", Style::default())];
+                        indented.append(&mut cl.spans);
+                        rendered_items.push(ChatRenderItem::Line(Line::from(indented)));
+                    }
                 }
             }
 
@@ -335,8 +355,10 @@ impl<'a> Widget for ChatFeed<'a> {
                 }
             }
 
-            // Message separator spacing
-            rendered_items.push(ChatRenderItem::Line(Line::from(String::new())));
+            // Message separator spacing (skipped in compact/dense chat mode)
+            if !self.state.config.compact_mode {
+                rendered_items.push(ChatRenderItem::Line(Line::from(String::new())));
+            }
         }
 
         // Expand items to lines count for scrolling calculation
@@ -379,30 +401,47 @@ impl<'a> Widget for ChatFeed<'a> {
             match pos.item {
                 ChatRenderItem::Line(line) => {
                     let screen_y = area.top() + (item_top.saturating_sub(view_start)) as u16;
-                    if screen_y < area.bottom() {
-                        buf.set_line(area.left() + 1, screen_y, line, area.width.saturating_sub(2));
+                    if screen_y < area.bottom() && max_line_w > 0 {
+                        buf.set_line(line_x, screen_y, line, max_line_w);
                     }
                 }
                 ChatRenderItem::AuthorHeader { spans, author_id } => {
                     let screen_y = area.top() + (item_top.saturating_sub(view_start)) as u16;
                     if screen_y < area.bottom() {
-                        // Render 2x1 PFP thumbnail on the left
-                        let pfp_rect = Rect {
-                            x: area.left() + 1,
-                            y: screen_y,
-                            width: 2,
-                            height: 1,
-                        };
-                        let key = format!("avatar_{}", author_id);
-                        if let Some(ref mut cache) = self.state.image_cache {
-                            if let Some(proto) = cache.get_mut(&key) {
-                                ratatui_image::ResizeEncodeRender::render(proto, pfp_rect, buf);
-                            }
-                        }
+                        if !is_compact && area.width >= 10 {
+                            // Render 2x1 PFP thumbnail on the left
+                            let pfp_rect = Rect {
+                                x: area.left() + 1,
+                                y: screen_y,
+                                width: 2,
+                                height: 1,
+                            };
 
-                        // Render header text to the right of PFP
-                        let header_line = Line::from(spans.clone());
-                        buf.set_line(area.left() + 4, screen_y, &header_line, area.width.saturating_sub(5));
+                            // Fallback initials badge
+                            let initials: String = self.state.users.get(author_id)
+                                .map(|u| u.name())
+                                .unwrap_or(author_id.as_str())
+                                .chars()
+                                .take(2)
+                                .collect::<String>()
+                                .to_uppercase();
+                            let (badge_bg, badge_fg) = theme.user_initials_color(author_id);
+                            let mut init_chars = initials.chars();
+                            let c1 = init_chars.next().unwrap_or('?');
+                            let c2 = init_chars.next().unwrap_or(' ');
+                            crate::ui::put_cell(buf, area, area.left() + 1, screen_y, c1, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
+                            crate::ui::put_cell(buf, area, area.left() + 2, screen_y, c2, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
+
+                            let key = format!("avatar_{}", author_id);
+                            self.state.deferred_image_renders.push((pfp_rect, key));
+                            self.state.request_user_avatar(author_id);
+
+                            let header_line = Line::from(spans.clone());
+                            buf.set_line(area.left() + 4, screen_y, &header_line, area.width.saturating_sub(5));
+                        } else if max_line_w > 0 {
+                            let header_line = Line::from(spans.clone());
+                            buf.set_line(line_x, screen_y, &header_line, max_line_w);
+                        }
                     }
                 }
                 ChatRenderItem::ImageAttachment { key, badge, height } => {
@@ -413,33 +452,36 @@ impl<'a> Widget for ChatFeed<'a> {
                     let img_screen_y = area.top() + (item_top.saturating_sub(view_start)) as u16;
                     let img_h = *height;
 
-                    if img_screen_y + img_h < area.bottom() {
+                    if img_screen_y + img_h <= area.bottom() {
                         let max_img_w = (area.width.saturating_sub(8)).min(60);
-                        let img_rect = Rect {
-                            x: area.left() + 4,
-                            y: img_screen_y,
-                            width: max_img_w,
-                            height: img_h,
-                        };
+                        if max_img_w >= 2 && img_h >= 1 {
+                            let img_rect = Rect {
+                                x: area.left() + 4,
+                                y: img_screen_y,
+                                width: max_img_w,
+                                height: img_h,
+                            };
 
-                        if let Some(ref mut cache) = self.state.image_cache {
-                            if let Some(proto) = cache.get_mut(key) {
-                                ratatui_image::ResizeEncodeRender::render(proto, img_rect, buf);
+                            for iy in img_rect.top()..img_rect.bottom() {
+                                for ix in img_rect.left()..img_rect.right() {
+                                    crate::ui::put_cell(buf, area, ix, iy, ' ', Style::default().bg(Color::Rgb(30, 30, 35)));
+                                }
                             }
+
+                            self.state.deferred_image_renders.push((img_rect, key.clone()));
                         }
                     }
 
-                    // Render badge line underneath image
                     let badge_screen_y = img_screen_y + img_h;
-                    if badge_screen_y < area.bottom() {
-                        buf.set_line(area.left() + 1, badge_screen_y, &badge_line, area.width.saturating_sub(2));
+                    if badge_screen_y < area.bottom() && max_line_w > 0 {
+                        buf.set_line(line_x, badge_screen_y, &badge_line, max_line_w);
                     }
                 }
             }
         }
 
         // Draw scrollbar indicator on the right edge if backlog is scrollable
-        if total_lines > visible_height {
+        if total_lines > visible_height && area.width >= 6 {
             let scrollbar_x = area.right().saturating_sub(1);
             let track_height = area.height as usize;
             let thumb_height = ((visible_height as f32 / total_lines as f32) * track_height as f32).max(1.0) as usize;
@@ -455,7 +497,7 @@ impl<'a> Widget for ChatFeed<'a> {
                 let is_thumb = y_off >= thumb_pos && y_off < thumb_pos + thumb_height;
                 let ch = if is_thumb { '█' } else { '│' };
                 let color = if is_thumb { theme.primary } else { Color::Rgb(40, 40, 45) };
-                buf[(scrollbar_x, y)].set_char(ch).set_fg(color);
+                crate::ui::put_cell(buf, area, scrollbar_x, y, ch, Style::default().fg(color));
             }
         }
     }

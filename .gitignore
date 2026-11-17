@@ -1,1 +1,6 @@
 /target
+**/*.rs.bk
+.env
+config.toml
+nav_cache.json
+debug.log

@@ -16,7 +16,11 @@ impl<'a> ContentHeader<'a> {
 
 impl<'a> Widget for ContentHeader<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let theme = &self.state.theme;
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let theme = self.state.theme.clone();
 
         // Render header background
         for y in area.top()..area.bottom() {
@@ -27,158 +31,183 @@ impl<'a> Widget for ContentHeader<'a> {
             }
         }
 
-        let block = Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(Color::Rgb(45, 45, 50)));
-        block.render(area, buf);
+        if area.height >= 2 {
+            let block = Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::Rgb(45, 45, 50)));
+            block.render(area, buf);
+        }
 
-        if area.height < 1 || area.width < 10 {
+        if area.width < 2 {
             return;
         }
 
         let cur_y = area.top();
-        let mut cur_x = area.left() + 1;
+        let is_compact = area.width < 32 || area.height == 1;
+        let mut cur_x = if area.width < 12 { area.left() } else { area.left() + 1 };
 
         // Channel name & prefix
-        let channel = self.state.active_channel();
-        let (prefix, name, topic, dm_user) = if let Some(ch) = channel {
+        let channel = self.state.active_channel().cloned();
+        let (prefix, name, topic, dm_user, instance_tag) = if let Some(ch) = channel {
+            let acc_id = self.state.account_for_channel(&ch.id).to_string();
+            let cur_uid = self.state.current_user_for_account(&acc_id).map(|u| u.id.as_str());
+            let inst_tag = self.state.instance_tag_for_account(&acc_id).map(str::to_string);
             let pfx = if ch.channel_type == "VoiceChannel" {
-                "🔊 "
+                if is_compact { "🔊" } else { "🔊 " }
             } else if ch.channel_type == "DirectMessage" {
-                "@ "
+                if is_compact { "@" } else { "@ " }
+            } else if is_compact {
+                "#"
             } else {
                 "# "
             };
-            let n = ch.display_name(&self.state.users, self.state.current_user.as_ref().map(|u| u.id.as_str()));
+            let n = ch.display_name(&self.state.users, cur_uid);
             let t = ch.description.clone().unwrap_or_default();
             let other_user = if ch.channel_type == "DirectMessage" {
                 ch.recipients.as_ref().and_then(|r| {
-                    let cur_id = self.state.current_user.as_ref().map(|u| u.id.as_str());
-                    let uid = r.iter().find(|&id| Some(id.as_str()) != cur_id).or_else(|| r.first());
+                    let uid = r.iter().find(|&id| Some(id.as_str()) != cur_uid).or_else(|| r.first());
                     uid.and_then(|id| self.state.users.get(id)).cloned()
                 })
             } else {
                 None
             };
-            (pfx, n, t, other_user)
+            (pfx, n, t, other_user, inst_tag)
+        } else if is_compact {
+            ("", "Stoat".to_string(), String::new(), None, None)
         } else {
-            ("", "No Channel Selected".to_string(), "".to_string(), None)
+            ("", "No Channel Selected".to_string(), "".to_string(), None, None)
         };
 
-        // If in DM and user avatar is available, render 2x1 avatar
-        if let Some(ref u) = dm_user {
-            let key = format!("avatar_{}", u.id);
-            let url = self.state.avatar_url_for_user(u);
-            let pfp_rect = Rect {
-                x: cur_x,
-                y: cur_y,
-                width: 2,
-                height: 1,
-            };
-            if let Some(ref mut cache) = self.state.image_cache {
-                if let Some(proto) = cache.get_mut(&key) {
-                    ratatui_image::ResizeEncodeRender::render(proto, pfp_rect, buf);
-                } else if !cache.contains(&key) && !cache.is_pending(&key) {
-                    cache.mark_pending(key.clone());
-                    if let Some(ref tx) = self.state.image_fetch_tx {
-                        let _ = tx.send((key, url));
-                    }
+        // Compact tiny mode (e.g. 10x10): render crisp title & pane indicator cleanly without clipping
+        if area.width < 40 {
+            let title_text = format!("{}{}", prefix, name);
+            cur_x = crate::ui::write_str(
+                buf,
+                area,
+                cur_x,
+                cur_y,
+                &title_text,
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            );
+            if area.width >= 16 && cur_x + 5 < area.right() {
+                let pane_tag = match self.state.focus {
+                    crate::state::Focus::Servers => "[1:Srv]",
+                    crate::state::Focus::Channels => "[2:Ch]",
+                    crate::state::Focus::Chat => "[3:Msg]",
+                    crate::state::Focus::Input => "[4:In]",
+                    crate::state::Focus::Members => "[5:Mem]",
+                };
+                let tag_x = area.right().saturating_sub(pane_tag.chars().count() as u16);
+                if tag_x > cur_x {
+                    crate::ui::write_str(buf, area, tag_x, cur_y, pane_tag, Style::default().fg(theme.primary));
                 }
             }
-            cur_x += 3;
+            return;
+        }
+
+        // If in DM and user avatar is available, render 2x1 avatar badge + deferred image
+        if let Some(ref u) = dm_user {
+            if cur_x + 2 < area.right() {
+                let pfp_rect = Rect {
+                    x: cur_x,
+                    y: cur_y,
+                    width: 2,
+                    height: 1,
+                };
+
+                let initials: String = u.name().chars().take(2).collect::<String>().to_uppercase();
+                let (badge_bg, badge_fg) = theme.user_initials_color(&u.id);
+                let mut init_chars = initials.chars();
+                let c1 = init_chars.next().unwrap_or('?');
+                let c2 = init_chars.next().unwrap_or(' ');
+                crate::ui::put_cell(buf, area, cur_x, cur_y, c1, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
+                crate::ui::put_cell(buf, area, cur_x + 1, cur_y, c2, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
+
+                let key = format!("avatar_{}", u.id);
+                self.state.deferred_image_renders.push((pfp_rect, key));
+                self.state.request_user_avatar(&u.id);
+
+                cur_x += 3;
+            }
         }
 
         // Render prefix
-        for ch in prefix.chars() {
-            buf[(cur_x, cur_y)]
-                .set_char(ch)
-                .set_fg(theme.primary)
-                .set_style(Modifier::BOLD);
-            cur_x += 1;
-        }
+        cur_x = crate::ui::write_str(
+            buf,
+            area,
+            cur_x,
+            cur_y,
+            prefix,
+            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+        );
 
-        // Render channel name
-        for ch in name.chars() {
-            if cur_x >= area.right().saturating_sub(40) {
-                break;
-            }
-            buf[(cur_x, cur_y)]
-                .set_char(ch)
-                .set_fg(Color::White)
-                .set_style(Modifier::BOLD);
-            cur_x += 1;
+        let right_reserve = area.right().saturating_sub(40);
+        let name_limit = Rect {
+            x: area.left(),
+            y: area.top(),
+            width: right_reserve.saturating_sub(area.left()),
+            height: area.height,
+        };
+        cur_x = crate::ui::write_str(
+            buf,
+            name_limit,
+            cur_x,
+            cur_y,
+            &name,
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        );
+        if let Some(ref tag) = instance_tag {
+            cur_x = crate::ui::write_str(
+                buf,
+                name_limit,
+                cur_x,
+                cur_y,
+                &format!(" ({})", tag),
+                Style::default().fg(theme.muted),
+            );
         }
 
         // Separator and topic
         if !topic.is_empty() && cur_x + 6 < area.right().saturating_sub(40) {
-            let sep = "  │  ";
-            for ch in sep.chars() {
-                buf[(cur_x, cur_y)]
-                    .set_char(ch)
-                    .set_fg(Color::Rgb(60, 60, 70));
-                cur_x += 1;
-            }
-
-            for ch in topic.chars() {
-                if cur_x >= area.right().saturating_sub(38) {
-                    break;
-                }
-                buf[(cur_x, cur_y)]
-                    .set_char(ch)
-                    .set_fg(theme.muted);
-                cur_x += 1;
-            }
+            let topic_limit = Rect {
+                x: area.left(),
+                y: area.top(),
+                width: area.right().saturating_sub(38).saturating_sub(area.left()),
+                height: area.height,
+            };
+            cur_x = crate::ui::write_str(buf, topic_limit, cur_x, cur_y, "  │  ", Style::default().fg(Color::Rgb(60, 60, 70)));
+            cur_x = crate::ui::write_str(buf, topic_limit, cur_x, cur_y, &topic, Style::default().fg(theme.muted));
         }
 
         // Right side: Member toggle button and connection status
         let mut rx = area.right().saturating_sub(2);
-
-        // Member button: `[ 👥 Members ]`
         let member_btn = if self.state.show_member_rail {
             "[ 👥 Members ▾ ]"
         } else {
             "[ 👥 Members ▸ ]"
         };
-        rx = rx.saturating_sub(member_btn.len() as u16);
+        rx = rx.saturating_sub(member_btn.chars().count() as u16);
         let btn_style = if self.state.show_member_rail {
             Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 50))
         } else {
             Style::default().fg(theme.muted).bg(Color::Rgb(25, 25, 30))
         };
-
-        let mut bx = rx;
-        for ch in member_btn.chars() {
-            if bx < area.right() {
-                buf[(bx, cur_y)]
-                    .set_char(ch)
-                    .set_style(btn_style);
-                bx += 1;
-            }
-        }
+        crate::ui::write_str(buf, area, rx, cur_y, member_btn, btn_style);
 
         // Connection status pill
         rx = rx.saturating_sub(2);
         let (dot, dot_color, status_text) = match &self.state.gateway_status {
-            GatewayStatus::Connected { latency_ms } => ("●", theme.status_online, format!("{}ms", latency_ms)),
-            GatewayStatus::Connecting => ("◐", theme.status_idle, "Connecting...".to_string()),
-            GatewayStatus::Disconnected(_) => ("○", theme.status_offline, "Offline".to_string()),
+            GatewayStatus::Connected { latency_ms } => ('●', theme.status_online, format!("{}ms", latency_ms)),
+            GatewayStatus::Connecting => ('◐', theme.status_idle, "Connecting...".to_string()),
+            GatewayStatus::Disconnected(_) => ('○', theme.status_offline, "Offline".to_string()),
         };
 
         let status_len = (status_text.len() + 3) as u16;
         rx = rx.saturating_sub(status_len);
 
         if rx > cur_x + 2 {
-            buf[(rx, cur_y)]
-                .set_char(dot.chars().next().unwrap_or('●'))
-                .set_fg(dot_color);
-
-            let mut sx = rx + 2;
-            for ch in status_text.chars() {
-                buf[(sx, cur_y)]
-                    .set_char(ch)
-                    .set_fg(theme.muted);
-                sx += 1;
-            }
+            crate::ui::put_cell(buf, area, rx, cur_y, dot, Style::default().fg(dot_color));
+            crate::ui::write_str(buf, area, rx + 2, cur_y, &status_text, Style::default().fg(theme.muted));
         }
     }
 }

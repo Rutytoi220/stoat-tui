@@ -23,6 +23,11 @@ impl ImageCache {
         }
     }
 
+    pub fn set_picker(&mut self, picker: Arc<Picker>) {
+        self.picker = picker;
+        // Re-encode cached protocols cleanly only if protocol changed; future inserts use the new picker
+    }
+
     pub fn get_mut(&mut self, key: &str) -> Option<&mut StatefulProtocol> {
         if self.protocols.contains_key(key) {
             // Touch key in LRU order
@@ -50,11 +55,14 @@ impl ImageCache {
 
     pub fn insert(&mut self, key: String, dyn_img: DynamicImage) {
         self.pending_fetches.remove(&key);
+        if let Some(pos) = self.lru_order.iter().position(|k| k == &key) {
+            self.lru_order.remove(pos);
+        }
 
         let stateful = self.picker.new_resize_protocol(dyn_img);
 
         // Evict LRU if capacity exceeded
-        while self.protocols.len() >= self.max_capacity {
+        while self.protocols.len() >= self.max_capacity && !self.protocols.contains_key(&key) {
             if let Some(oldest) = self.lru_order.pop_front() {
                 self.protocols.remove(&oldest);
             } else {
@@ -64,5 +72,13 @@ impl ImageCache {
 
         self.lru_order.push_back(key.clone());
         self.protocols.insert(key, stateful);
+    }
+
+    pub fn remove(&mut self, key: &str) {
+        self.pending_fetches.remove(key);
+        self.protocols.remove(key);
+        if let Some(pos) = self.lru_order.iter().position(|k| k == key) {
+            self.lru_order.remove(pos);
+        }
     }
 }

@@ -158,10 +158,14 @@ pub fn parse_resilient_ready(val: &serde_json::Value) -> ServerMessage {
             } else if let Some(id) = u_val.get("_id").and_then(|i| i.as_str()) {
                 let username = u_val.get("username").and_then(|u| u.as_str()).unwrap_or("user").to_string();
                 let display_name = u_val.get("display_name").and_then(|d| d.as_str()).map(|s| s.to_string());
+                let avatar = u_val.get("avatar").and_then(|a| serde_json::from_value(a.clone()).ok());
+                let status = u_val.get("status").and_then(|s| serde_json::from_value(s.clone()).ok());
                 users.push(User {
                     id: id.to_string(),
                     username,
                     display_name,
+                    avatar,
+                    status,
                     ..Default::default()
                 });
             }
@@ -176,6 +180,7 @@ pub fn parse_resilient_ready(val: &serde_json::Value) -> ServerMessage {
             } else if let Some(id) = s_val.get("_id").and_then(|i| i.as_str()) {
                 let name = s_val.get("name").and_then(|n| n.as_str()).unwrap_or("Server").to_string();
                 let description = s_val.get("description").and_then(|d| d.as_str()).map(|s| s.to_string());
+                let icon = s_val.get("icon").and_then(|ic| serde_json::from_value(ic.clone()).ok());
                 let channels = s_val.get("channels")
                     .and_then(|c| c.as_array())
                     .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
@@ -186,6 +191,7 @@ pub fn parse_resilient_ready(val: &serde_json::Value) -> ServerMessage {
                     id: id.to_string(),
                     name,
                     description,
+                    icon,
                     channels,
                     categories,
                     ..Default::default()

@@ -125,9 +125,14 @@ pub struct AppState {
 
     // UI Toggles & Modals
     pub show_member_rail: bool,
+    pub member_rail_explicitly_toggled: bool,
+    pub left_sidebar_width: u16,
     pub show_command_palette: bool,
     pub command_palette_query: String,
     pub command_palette_selected: usize,
+
+    pub show_settings_modal: bool,
+    pub settings_selected_index: usize,
 
     pub show_login_modal: bool,
     pub is_demo_mode: bool,
@@ -138,12 +143,27 @@ pub struct AppState {
     pub login_password_input: String,
     pub login_totp_input: String,
     pub login_token_input: String,
+    pub login_api_input: String,
+    pub login_add_account: bool,
     pub login_error: Option<String>,
     pub login_loading: bool,
+
+    // Multi-Account / Multi-Instance Tracking
+    pub active_account_id: String,
+    pub account_api_urls: HashMap<String, String>,
+    pub account_labels: HashMap<String, Option<String>>,
+    pub account_users: HashMap<String, User>,
+    pub account_autumn_urls: HashMap<String, String>,
+    pub account_livekit: HashMap<String, (Option<String>, Option<String>)>,
+    pub account_gateway_statuses: HashMap<String, GatewayStatus>,
+    pub server_accounts: HashMap<String, String>,
+    pub channel_accounts: HashMap<String, String>,
+    pub user_accounts: HashMap<String, String>,
 
     // Gateway / network
     pub gateway_status: GatewayStatus,
     pub status_message: Option<(String, chrono::DateTime<Utc>)>,
+    pub cached_ws_url: Option<String>,
 
     // Data stores
     pub current_user: Option<User>,
@@ -153,6 +173,7 @@ pub struct AppState {
     pub server_channels: HashMap<String, Vec<String>>,
     pub dms: Vec<Channel>,
     pub members: HashMap<String, Vec<Member>>,
+    pub user_profiles: HashMap<String, crate::api::models::UserProfile>,
     pub messages: HashMap<String, Vec<Message>>,
     pub unread_counts: HashMap<String, usize>,
 
@@ -160,15 +181,19 @@ pub struct AppState {
     pub active_call: Option<ActiveCallState>,
     pub call_fullscreen: bool,
     pub voice_channel_participants: HashMap<String, Vec<VoiceParticipant>>,
+    pub livekit_node_name: Option<String>,
+    pub livekit_url: Option<String>,
+    pub call_fallback_names: HashMap<String, String>,
 
     // Dynamic user resolution cache
     pub pending_user_fetches: Arc<Mutex<HashSet<String>>>,
-    pub user_fetch_tx: Option<mpsc::UnboundedSender<String>>,
+    pub user_fetch_tx: Option<mpsc::UnboundedSender<(String, String)>>,
 
     // Autumn CDN & Async Image Cache
     pub autumn_url: String,
     pub image_cache: Option<crate::ui::images::ImageCache>,
     pub image_fetch_tx: Option<mpsc::UnboundedSender<(String, String)>>, // (key, url)
+    pub deferred_image_renders: Vec<(Rect, String)>,
 
     // Precision hit-test rects from last render frame
     pub rect_rail: Rect,
@@ -193,10 +218,32 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Self {
+    pub fn new(mut config: Config) -> Self {
+        config.migrate_legacy_account();
         let theme = Theme::from_config(&config.theme);
-        let has_token = config.token.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false);
+        let has_token = !config.accounts.is_empty()
+            || config.token.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false);
         let show_login = !has_token;
+        let left_sidebar_width = config.left_sidebar_width.clamp(16, 52);
+        let initial_api = config.api_url.clone();
+
+        let active_account_id = config
+            .accounts
+            .first()
+            .map(|a| a.id.clone())
+            .unwrap_or_else(|| "primary".to_string());
+        let mut account_api_urls = HashMap::new();
+        let mut account_labels = HashMap::new();
+        for acc in &config.accounts {
+            account_api_urls.insert(acc.id.clone(), acc.api_url.clone());
+            account_labels.insert(acc.id.clone(), crate::config::short_instance_label(&acc.api_url));
+        }
+        account_api_urls
+            .entry(active_account_id.clone())
+            .or_insert_with(|| initial_api.clone());
+        account_labels
+            .entry(active_account_id.clone())
+            .or_insert_with(|| crate::config::short_instance_label(&initial_api));
 
         let mut state = Self {
             config,
@@ -217,9 +264,14 @@ impl AppState {
             pending_attachments: Vec::new(),
 
             show_member_rail: true,
+            member_rail_explicitly_toggled: false,
+            left_sidebar_width,
             show_command_palette: false,
             command_palette_query: String::new(),
             command_palette_selected: 0,
+
+            show_settings_modal: false,
+            settings_selected_index: 0,
 
             show_login_modal: show_login,
             is_demo_mode: false,
@@ -230,8 +282,21 @@ impl AppState {
             login_password_input: String::new(),
             login_totp_input: String::new(),
             login_token_input: String::new(),
+            login_api_input: initial_api,
+            login_add_account: has_token,
             login_error: None,
             login_loading: false,
+
+            active_account_id,
+            account_api_urls,
+            account_labels,
+            account_users: HashMap::new(),
+            account_autumn_urls: HashMap::new(),
+            account_livekit: HashMap::new(),
+            account_gateway_statuses: HashMap::new(),
+            server_accounts: HashMap::new(),
+            channel_accounts: HashMap::new(),
+            user_accounts: HashMap::new(),
 
             gateway_status: if show_login {
                 GatewayStatus::Disconnected("Not logged in".to_string())
@@ -243,6 +308,7 @@ impl AppState {
             } else {
                 Some(("Connecting...".to_string(), Utc::now()))
             },
+            cached_ws_url: None,
 
             current_user: None,
             users: HashMap::new(),
@@ -251,17 +317,22 @@ impl AppState {
             server_channels: HashMap::new(),
             dms: Vec::new(),
             members: HashMap::new(),
+            user_profiles: HashMap::new(),
             messages: HashMap::new(),
             unread_counts: HashMap::new(),
             active_call: None,
             call_fullscreen: false,
             voice_channel_participants: HashMap::new(),
+            livekit_node_name: None,
+            livekit_url: None,
+            call_fallback_names: HashMap::new(),
             pending_user_fetches: Arc::new(Mutex::new(HashSet::new())),
             user_fetch_tx: None,
 
             autumn_url: "https://cdn.stoatusercontent.com".to_string(),
             image_cache: None,
             image_fetch_tx: None,
+            deferred_image_renders: Vec::new(),
 
             rect_rail: Rect::default(),
             rect_server_items: Vec::new(),
@@ -294,17 +365,299 @@ impl AppState {
         self.status_message = Some((text.into(), Utc::now()));
     }
 
-    /// Resolve a user from the cache, or dispatch a non-blocking background fetch if missing.
-    pub fn resolve_user(&self, user_id: &str) -> Option<&User> {
+    pub fn resolve_call_participant_name(&self, user_id: &str) -> String {
+        if let Some(u) = self.users.get(user_id) {
+            return u.name().to_string();
+        }
+        if let Some(fb) = self.call_fallback_names.get(user_id) {
+            let trimmed = fb.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        user_id.chars().take(6).collect()
+    }
+
+    pub fn current_accent_preset_index(&self) -> usize {
+        crate::config::ACCENT_PRESETS
+            .iter()
+            .position(|(_, hex)| hex.eq_ignore_ascii_case(&self.config.theme.primary))
+            .unwrap_or(0)
+    }
+
+    pub fn set_accent_preset(&mut self, index: usize) {
+        let len = crate::config::ACCENT_PRESETS.len();
+        if len == 0 {
+            return;
+        }
+        let (_, hex) = crate::config::ACCENT_PRESETS[index % len];
+        self.config.theme.primary = hex.to_string();
+        self.theme = Theme::from_config(&self.config.theme);
+    }
+
+    /// Hydrate server/DM navigation lists and last active channel from disk cache for Frame 1 paint.
+    pub fn hydrate_nav_cache(&mut self, cache: crate::config::NavCache) {
+        if cache.api_url != self.config.api_url {
+            return;
+        }
+        if let Some(ws) = cache.ws_url {
+            if !ws.trim().is_empty() {
+                self.cached_ws_url = Some(ws);
+            }
+        }
+        if let Some(autumn) = cache.autumn_url {
+            if !autumn.trim().is_empty() {
+                self.autumn_url = autumn;
+            }
+        }
+
+        self.users.clear();
+        for u in cache.users {
+            self.users.insert(u.id.clone(), u);
+        }
+        self.user_accounts = cache.user_accounts;
+
+        self.servers = cache.servers;
+        self.server_accounts = cache.server_accounts;
+        self.channels.clear();
+        self.server_channels.clear();
+        for ch in cache.channels {
+            if let Some(ref sid) = ch.server {
+                if !sid.trim().is_empty() {
+                    self.server_channels.entry(sid.clone()).or_default().push(ch.id.clone());
+                }
+            }
+            self.channels.insert(ch.id.clone(), ch);
+        }
+        self.channel_accounts = cache.channel_accounts;
+        for s in &self.servers {
+            let entry = self.server_channels.entry(s.id.clone()).or_default();
+            for cid in &s.channels {
+                if !entry.contains(cid) {
+                    entry.push(cid.clone());
+                }
+            }
+        }
+        self.dms = cache.dms;
+        for dm in &self.dms {
+            self.channels.entry(dm.id.clone()).or_insert_with(|| dm.clone());
+        }
+
+        // Restore last active rail & channel immediately for frame 1 header/sidebar
+        if self.config.last_in_dm {
+            self.active_rail = ActiveRail::DirectMessages;
+            self.active_server_id = None;
+            self.selected_server_index = 0;
+            if let Some(ref lcid) = self.config.last_channel_id {
+                if self.channels.contains_key(lcid) {
+                    self.active_channel_id = Some(lcid.clone());
+                }
+            }
+            if self.active_channel_id.is_none() {
+                self.active_channel_id = self.dms.first().map(|d| d.id.clone());
+            }
+        } else if let Some(ref saved_sid) = self.config.last_server_id {
+            if let Some(pos) = self.servers.iter().position(|s| &s.id == saved_sid) {
+                self.active_rail = ActiveRail::Server(saved_sid.clone());
+                self.active_server_id = Some(saved_sid.clone());
+                self.selected_server_index = pos + 1;
+                if let Some(ref lcid) = self.config.last_channel_id {
+                    if self.channels.contains_key(lcid) {
+                        self.active_channel_id = Some(lcid.clone());
+                    }
+                }
+                if self.active_channel_id.is_none() {
+                    if let Some(cids) = self.server_channels.get(saved_sid) {
+                        self.active_channel_id = cids
+                            .iter()
+                            .find(|cid| {
+                                self.channels
+                                    .get(*cid)
+                                    .map(|c| c.channel_type == "TextChannel")
+                                    .unwrap_or(false)
+                            })
+                            .or_else(|| cids.first())
+                            .cloned();
+                    }
+                }
+            }
+        }
+
+        if self.active_channel_id.is_none() {
+            if let Some(first_srv) = self.servers.first() {
+                let sid = first_srv.id.clone();
+                self.active_rail = ActiveRail::Server(sid.clone());
+                self.active_server_id = Some(sid.clone());
+                self.selected_server_index = 1;
+                if let Some(cids) = self.server_channels.get(&sid) {
+                    self.active_channel_id = cids.first().cloned();
+                }
+            } else if let Some(first_dm) = self.dms.first() {
+                self.active_rail = ActiveRail::DirectMessages;
+                self.active_server_id = None;
+                self.selected_server_index = 0;
+                self.active_channel_id = Some(first_dm.id.clone());
+            }
+        }
+    }
+
+    /// Build a compact `NavCache` snapshot (omitting bulky role/message maps).
+    pub fn build_nav_cache(&self) -> crate::config::NavCache {
+        let mut servers = Vec::with_capacity(self.servers.len());
+        for s in &self.servers {
+            let mut compact = s.clone();
+            compact.roles = None;
+            servers.push(compact);
+        }
+        let channels: Vec<Channel> = self
+            .channels
+            .values()
+            .filter(|c| c.server.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false))
+            .cloned()
+            .collect();
+
+        let mut dm_user_ids = HashSet::new();
+        for dm in &self.dms {
+            if let Some(ref recs) = dm.recipients {
+                for r in recs {
+                    dm_user_ids.insert(r.clone());
+                }
+            }
+        }
+        if let Some(ref me) = self.current_user {
+            dm_user_ids.insert(me.id.clone());
+        }
+        let users: Vec<User> = dm_user_ids
+            .iter()
+            .filter_map(|uid| self.users.get(uid).cloned())
+            .collect();
+
+        crate::config::NavCache {
+            api_url: self.config.api_url.clone(),
+            ws_url: self.cached_ws_url.clone(),
+            autumn_url: Some(self.autumn_url.clone()),
+            servers,
+            channels,
+            dms: self.dms.clone(),
+            users,
+            server_accounts: self.server_accounts.clone(),
+            channel_accounts: self.channel_accounts.clone(),
+            user_accounts: self.user_accounts.clone(),
+        }
+    }
+
+    pub fn account_for_channel(&self, channel_id: &str) -> &str {
+        self.channel_accounts
+            .get(channel_id)
+            .map(String::as_str)
+            .unwrap_or(self.active_account_id.as_str())
+    }
+
+    pub fn account_for_server(&self, server_id: &str) -> &str {
+        self.server_accounts
+            .get(server_id)
+            .map(String::as_str)
+            .unwrap_or(self.active_account_id.as_str())
+    }
+
+    pub fn account_for_user(&self, user_id: &str) -> &str {
+        self.user_accounts
+            .get(user_id)
+            .map(String::as_str)
+            .unwrap_or(self.active_account_id.as_str())
+    }
+
+    pub fn account_for_active_channel(&self) -> &str {
+        if let Some(ref cid) = self.active_channel_id {
+            self.account_for_channel(cid)
+        } else if let Some(ref sid) = self.active_server_id {
+            self.account_for_server(sid)
+        } else {
+            self.active_account_id.as_str()
+        }
+    }
+
+    pub fn instance_tag_for_account(&self, account_id: &str) -> Option<&str> {
+        self.account_labels
+            .get(account_id)
+            .and_then(|opt| opt.as_deref())
+    }
+
+    pub fn autumn_url_for_account(&self, account_id: &str) -> &str {
+        self.account_autumn_urls
+            .get(account_id)
+            .map(String::as_str)
+            .unwrap_or(self.autumn_url.as_str())
+    }
+
+    pub fn api_url_for_account(&self, account_id: &str) -> &str {
+        self.account_api_urls
+            .get(account_id)
+            .map(String::as_str)
+            .unwrap_or(self.config.api_url.as_str())
+    }
+
+    pub fn current_user_for_account(&self, account_id: &str) -> Option<&User> {
+        self.account_users
+            .get(account_id)
+            .or(self.current_user.as_ref())
+    }
+
+    pub fn purge_account_items(&mut self, account_id: &str) {
+        let active_acc = &self.active_account_id;
+        let server_accounts = &self.server_accounts;
+        let channel_accounts = &self.channel_accounts;
+
+        let old_server_ids: Vec<String> = self
+            .servers
+            .iter()
+            .filter(|s| {
+                server_accounts
+                    .get(&s.id)
+                    .map(String::as_str)
+                    .unwrap_or(active_acc.as_str())
+                    == account_id
+            })
+            .map(|s| s.id.clone())
+            .collect();
+
+        self.servers.retain(|s| {
+            server_accounts
+                .get(&s.id)
+                .map(String::as_str)
+                .unwrap_or(active_acc.as_str())
+                != account_id
+        });
+        for sid in old_server_ids {
+            self.server_channels.remove(&sid);
+            self.members.remove(&sid);
+        }
+        self.dms.retain(|d| {
+            channel_accounts
+                .get(&d.id)
+                .map(String::as_str)
+                .unwrap_or(active_acc.as_str())
+                != account_id
+        });
+        self.channels.retain(|cid, _| {
+            channel_accounts
+                .get(cid)
+                .map(String::as_str)
+                .unwrap_or(active_acc.as_str())
+                != account_id
+        });
+    }
+
+    /// Resolve a user from the cache, or dispatch a non-blocking background fetch on a specific account.
+    pub fn resolve_user_in_account(&self, account_id: &str, user_id: &str) -> Option<&User> {
         if let Some(user) = self.users.get(user_id) {
             return Some(user);
         }
 
-        // Trigger background fetch if not already in-flight
         if let Ok(mut pending) = self.pending_user_fetches.lock() {
             if pending.insert(user_id.to_string()) {
                 if let Some(ref tx) = self.user_fetch_tx {
-                    let _ = tx.send(user_id.to_string());
+                    let _ = tx.send((account_id.to_string(), user_id.to_string()));
                 }
             }
         }
@@ -312,15 +665,21 @@ impl AppState {
         None
     }
 
+    /// Resolve a user from the cache, or dispatch a non-blocking background fetch if missing.
+    pub fn resolve_user(&self, user_id: &str) -> Option<&User> {
+        let acc = self.account_for_user(user_id);
+        self.resolve_user_in_account(acc, user_id)
+    }
+
     /// Clear all mock demo data (servers, channels, mock messages, demo users) on real authentication
     pub fn clear_mock_data(&mut self) {
         self.is_demo_mode = false;
         self.servers.retain(|s| s.id != "srv_stoat" && s.id != "srv_rust");
-        self.channels.retain(|id, _| !id.starts_with("ch_stoat_") && !id.starts_with("ch_rust_") && !id.starts_with("dm_"));
+        self.channels.retain(|id, _| !id.starts_with("ch_stoat_") && !id.starts_with("ch_rust_") && id != "dm_alice" && id != "dm_bob");
         self.server_channels.retain(|sid, _| sid != "srv_stoat" && sid != "srv_rust");
-        self.messages.retain(|cid, _| !cid.starts_with("ch_stoat_") && !cid.starts_with("ch_rust_") && !cid.starts_with("dm_"));
+        self.messages.retain(|cid, _| !cid.starts_with("ch_stoat_") && !cid.starts_with("ch_rust_") && cid != "dm_alice" && cid != "dm_bob");
         self.members.retain(|sid, _| sid != "srv_stoat" && sid != "srv_rust");
-        self.dms.retain(|ch| !ch.id.starts_with("dm_"));
+        self.dms.retain(|ch| ch.id != "dm_alice" && ch.id != "dm_bob");
         self.unread_counts.retain(|cid, _| !cid.starts_with("ch_stoat_") && !cid.starts_with("ch_rust_"));
         self.users.retain(|uid, _| uid != "user_me" && uid != "user_alice" && uid != "user_bob" && uid != "user_charlie" && uid != "user_dana" && uid != "user_eve");
         if let Some(ref sid) = self.active_server_id {
@@ -329,6 +688,44 @@ impl AppState {
                 self.active_channel_id = None;
             }
         }
+    }
+
+    pub fn next_nonce(&self) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NONCE_SEQ: AtomicU64 = AtomicU64::new(1);
+        let seq = NONCE_SEQ.fetch_add(1, Ordering::Relaxed);
+        format!("stoat_tui_{}_{}", Utc::now().timestamp_millis(), seq)
+    }
+
+    /// Upserts a message into `self.messages[channel_id]`, deduplicating by canonical `_id` and client `nonce`.
+    pub fn upsert_message(&mut self, channel_id: &str, msg: Message) {
+        let list = self.messages.entry(channel_id.to_string()).or_default();
+
+        if !msg.id.is_empty() {
+            if let Some(pos) = list.iter().position(|m| m.id == msg.id) {
+                let prev_nonce = list[pos].nonce.clone();
+                list[pos] = msg;
+                if list[pos].nonce.is_none() {
+                    list[pos].nonce = prev_nonce;
+                }
+                return;
+            }
+        }
+
+        if let Some(ref n) = msg.nonce {
+            if !n.is_empty() {
+                let opt_id = format!("optimistic:{}", n);
+                if let Some(pos) = list
+                    .iter()
+                    .position(|m| m.nonce.as_deref() == Some(n.as_str()) || m.id == opt_id)
+                {
+                    list[pos] = msg;
+                    return;
+                }
+            }
+        }
+
+        list.push(msg);
     }
 
     pub fn active_channel(&self) -> Option<&Channel> {
@@ -821,15 +1218,33 @@ impl AppState {
     }
 
     pub fn avatar_url_for_user(&self, user: &User) -> String {
+        let acc = self.account_for_user(&user.id);
+        let autumn = self.autumn_url_for_account(acc).trim_end_matches('/');
         if let Some(ref av) = user.avatar {
-            format!("{}/avatars/{}?max_side=128", self.autumn_url.trim_end_matches('/'), av.id)
-        } else {
-            format!("{}/users/{}/default_avatar", self.config.api_url.trim_end_matches('/'), user.id)
+            if !av.id.is_empty() {
+                return format!("{}/avatars/{}?max_side=128", autumn, av.id);
+            }
         }
+        let api = self.api_url_for_account(acc).trim_end_matches('/');
+        format!("{}/users/{}/default_avatar", api, user.id)
+    }
+
+    pub fn server_icon_url(&self, server: &Server) -> Option<String> {
+        let acc = self.account_for_server(&server.id);
+        let autumn = self.autumn_url_for_account(acc).trim_end_matches('/');
+        server.icon.as_ref().and_then(|ic| {
+            if ic.id.is_empty() {
+                None
+            } else {
+                Some(format!("{}/icons/{}?max_side=128", autumn, ic.id))
+            }
+        })
     }
 
     pub fn attachment_image_url(&self, file_id: &str) -> String {
-        format!("{}/attachments/{}?max_side=800", self.autumn_url.trim_end_matches('/'), file_id)
+        let acc = self.account_for_active_channel();
+        let autumn = self.autumn_url_for_account(acc).trim_end_matches('/');
+        format!("{}/attachments/{}?max_side=800", autumn, file_id)
     }
 
     pub fn request_image(&mut self, key: String, url: String) {
@@ -840,6 +1255,21 @@ impl AppState {
                     let _ = tx.send((key, url));
                 }
             }
+        }
+    }
+
+    pub fn request_user_avatar(&mut self, user_id: &str) {
+        let key = format!("avatar_{}", user_id);
+        self.request_user_avatar_with_key(user_id, &key);
+    }
+
+    pub fn request_user_avatar_with_key(&mut self, user_id: &str, key: &str) {
+        if let Some(user) = self.users.get(user_id).cloned() {
+            let url = self.avatar_url_for_user(&user);
+            self.request_image(key.to_string(), url);
+        } else {
+            // Trigger user fetch so we know whether the user has a custom Autumn avatar
+            let _ = self.resolve_user(user_id);
         }
     }
 }

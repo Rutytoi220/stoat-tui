@@ -3,16 +3,16 @@ use crossterm::{
     cursor::Show,
     event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode, window_size, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::env;
-use std::io::{self, stdout};
-use std::time::Duration;
+use std::io::{self, stdout, IsTerminal};
+use std::time::{Duration, Instant};
 use stoat_tui::app::App;
-use stoat_tui::config::Config;
-use stoat_tui::event::EventHandler;
+use stoat_tui::config::{Config, NavCache};
+use stoat_tui::event::{AppEvent, EventHandler};
 use stoat_tui::ui;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -64,8 +64,48 @@ fn print_version() {
     println!("stoat-tui {}", VERSION);
 }
 
+fn detect_picker_fast() -> (std::sync::Arc<ratatui_image::picker::Picker>, bool) {
+    use ratatui_image::picker::{Picker, ProtocolType};
+
+    // Query cell pixel dimensions via pure TIOCGWINSZ ioctl (~10us, never blocks on stdin)
+    let font_size = match window_size() {
+        Ok(ws) if ws.columns > 0 && ws.rows > 0 && ws.width > 0 && ws.height > 0 => {
+            let cw = (ws.width / ws.columns).clamp(4, 64);
+            let ch = (ws.height / ws.rows).clamp(8, 128);
+            (cw, ch)
+        }
+        _ => (10, 20),
+    };
+
+    #[allow(deprecated)]
+    let mut picker = Picker::from_fontsize(font_size.into());
+
+    let term = env::var("TERM").unwrap_or_default().to_ascii_lowercase();
+    let term_program = env::var("TERM_PROGRAM").unwrap_or_default().to_ascii_lowercase();
+    let has_kitty_id = env::var("KITTY_WINDOW_ID").map(|v| !v.trim().is_empty()).unwrap_or(false);
+    let has_wezterm = env::var("WEZTERM_EXECUTABLE").map(|v| !v.trim().is_empty()).unwrap_or(false);
+
+    if has_kitty_id
+        || term.contains("kitty")
+        || term.contains("ghostty")
+        || term_program.contains("ghostty")
+    {
+        picker.set_protocol_type(ProtocolType::Kitty);
+        return (std::sync::Arc::new(picker), true);
+    }
+
+    if has_wezterm || term_program.contains("wezterm") || term_program.contains("iterm") {
+        picker.set_protocol_type(ProtocolType::Iterm2);
+        return (std::sync::Arc::new(picker), true);
+    }
+
+    // Immediate non-blocking fallback before optional background stdio check
+    (std::sync::Arc::new(picker), false)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let launch_start = Instant::now();
     // 0. Parse command-line arguments
     let args: Vec<String> = env::args().skip(1).collect();
     let mut override_api: Option<String> = None;
@@ -127,18 +167,22 @@ async fn main() -> Result<()> {
         default_panic(info);
     }));
 
-    // 3. Terminal graphics protocol detection before entering alternate screen
-    let picker = ratatui_image::picker::Picker::from_query_stdio()
-        .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
-    let picker = std::sync::Arc::new(picker);
-    stoat_tui::log_info!(
-        "Terminal graphics protocol: {:?} (font size: {}x{})",
-        picker.protocol_type(),
-        picker.font_size().width,
-        picker.font_size().height
-    );
+    // 3. Load configuration and lightweight navigation cache synchronously (<1ms)
+    let mut config = Config::load().unwrap_or_default();
+    if let Some(api) = override_api {
+        config.api_url = api;
+    }
+    let has_token = config.token.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false);
+    let nav_cache = if has_token {
+        NavCache::load_from(&config.nav_cache_path())
+    } else {
+        None
+    };
 
-    // 4. Initialize terminal in raw mode with alternate screen, mouse capture, and bracketed paste
+    // 4. Instant graphics protocol fast-path (zero stdio blocking)
+    let (picker, env_matched_graphics) = detect_picker_fast();
+
+    // 5. Initialize terminal in raw mode with alternate screen, mouse capture, and bracketed paste
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(
@@ -150,28 +194,53 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // 5. Load configuration (and apply CLI overrides)
-    let mut config = Config::load().unwrap_or_default();
-    if let Some(api) = override_api {
-        config.api_url = api;
+    // 6. Initialize deferred event handler + App state hydrated from disk cache
+    let mut event_handler = EventHandler::new_deferred(Duration::from_millis(30));
+    let tx = event_handler.sender();
+    let mut app = App::new(config, tx.clone(), picker.clone());
+    if let Some(cache) = nav_cache {
+        app.state.hydrate_nav_cache(cache);
     }
-    stoat_tui::log_info!("Loaded config: API={}, HasToken={}", config.api_url, config.token.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false));
 
-    // 6. Initialize event stream (30ms tick rate for responsive 30+ FPS UI updates)
-    let mut event_handler = EventHandler::new(Duration::from_millis(30));
+    // 7. Paint Frame 1 IMMEDIATELY before any network I/O or stdio queries!
+    terminal.draw(|f| ui::render(f, &mut app.state))?;
+    let first_frame_ms = launch_start.elapsed().as_secs_f64() * 1000.0;
+    stoat_tui::log_info!(
+        "First frame painted in {:.2}ms (protocol={:?}, font={}x{}, env_fast_path={})",
+        first_frame_ms,
+        picker.protocol_type(),
+        picker.font_size().width,
+        picker.font_size().height,
+        env_matched_graphics
+    );
 
-    // 7. Initialize application & run startup authentication verification
-    let mut app = App::new(config, event_handler.sender(), picker);
+    // 8. Start input stream & optional background stdio probe (after Frame 1)
+    if env_matched_graphics || !io::stdin().is_terminal() {
+        EventHandler::spawn_stdin_reader(tx.clone());
+    } else {
+        let probe_tx = tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut opts = ratatui_image::picker::cap_parser::QueryStdioOptions::default();
+            opts.timeout = Duration::from_millis(80);
+            if let Ok(probed) = ratatui_image::picker::Picker::from_query_stdio_with_options(opts) {
+                let _ = probe_tx.blocking_send(AppEvent::PickerResolved(std::sync::Arc::new(probed)));
+            }
+            EventHandler::spawn_stdin_reader(probe_tx);
+        });
+    }
+
+    // 9. Spawn concurrent network startup tasks AFTER Frame 1 is on screen
     app.startup();
 
-    // 7. Main event loop
+    // 10. Main event loop
     while !app.state.should_quit {
-        terminal.draw(|f| ui::render(f, &mut app.state))?;
-
         tokio::select! {
             Some(event) = event_handler.rx.recv() => {
                 app.handle_event(event).await;
             }
+        }
+        if !app.state.should_quit {
+            terminal.draw(|f| ui::render(f, &mut app.state))?;
         }
     }
 
@@ -185,6 +254,9 @@ async fn main() -> Result<()> {
         Show
     )?;
     terminal.show_cursor()?;
+
+    // Gracefully leave any active voice call and close LiveKit room before exiting
+    app.shutdown().await;
 
     Ok(())
 }

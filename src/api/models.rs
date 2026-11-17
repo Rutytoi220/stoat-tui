@@ -15,6 +15,10 @@ pub struct ServerMetadata {
 pub struct ServerFeatures {
     #[serde(default)]
     pub autumn: Option<AutumnFeature>,
+    #[serde(default)]
+    pub livekit: Option<LivekitFeature>,
+    #[serde(default)]
+    pub voice: Option<LivekitFeature>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -23,6 +27,78 @@ pub struct AutumnFeature {
     pub enabled: bool,
     #[serde(default)]
     pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LivekitNode {
+    #[serde(default, alias = "id")]
+    pub name: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub lat: Option<f64>,
+    #[serde(default)]
+    pub lon: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LivekitFeature {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub nodes: Option<Vec<LivekitNode>>,
+}
+
+impl LivekitFeature {
+    /// Resolves `(node_name, url)` from `nodes` (falling back to `"worldwide"` and top-level `url`).
+    pub fn resolved_node(&self) -> (Option<String>, Option<String>) {
+        if let Some(ref nodes) = self.nodes {
+            if !nodes.is_empty() {
+                let preferred = nodes
+                    .iter()
+                    .find(|n| n.name.trim().eq_ignore_ascii_case("worldwide") && !n.url.trim().is_empty())
+                    .or_else(|| nodes.iter().find(|n| !n.url.trim().is_empty()))
+                    .or_else(|| nodes.first());
+
+                if let Some(node) = preferred {
+                    let name = if node.name.trim().is_empty() {
+                        Some("worldwide".to_string())
+                    } else {
+                        Some(node.name.trim().to_string())
+                    };
+                    let url = if node.url.trim().is_empty() {
+                        self.url
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|u| !u.is_empty())
+                            .map(str::to_string)
+                    } else {
+                        Some(node.url.trim().to_string())
+                    };
+                    return (name, url);
+                }
+            }
+        }
+
+        let top_url = self
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string);
+        let default_name = if self.enabled || top_url.is_some() || self.nodes.is_some() {
+            Some("worldwide".to_string())
+        } else {
+            None
+        };
+        (default_name, top_url)
+    }
+
+    pub fn resolved_url(&self) -> Option<String> {
+        self.resolved_node().1
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +240,7 @@ pub enum Presence {
     Focus,
     Busy,
     Invisible,
+    #[serde(other)]
     Offline,
 }
 
@@ -182,6 +259,7 @@ impl Presence {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BotInfo {
+    #[serde(default)]
     pub owner: String,
 }
 
@@ -197,10 +275,11 @@ pub struct FileMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileObject {
-    #[serde(rename = "_id")]
+    #[serde(rename = "_id", default)]
     pub id: String,
     #[serde(default)]
     pub tag: Option<String>,
+    #[serde(default)]
     pub filename: Option<String>,
     #[serde(default)]
     pub metadata: Option<FileMetadata>,
@@ -208,7 +287,13 @@ pub struct FileObject {
     pub content_type: Option<String>,
     #[serde(default)]
     pub size: Option<u64>,
+    #[serde(default)]
+    pub deleted: Option<bool>,
+    #[serde(default)]
+    pub reported: Option<bool>,
 }
+
+pub type Attachment = FileObject;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Server {
@@ -295,6 +380,22 @@ impl Channel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServerMembersResponse {
+    #[serde(default)]
+    pub members: Vec<Member>,
+    #[serde(default)]
+    pub users: Vec<User>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UserProfile {
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub background: Option<FileObject>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MemberId {
     #[serde(default)]
     pub server: String,
@@ -338,6 +439,8 @@ pub struct Message {
     pub reactions: Option<HashMap<String, Vec<String>>>,
     #[serde(default)]
     pub masquerade: Option<Masquerade>,
+    #[serde(default)]
+    pub nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -355,6 +458,8 @@ pub struct SendMessagePayload {
     pub attachments: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replies: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
