@@ -3103,3 +3103,97 @@ async fn test_secondary_account_call_no_duplicate_local_participant() {
         stage_slice
     );
 }
+
+#[tokio::test]
+async fn test_secondary_account_custom_avatar_uses_instance_autumn_url() {
+    use stoat_tui::api::models::{FileObject, User};
+    use stoat_tui::api::DeltaClient;
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::state::AppState;
+    use stoat_tui::ui::images::ImageCache;
+
+    // 1. Relative "/autumn" resolves against self-hosted api_url origin
+    assert_eq!(
+        DeltaClient::resolve_autumn_url("https://alpha-node.example.ts.net/api", Some("/autumn")),
+        "https://alpha-node.example.ts.net/autumn"
+    );
+    assert_eq!(
+        DeltaClient::resolve_autumn_url("https://alpha-node.example.ts.net/api", None),
+        "https://alpha-node.example.ts.net/autumn"
+    );
+    assert_eq!(
+        DeltaClient::resolve_autumn_url("https://api.stoat.chat", None),
+        "https://cdn.stoatusercontent.com"
+    );
+
+    // 2. request_user_avatar_with_key_in_account uses alpha-node's autumn URL + avatar._id
+    let (cfg, _guard) = isolated_config(Some("tok_primary"));
+    let mut state = AppState::new(cfg);
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    state.image_cache = Some(ImageCache::new(picker));
+    let (img_tx, mut img_rx) = tokio::sync::mpsc::unbounded_channel();
+    state.image_fetch_tx = Some(img_tx);
+
+    state.autumn_url = "https://cdn.stoatusercontent.com".to_string();
+    state.account_api_urls.insert(
+        "alpha-node".to_string(),
+        "https://alpha-node.example.ts.net/api".to_string(),
+    );
+    state.account_autumn_urls.insert(
+        "alpha-node".to_string(),
+        "https://alpha-node.example.ts.net/autumn".to_string(),
+    );
+
+    let alpha_user = User {
+        id: "01ALPHA_USER".to_string(),
+        username: "rutytoi".to_string(),
+        avatar: Some(FileObject {
+            id: "01AVATAR_CUSTOM".to_string(),
+            tag: Some("avatars".to_string()),
+            filename: Some("pfp.png".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    state.users.insert(alpha_user.id.clone(), alpha_user.clone());
+
+    let key = state.avatar_cache_key("alpha-node", &alpha_user.id, "avatar");
+    assert_eq!(key, "avatar:alpha-node:01ALPHA_USER:01AVATAR_CUSTOM");
+
+    state.request_user_avatar_with_key_in_account("alpha-node", &alpha_user.id, &key);
+    let (fetched_key, fetched_url) = img_rx
+        .try_recv()
+        .expect("Should enqueue custom avatar fetch for alpha-node user");
+    assert_eq!(fetched_key, key);
+    assert_eq!(
+        fetched_url,
+        "https://alpha-node.example.ts.net/autumn/avatars/01AVATAR_CUSTOM?max_side=128"
+    );
+    assert!(
+        !fetched_url.contains("stoatusercontent.com") && !fetched_url.contains("default_avatar"),
+        "Must not fall back to primary CDN or default_avatar: {}",
+        fetched_url
+    );
+
+    // 3. Also verify AppEvent::AccountScoped(AutumnUrlResolved("/autumn")) resolves cleanly
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let (cfg2, _guard2) = isolated_config(Some("tok_p"));
+    let picker2 = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(cfg2, tx, picker2);
+    app.state.account_api_urls.insert(
+        "alpha-node".to_string(),
+        "https://alpha-node.example.ts.net/api".to_string(),
+    );
+    app.handle_event(AppEvent::AccountScoped {
+        account_id: "alpha-node".to_string(),
+        event: Box::new(AppEvent::AutumnUrlResolved(DeltaClient::resolve_autumn_url(
+            "https://alpha-node.example.ts.net/api",
+            Some("/autumn"),
+        ))),
+    })
+    .await;
+    assert_eq!(
+        app.state.autumn_url_for_account("alpha-node"),
+        "https://alpha-node.example.ts.net/autumn"
+    );
+}

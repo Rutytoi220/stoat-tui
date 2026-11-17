@@ -118,9 +118,10 @@ impl<'a> Widget for MemberRail<'a> {
                             crate::ui::put_cell(buf, content_rect, start_x + 2, cur_y, c1, ratatui::style::Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
                             crate::ui::put_cell(buf, content_rect, start_x + 3, cur_y, c2, ratatui::style::Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
 
-                            let key = format!("avatar_{}", uid);
-                            self.state.deferred_image_renders.push((pfp_rect, key));
-                            self.state.request_user_avatar(&uid);
+                            let acc_id = self.state.account_for_user(&uid).to_string();
+                            let key = self.state.avatar_cache_key(&acc_id, &uid, "avatar");
+                            self.state.deferred_image_renders.push((pfp_rect, key.clone()));
+                            self.state.request_user_avatar_with_key_in_account(&acc_id, &uid, &key);
 
                             crate::ui::write_str(buf, content_rect, start_x + 5, cur_y, name, ratatui::style::Style::default().fg(theme.text));
                         } else {
@@ -201,9 +202,10 @@ impl<'a> Widget for MemberRail<'a> {
                             crate::ui::put_cell(buf, content_rect, mid_x, mid_y, c1, ratatui::style::Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
                             crate::ui::put_cell(buf, content_rect, mid_x + 1, mid_y, c2, ratatui::style::Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
 
-                            let key = format!("avatar_large_{}", uid);
+                            let acc_id = self.state.account_for_user(&uid).to_string();
+                            let key = self.state.avatar_cache_key(&acc_id, &uid, "avatar_large");
                             self.state.deferred_image_renders.push((pfp_rect, key.clone()));
-                            self.state.request_user_avatar_with_key(&uid, &key);
+                            self.state.request_user_avatar_with_key_in_account(&acc_id, &uid, &key);
 
                             cur_y += pfp_h + 1;
                         }
@@ -336,9 +338,10 @@ impl<'a> Widget for MemberRail<'a> {
                     crate::ui::put_cell(buf, content_rect, start_x + 2, cur_y, c1, ratatui::style::Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
                     crate::ui::put_cell(buf, content_rect, start_x + 3, cur_y, c2, ratatui::style::Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
 
-                    let key = format!("avatar_{}", m.id.user);
-                    self.state.deferred_image_renders.push((pfp_rect, key));
-                    self.state.request_user_avatar(&m.id.user);
+                    let acc_id = self.state.account_for_user(&m.id.user).to_string();
+                    let key = self.state.avatar_cache_key(&acc_id, &m.id.user, "avatar");
+                    self.state.deferred_image_renders.push((pfp_rect, key.clone()));
+                    self.state.request_user_avatar_with_key_in_account(&acc_id, &m.id.user, &key);
 
                     crate::ui::write_str(buf, content_rect, start_x + 5, cur_y, &name, ratatui::style::Style::default().fg(name_color));
                 } else {
@@ -393,9 +396,10 @@ impl<'a> Widget for MemberRail<'a> {
                     crate::ui::put_cell(buf, content_rect, start_x + 2, cur_y, c1, ratatui::style::Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
                     crate::ui::put_cell(buf, content_rect, start_x + 3, cur_y, c2, ratatui::style::Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
 
-                    let key = format!("avatar_{}", m.id.user);
-                    self.state.deferred_image_renders.push((pfp_rect, key));
-                    self.state.request_user_avatar(&m.id.user);
+                    let acc_id = self.state.account_for_user(&m.id.user).to_string();
+                    let key = self.state.avatar_cache_key(&acc_id, &m.id.user, "avatar");
+                    self.state.deferred_image_renders.push((pfp_rect, key.clone()));
+                    self.state.request_user_avatar_with_key_in_account(&acc_id, &m.id.user, &key);
 
                     crate::ui::write_str(buf, content_rect, start_x + 5, cur_y, &name, ratatui::style::Style::default().fg(theme.muted));
                 } else {

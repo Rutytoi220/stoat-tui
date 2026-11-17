@@ -591,11 +591,19 @@ impl AppState {
             .and_then(|opt| opt.as_deref())
     }
 
-    pub fn autumn_url_for_account(&self, account_id: &str) -> &str {
-        self.account_autumn_urls
-            .get(account_id)
-            .map(String::as_str)
-            .unwrap_or(self.autumn_url.as_str())
+    pub fn autumn_url_for_account(&self, account_id: &str) -> String {
+        if let Some(u) = self.account_autumn_urls.get(account_id) {
+            if !u.trim().is_empty() {
+                return u.clone();
+            }
+        }
+        if let Some(api_url) = self.account_api_urls.get(account_id) {
+            let host = crate::config::instance_host(api_url);
+            if !host.is_empty() && host != "api.stoat.chat" && host != "api.revolt.chat" {
+                return crate::api::DeltaClient::resolve_autumn_url(api_url, None);
+            }
+        }
+        self.autumn_url.clone()
     }
 
     pub fn api_url_for_account(&self, account_id: &str) -> &str {
@@ -1225,21 +1233,45 @@ impl AppState {
         self.gateway_status = GatewayStatus::Connected { latency_ms: 18 };
     }
 
-    pub fn avatar_url_for_user(&self, user: &User) -> String {
-        let acc = self.account_for_user(&user.id);
-        let autumn = self.autumn_url_for_account(acc).trim_end_matches('/');
+    pub fn avatar_url_for_user_in_account(&self, account_id: &str, user: &User) -> String {
+        let autumn_binding = self.autumn_url_for_account(account_id);
+        let autumn = autumn_binding.trim_end_matches('/');
         if let Some(ref av) = user.avatar {
             if !av.id.is_empty() {
                 return format!("{}/avatars/{}?max_side=128", autumn, av.id);
             }
         }
-        let api = self.api_url_for_account(acc).trim_end_matches('/');
+        let api = self.api_url_for_account(account_id).trim_end_matches('/');
         format!("{}/users/{}/default_avatar", api, user.id)
+    }
+
+    pub fn avatar_url_for_user(&self, user: &User) -> String {
+        let acc = self.account_for_user(&user.id).to_string();
+        self.avatar_url_for_user_in_account(&acc, user)
+    }
+
+    /// Returns an `ImageCache` key containing `account_id`, `user_id`, and `avatar._id`
+    /// (or `"default"`) so a cached default avatar never shadows a real uploaded PFP.
+    pub fn avatar_cache_key(&self, account_id: &str, user_id: &str, prefix: &str) -> String {
+        let acc = if account_id.is_empty() {
+            self.account_for_user(user_id)
+        } else {
+            account_id
+        };
+        let av_part = self
+            .users
+            .get(user_id)
+            .and_then(|u| u.avatar.as_ref())
+            .map(|av| av.id.trim())
+            .filter(|id| !id.is_empty())
+            .unwrap_or("default");
+        format!("{}:{}:{}:{}", prefix, acc, user_id, av_part)
     }
 
     pub fn server_icon_url(&self, server: &Server) -> Option<String> {
         let acc = self.account_for_server(&server.id);
-        let autumn = self.autumn_url_for_account(acc).trim_end_matches('/');
+        let autumn_binding = self.autumn_url_for_account(acc);
+        let autumn = autumn_binding.trim_end_matches('/');
         server.icon.as_ref().and_then(|ic| {
             if ic.id.is_empty() {
                 None
@@ -1251,7 +1283,8 @@ impl AppState {
 
     pub fn attachment_image_url(&self, file_id: &str) -> String {
         let acc = self.account_for_active_channel();
-        let autumn = self.autumn_url_for_account(acc).trim_end_matches('/');
+        let autumn_binding = self.autumn_url_for_account(acc);
+        let autumn = autumn_binding.trim_end_matches('/');
         format!("{}/attachments/{}?max_side=800", autumn, file_id)
     }
 
@@ -1267,18 +1300,14 @@ impl AppState {
     }
 
     pub fn request_user_avatar(&mut self, user_id: &str) {
-        let key = format!("avatar_{}", user_id);
-        self.request_user_avatar_with_key(user_id, &key);
+        let acc = self.account_for_user(user_id).to_string();
+        let key = self.avatar_cache_key(&acc, user_id, "avatar");
+        self.request_user_avatar_with_key_in_account(&acc, user_id, &key);
     }
 
     pub fn request_user_avatar_with_key(&mut self, user_id: &str, key: &str) {
-        if let Some(user) = self.users.get(user_id).cloned() {
-            let url = self.avatar_url_for_user(&user);
-            self.request_image(key.to_string(), url);
-        } else {
-            // Trigger user fetch so we know whether the user has a custom Autumn avatar
-            let _ = self.resolve_user(user_id);
-        }
+        let acc = self.account_for_user(user_id).to_string();
+        self.request_user_avatar_with_key_in_account(&acc, user_id, key);
     }
 
     pub fn request_user_avatar_with_key_in_account(
@@ -1287,16 +1316,19 @@ impl AppState {
         user_id: &str,
         key: &str,
     ) {
-        if !account_id.is_empty() {
+        let eff_acc = if account_id.is_empty() {
+            self.account_for_user(user_id).to_string()
+        } else {
             self.user_accounts
                 .entry(user_id.to_string())
                 .or_insert_with(|| account_id.to_string());
-        }
+            account_id.to_string()
+        };
         if let Some(user) = self.users.get(user_id).cloned() {
-            let url = self.avatar_url_for_user(&user);
+            let url = self.avatar_url_for_user_in_account(&eff_acc, &user);
             self.request_image(key.to_string(), url);
         } else {
-            let _ = self.resolve_user_in_account(account_id, user_id);
+            let _ = self.resolve_user_in_account(&eff_acc, user_id);
         }
     }
 }

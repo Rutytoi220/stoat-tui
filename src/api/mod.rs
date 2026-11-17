@@ -46,6 +46,48 @@ impl DeltaClient {
             .unwrap_or(false)
     }
 
+    pub fn api_url(&self) -> &str {
+        &self.api_url
+    }
+
+    /// Extracts `scheme://authority` origin from an HTTP(S) URL.
+    pub fn origin_from_url(raw_url: &str) -> Option<String> {
+        let trimmed = raw_url.trim();
+        let scheme_end = trimmed.find("://")?;
+        let scheme = &trimmed[..scheme_end];
+        let rest = &trimmed[scheme_end + 3..];
+        let authority = rest.split('/').next().unwrap_or(rest).trim();
+        if authority.is_empty() {
+            None
+        } else {
+            Some(format!("{}://{}", scheme, authority))
+        }
+    }
+
+    /// Resolves `features.autumn.url` (including relative paths like `"/autumn"`)
+    /// against an instance's `api_url` origin, falling back to `{origin}/autumn`
+    /// for self-hosted servers or `https://cdn.stoatusercontent.com` for primary Stoat.
+    pub fn resolve_autumn_url(api_url: &str, raw_autumn: Option<&str>) -> String {
+        let origin = Self::origin_from_url(api_url)
+            .unwrap_or_else(|| api_url.trim().trim_end_matches('/').to_string());
+        if let Some(raw) = raw_autumn.map(str::trim).filter(|s| !s.is_empty()) {
+            if raw.starts_with("http://") || raw.starts_with("https://") {
+                return raw.trim_end_matches('/').to_string();
+            }
+            let rel = raw.trim_start_matches('/').trim_end_matches('/');
+            if rel.is_empty() {
+                return origin;
+            }
+            return format!("{}/{}", origin, rel);
+        }
+        let host = crate::config::instance_host(api_url);
+        if host.is_empty() || host == "api.stoat.chat" || host == "api.revolt.chat" {
+            "https://cdn.stoatusercontent.com".to_string()
+        } else {
+            format!("{}/autumn", origin)
+        }
+    }
+
     /// Normalizes a user-entered server URL by trimming trailing `/` and prefixing `https://`
     /// (or `http://` for localhost / private LAN IPs) if no scheme was specified.
     pub fn normalize_url_str(raw_url: &str) -> String {
@@ -1029,9 +1071,16 @@ impl DeltaClient {
     }
 
     pub async fn fetch_bytes_with_status(&self, url: &str) -> Result<(reqwest::StatusCode, Vec<u8>)> {
-        let resp = self
-            .client
-            .get(url)
+        let mut req = self.client.get(url);
+        if let (Some(api_origin), Some(asset_origin)) = (
+            Self::origin_from_url(&self.api_url),
+            Self::origin_from_url(url),
+        ) {
+            if api_origin.eq_ignore_ascii_case(&asset_origin) {
+                req = req.headers(self.headers());
+            }
+        }
+        let resp = req
             .send()
             .await
             .with_context(|| format!("Failed to fetch asset from {}", url))?;

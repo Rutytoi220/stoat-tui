@@ -92,11 +92,36 @@ impl App {
         });
 
         let api_client_img = api_client.clone();
+        let account_clients_img = account_clients.clone();
         let event_tx_img = event_tx.clone();
         tokio::spawn(async move {
             let mut logged_fetches: usize = 0;
             while let Some((key, url)) = image_fetch_rx.recv().await {
-                let client = api_client_img.lock().await.clone();
+                let url_origin = DeltaClient::origin_from_url(&url);
+                let matched_client = account_clients_img.lock().ok().and_then(|map| {
+                    if let Some(ref uo) = url_origin {
+                        if let Some(c) = map.values().find(|c| {
+                            DeltaClient::origin_from_url(c.api_url())
+                                .map(|o| o.eq_ignore_ascii_case(uo))
+                                .unwrap_or(false)
+                        }) {
+                            return Some(c.clone());
+                        }
+                    }
+                    // Also check key format `<prefix>:<account_id>:<user_id>:<avatar_id>`
+                    let mut parts = key.split(':');
+                    let _prefix = parts.next();
+                    if let Some(acc_id) = parts.next() {
+                        if let Some(c) = map.get(acc_id) {
+                            return Some(c.clone());
+                        }
+                    }
+                    None
+                });
+                let client = match matched_client {
+                    Some(c) => c,
+                    None => api_client_img.lock().await.clone(),
+                };
                 let should_log = logged_fetches < 5;
                 if should_log {
                     logged_fetches += 1;
@@ -203,6 +228,10 @@ impl App {
             },
         );
         self.state.account_api_urls.insert(account_id.clone(), api_url.clone());
+        self.state.account_autumn_urls.insert(
+            account_id.clone(),
+            DeltaClient::resolve_autumn_url(&api_url, None),
+        );
         self.state
             .account_labels
             .insert(account_id.clone(), crate::config::short_instance_label(&api_url));
@@ -351,11 +380,10 @@ impl App {
                 }
             };
 
-            let resolved_autumn = autumn_url_opt
-                .as_deref()
-                .map(|u| u.trim().trim_end_matches('/').to_string())
-                .filter(|u| !u.is_empty())
-                .unwrap_or_else(|| "https://cdn.stoatusercontent.com".to_string());
+            let resolved_autumn = DeltaClient::resolve_autumn_url(
+                client_meta.api_url(),
+                autumn_url_opt.as_deref(),
+            );
             let _ = tx_meta
                 .send(AppEvent::AccountScoped {
                     account_id: acc_meta.clone(),
@@ -425,14 +453,12 @@ impl App {
                 let client = api_client.lock().await.clone();
                 match client.fetch_metadata().await {
                     Ok(meta) => {
-                        let autumn_url = meta
+                        let raw_autumn = meta
                             .features
                             .as_ref()
                             .and_then(|f| f.autumn.as_ref())
-                            .and_then(|a| a.url.as_deref())
-                            .map(|u| u.trim().trim_end_matches('/').to_string())
-                            .filter(|u| !u.is_empty())
-                            .unwrap_or_else(|| "https://cdn.stoatusercontent.com".to_string());
+                            .and_then(|a| a.url.as_deref());
+                        let autumn_url = DeltaClient::resolve_autumn_url(client.api_url(), raw_autumn);
                         let _ = event_tx
                             .send(AppEvent::AccountScoped {
                                 account_id: acc_id_spawn.clone(),

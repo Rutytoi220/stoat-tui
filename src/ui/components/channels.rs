@@ -259,9 +259,10 @@ impl<'a> Widget for ChannelsSidebar<'a> {
                             crate::ui::put_cell(buf, content_rect, start_x + 1, cur_y, c1, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
                             crate::ui::put_cell(buf, content_rect, start_x + 2, cur_y, c2, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
 
-                            let key = format!("avatar_{}", uid);
-                            self.state.deferred_image_renders.push((pfp_rect, key));
-                            self.state.request_user_avatar(&uid);
+                            let acc_id = self.state.account_for_user(&uid).to_string();
+                            let key = self.state.avatar_cache_key(&acc_id, &uid, "avatar");
+                            self.state.deferred_image_renders.push((pfp_rect, key.clone()));
+                            self.state.request_user_avatar_with_key_in_account(&acc_id, &uid, &key);
 
                             cx = start_x + 4;
                             avail_name_w = if unread > 0 { max_w.saturating_sub(8) } else { max_w.saturating_sub(4) };

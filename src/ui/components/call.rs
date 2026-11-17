@@ -714,7 +714,7 @@ impl<'a> Widget for CallStage<'a> {
                 );
 
                 if !card.user_id.is_empty() {
-                    let key = format!("avatar_card_{}", card.user_id);
+                    let key = self.state.avatar_cache_key(&call_account_id, &card.user_id, "avatar_card");
                     self.state.deferred_image_renders.push((pfp_rect, key.clone()));
                     self.state
                         .request_user_avatar_with_key_in_account(&call_account_id, &card.user_id, &key);

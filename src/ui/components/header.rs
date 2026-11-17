@@ -123,9 +123,10 @@ impl<'a> Widget for ContentHeader<'a> {
                 crate::ui::put_cell(buf, area, cur_x, cur_y, c1, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
                 crate::ui::put_cell(buf, area, cur_x + 1, cur_y, c2, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
 
-                let key = format!("avatar_{}", u.id);
-                self.state.deferred_image_renders.push((pfp_rect, key));
-                self.state.request_user_avatar(&u.id);
+                let acc_id = self.state.account_for_user(&u.id).to_string();
+                let key = self.state.avatar_cache_key(&acc_id, &u.id, "avatar");
+                self.state.deferred_image_renders.push((pfp_rect, key.clone()));
+                self.state.request_user_avatar_with_key_in_account(&acc_id, &u.id, &key);
 
                 cur_x += 3;
             }

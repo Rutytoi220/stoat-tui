@@ -456,9 +456,10 @@ impl<'a> Widget for ChatFeed<'a> {
                             crate::ui::put_cell(buf, area, area.left() + 1, screen_y, c1, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
                             crate::ui::put_cell(buf, area, area.left() + 2, screen_y, c2, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD));
 
-                            let key = format!("avatar_{}", author_id);
-                            self.state.deferred_image_renders.push((pfp_rect, key));
-                            self.state.request_user_avatar(author_id);
+                            let acc_id = self.state.account_for_user(author_id).to_string();
+                            let key = self.state.avatar_cache_key(&acc_id, author_id, "avatar");
+                            self.state.deferred_image_renders.push((pfp_rect, key.clone()));
+                            self.state.request_user_avatar_with_key_in_account(&acc_id, author_id, &key);
 
                             let header_line = Line::from(spans.clone());
                             buf.set_line(area.left() + 4, screen_y, &header_line, area.width.saturating_sub(5));
