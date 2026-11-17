@@ -28,10 +28,15 @@ pub enum AppEvent {
     StartGateway { token: String, gateway_url: Option<String> },
     VideoFrameReady,
     ScreenShareFailed { channel_id: String, error: String },
+    ScreenShareCancelled { channel_id: String },
+    ScreenShareSelectTarget {
+        channel_id: String,
+        targets: Vec<crate::voice::screen::ScreenShareTarget>,
+    },
     CallConnected { channel_id: String },
     CallFailed { channel_id: String, error: String },
     CallDisconnected { channel_id: String, reason: String },
-    CallParticipantJoined { channel_id: String, user_id: String },
+    CallParticipantJoined { channel_id: String, user_id: String, is_local: bool },
     CallParticipantLeft { channel_id: String, user_id: String },
     CallParticipantState {
         channel_id: String,

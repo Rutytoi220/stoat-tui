@@ -1,24 +1,14 @@
 use crate::{log_debug, log_error, log_info, log_warn};
-use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
-use ashpd::desktop::PersistMode;
-use pipewire as pw;
-use pw::{properties::properties, spa};
-use spa::param::format::{MediaSubtype, MediaType};
-use spa::param::format_utils;
-use spa::param::video::VideoFormat;
-use spa::pod::Pod;
-use std::io::Cursor;
-use std::os::fd::OwnedFd;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 pub const MAX_CAPTURE_WIDTH: u32 = 1280;
 pub const MAX_CAPTURE_HEIGHT: u32 = 720;
-const PIPEWIRE_MIN_FRAME_INTERVAL: Duration = Duration::from_millis(45); // ~22 FPS cap
-const CLI_FALLBACK_FRAME_INTERVAL: Duration = Duration::from_millis(80); // ~12 FPS
+const X11_FALLBACK_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 #[derive(Debug, Clone)]
 pub struct CapturedFrame {
@@ -27,87 +17,231 @@ pub struct CapturedFrame {
     pub rgba: Vec<u8>,
 }
 
-enum PortalError {
-    Cancelled,
-    Unavailable(String),
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScreenShareTargetKind {
+    EntireDesktop,
+    Monitor {
+        name: String,
+        width: u32,
+        height: u32,
+    },
+    Window {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        class: String,
+    },
 }
 
-/// Converts raw PipeWire video buffer rows into packed RGBA (`[R, G, B, A]`).
-pub fn convert_pipewire_to_rgba(
-    format: VideoFormat,
-    src: &[u8],
-    stride: usize,
-    width: u32,
-    height: u32,
-) -> Option<Vec<u8>> {
-    let w = width as usize;
-    let h = height as usize;
-    if w == 0 || h == 0 {
-        return None;
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenShareTarget {
+    pub label: String,
+    pub kind: ScreenShareTargetKind,
+}
 
-    let bpp = match format {
-        VideoFormat::RGBA | VideoFormat::RGBx | VideoFormat::BGRA | VideoFormat::BGRx => 4,
-        VideoFormat::RGB | VideoFormat::BGR => 3,
-        _ => return None,
-    };
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScreenCaptureError {
+    Cancelled,
+    NeedTargetSelection(Vec<ScreenShareTarget>),
+    Failed(String),
+}
 
-    let row_bytes = w * bpp;
-    let effective_stride = if stride >= row_bytes { stride } else { row_bytes };
-    if src.len() < (h - 1) * effective_stride + row_bytes {
-        return None;
-    }
-
-    let mut out = vec![255u8; w * h * 4];
-    for y in 0..h {
-        let s_row = &src[y * effective_stride..y * effective_stride + row_bytes];
-        let d_row = &mut out[y * w * 4..(y + 1) * w * 4];
-        match format {
-            VideoFormat::RGBA => {
-                d_row.copy_from_slice(s_row);
-            }
-            VideoFormat::RGBx => {
-                d_row.copy_from_slice(s_row);
-                for px in d_row.chunks_exact_mut(4) {
-                    px[3] = 255;
-                }
-            }
-            VideoFormat::BGRA => {
-                for (s, d) in s_row.chunks_exact(4).zip(d_row.chunks_exact_mut(4)) {
-                    d[0] = s[2];
-                    d[1] = s[1];
-                    d[2] = s[0];
-                    d[3] = s[3];
-                }
-            }
-            VideoFormat::BGRx => {
-                for (s, d) in s_row.chunks_exact(4).zip(d_row.chunks_exact_mut(4)) {
-                    d[0] = s[2];
-                    d[1] = s[1];
-                    d[2] = s[0];
-                    d[3] = 255;
-                }
-            }
-            VideoFormat::RGB => {
-                for (s, d) in s_row.chunks_exact(3).zip(d_row.chunks_exact_mut(4)) {
-                    d[0] = s[0];
-                    d[1] = s[1];
-                    d[2] = s[2];
-                    d[3] = 255;
-                }
-            }
-            VideoFormat::BGR => {
-                for (s, d) in s_row.chunks_exact(3).zip(d_row.chunks_exact_mut(4)) {
-                    d[0] = s[2];
-                    d[1] = s[1];
-                    d[2] = s[0];
-                    d[3] = 255;
-                }
-            }
-            _ => unreachable!(),
+pub fn grim_args_for_target(target: &ScreenShareTargetKind) -> Vec<String> {
+    match target {
+        ScreenShareTargetKind::EntireDesktop => {
+            vec!["-t".to_string(), "ppm".to_string(), "-".to_string()]
         }
+        ScreenShareTargetKind::Monitor { name, .. } => vec![
+            "-o".to_string(),
+            name.clone(),
+            "-t".to_string(),
+            "ppm".to_string(),
+            "-".to_string(),
+        ],
+        ScreenShareTargetKind::Window {
+            x,
+            y,
+            width,
+            height,
+            ..
+        } => vec![
+            "-g".to_string(),
+            format!("{},{} {}x{}", x, y, width, height),
+            "-t".to_string(),
+            "ppm".to_string(),
+            "-".to_string(),
+        ],
     }
-    Some(out)
+}
+
+/// Builds `wf-recorder` CLI arguments for raw RGBA stdout streaming at 60 FPS,
+/// returning `(args, src_width, src_height)` when exact dimensions are known.
+pub fn wf_recorder_args_for_target(
+    target: &ScreenShareTargetKind,
+) -> Option<(Vec<String>, u32, u32)> {
+    match target {
+        ScreenShareTargetKind::Monitor {
+            name,
+            width,
+            height,
+        } if *width > 0 && *height > 0 => Some((
+            vec![
+                "--output".to_string(),
+                name.clone(),
+                "-c".to_string(),
+                "rawvideo".to_string(),
+                "-m".to_string(),
+                "rawvideo".to_string(),
+                "-x".to_string(),
+                "rgba".to_string(),
+                "-f".to_string(),
+                "pipe:1".to_string(),
+            ],
+            *width,
+            *height,
+        )),
+        ScreenShareTargetKind::Window {
+            x,
+            y,
+            width,
+            height,
+            ..
+        } if *width > 0 && *height > 0 => Some((
+            vec![
+                "--geometry".to_string(),
+                format!("{},{} {}x{}", x, y, width, height),
+                "-c".to_string(),
+                "rawvideo".to_string(),
+                "-m".to_string(),
+                "rawvideo".to_string(),
+                "-x".to_string(),
+                "rgba".to_string(),
+                "-f".to_string(),
+                "pipe:1".to_string(),
+            ],
+            *width,
+            *height,
+        )),
+        _ => None,
+    }
+}
+
+pub fn parse_hyprctl_monitors_json(json_str: &str) -> Vec<ScreenShareTarget> {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return Vec::new();
+    };
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        let Some(name) = item.get("name").and_then(|v| v.as_str()).map(str::trim) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let width = item.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let height = item.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let label = if width > 0 && height > 0 {
+            format!("Monitor: {} ({}x{})", name, width, height)
+        } else {
+            format!("Monitor: {}", name)
+        };
+        out.push(ScreenShareTarget {
+            label,
+            kind: ScreenShareTargetKind::Monitor {
+                name: name.to_string(),
+                width,
+                height,
+            },
+        });
+    }
+    out
+}
+
+pub fn parse_hyprctl_clients_json(json_str: &str) -> Vec<ScreenShareTarget> {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return Vec::new();
+    };
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        let mapped = item.get("mapped").and_then(|v| v.as_bool()).unwrap_or(true);
+        let hidden = item.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !mapped || hidden {
+            continue;
+        }
+        let Some(at) = item.get("at").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let Some(size) = item.get("size").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        if at.len() < 2 || size.len() < 2 {
+            continue;
+        }
+        let x = at[0].as_i64().unwrap_or(0) as i32;
+        let y = at[1].as_i64().unwrap_or(0) as i32;
+        let width = size[0].as_u64().unwrap_or(0) as u32;
+        let height = size[1].as_u64().unwrap_or(0) as u32;
+        if width == 0 || height == 0 {
+            continue;
+        }
+        let class = item
+            .get("class")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        let raw_title = item
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        let title_preview: String = raw_title.chars().take(36).collect();
+        let display_name = if !title_preview.is_empty() && !class.is_empty() {
+            format!("{} [{}]", title_preview, class)
+        } else if !title_preview.is_empty() {
+            title_preview
+        } else if !class.is_empty() {
+            class.clone()
+        } else {
+            "Window".to_string()
+        };
+        out.push(ScreenShareTarget {
+            label: format!("Window: {} ({}x{})", display_name, width, height),
+            kind: ScreenShareTargetKind::Window {
+                x,
+                y,
+                width,
+                height,
+                class,
+            },
+        });
+    }
+    out
+}
+
+pub fn build_hyprland_targets(
+    monitors_json: Option<&str>,
+    clients_json: Option<&str>,
+) -> Vec<ScreenShareTarget> {
+    let mut targets = Vec::new();
+    if let Some(m) = monitors_json {
+        targets.extend(parse_hyprctl_monitors_json(m));
+    }
+    if let Some(c) = clients_json {
+        targets.extend(parse_hyprctl_clients_json(c));
+    }
+    targets.push(ScreenShareTarget {
+        label: "Entire Desktop (All Monitors)".to_string(),
+        kind: ScreenShareTargetKind::EntireDesktop,
+    });
+    targets
 }
 
 /// Downscales an RGBA buffer to fit inside `max_w x max_h` preserving aspect ratio,
@@ -134,22 +268,32 @@ pub fn downscale_rgba_even(
     let dst_w = dst_w.max(2);
     let dst_h = dst_h.max(2);
 
-    if dst_w == src_w && dst_h == src_h && src.len() == (src_w * src_h * 4) as usize {
+    if dst_w == src_w && dst_h == src_h && src.len() == (src_w as usize) * (src_h as usize) * 4 {
         return (dst_w, dst_h, src.to_vec());
     }
 
-    let mut dst = vec![0u8; (dst_w * dst_h * 4) as usize];
-    for dy in 0..dst_h {
-        let sy = ((dy as u64 * src_h as u64) / dst_h as u64).min(src_h as u64 - 1) as usize;
-        let src_row_off = sy * src_w as usize * 4;
-        let dst_row_off = dy as usize * dst_w as usize * 4;
-        for dx in 0..dst_w {
-            let sx = ((dx as u64 * src_w as u64) / dst_w as u64).min(src_w as u64 - 1) as usize;
-            let s_idx = src_row_off + sx * 4;
-            let d_idx = dst_row_off + dx as usize * 4;
-            if s_idx + 4 <= src.len() {
-                dst[d_idx..d_idx + 4].copy_from_slice(&src[s_idx..s_idx + 4]);
-            }
+    let mut dst = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+    let src_w_usize = src_w as usize;
+    let src_h_usize = src_h as usize;
+    let dst_w_usize = dst_w as usize;
+    let dst_h_usize = dst_h as usize;
+    let src_stride = src_w_usize * 4;
+    let dst_stride = dst_w_usize * 4;
+
+    if src.len() < src_h_usize * src_stride {
+        return (dst_w, dst_h, dst);
+    }
+
+    // Precompute integer byte offsets per column once so the inner pixel loop has zero divisions/floats
+    let x_offsets: Vec<usize> = (0..dst_w_usize)
+        .map(|dx| ((dx * src_w_usize) / dst_w_usize).min(src_w_usize - 1) * 4)
+        .collect();
+
+    for (dy, dst_row) in dst.chunks_exact_mut(dst_stride).enumerate() {
+        let sy = ((dy * src_h_usize) / dst_h_usize).min(src_h_usize - 1);
+        let src_row = &src[sy * src_stride..(sy + 1) * src_stride];
+        for (dst_px, &s_off) in dst_row.chunks_exact_mut(4).zip(x_offsets.iter()) {
+            dst_px.copy_from_slice(&src_row[s_off..s_off + 4]);
         }
     }
     (dst_w, dst_h, dst)
@@ -202,7 +346,10 @@ pub fn parse_ppm_p6(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
         .map_err(|_| format!("Invalid PPM maxval: {}", tokens[2]))?;
 
     if maxval != 255 || width == 0 || height == 0 {
-        return Err(format!("Unsupported PPM dimensions/maxval: {}x{} max={}", width, height, maxval));
+        return Err(format!(
+            "Unsupported PPM dimensions/maxval: {}x{} max={}",
+            width, height, maxval
+        ));
     }
 
     let expected_rgb = (width as usize) * (height as usize) * 3;
@@ -216,7 +363,10 @@ pub fn parse_ppm_p6(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     }
 
     let mut rgba = vec![255u8; (width as usize) * (height as usize) * 4];
-    for (s, d) in rgb[..expected_rgb].chunks_exact(3).zip(rgba.chunks_exact_mut(4)) {
+    for (s, d) in rgb[..expected_rgb]
+        .chunks_exact(3)
+        .zip(rgba.chunks_exact_mut(4))
+    {
         d[0] = s[0];
         d[1] = s[1];
         d[2] = s[2];
@@ -225,386 +375,208 @@ pub fn parse_ppm_p6(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     Ok((width, height, rgba))
 }
 
-/// Starts screen capture using Wayland xdg-desktop-portal + PipeWire as primary,
-/// falling back cleanly to `grim -t ppm -` or `ffmpeg` if the portal is unavailable.
+/// Starts pure-Rust subprocess screen capture (zero PipeWire C FFI).
+/// On Wayland (`WAYLAND_DISPLAY` set):
+/// 1. Queries `hyprctl monitors -j` and `hyprctl clients -j` and opens `ScreenPickerModal`
+///    whenever multiple targets exist (when `selected_target` is `None`).
+/// 2. Streams at 30–60 FPS via `wf-recorder` raw RGBA pipe if available, falling back
+///    cleanly to a back-to-back async `grim` loop.
 pub async fn start_screen_capture(
     shutdown: Arc<AtomicBool>,
-) -> Result<mpsc::Receiver<CapturedFrame>, String> {
+    selected_target: Option<ScreenShareTargetKind>,
+) -> Result<mpsc::Receiver<CapturedFrame>, ScreenCaptureError> {
     let (frame_tx, frame_rx) = mpsc::channel::<CapturedFrame>(2);
 
-    match start_portal_screencast(frame_tx.clone(), shutdown.clone()).await {
-        Ok(()) => {
-            log_info!("ScreenCast: initialized Wayland xdg-desktop-portal + PipeWire stream");
+    if let Some(target) = selected_target {
+        if start_wf_recorder_capture(frame_tx.clone(), shutdown.clone(), &target)
+            .await
+            .is_ok()
+        {
             return Ok(frame_rx);
         }
-        Err(PortalError::Cancelled) => {
-            return Err("Screen share cancelled in system picker".to_string());
-        }
-        Err(PortalError::Unavailable(reason)) => {
-            log_warn!("ScreenCast portal unavailable ({}); trying CLI frame grabber fallback...", reason);
-        }
+        start_grim_capture_target(frame_tx, shutdown, target)
+            .await
+            .map_err(ScreenCaptureError::Failed)?;
+        return Ok(frame_rx);
     }
 
-    start_cli_fallback_capture(frame_tx, shutdown).await?;
+    let has_wayland = std::env::var("WAYLAND_DISPLAY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+
+    if has_wayland {
+        let targets = list_grim_targets().await;
+        if targets.len() > 1 {
+            return Err(ScreenCaptureError::NeedTargetSelection(targets));
+        }
+        let target = targets
+            .into_iter()
+            .next()
+            .map(|t| t.kind)
+            .unwrap_or(ScreenShareTargetKind::EntireDesktop);
+
+        if start_wf_recorder_capture(frame_tx.clone(), shutdown.clone(), &target)
+            .await
+            .is_ok()
+        {
+            return Ok(frame_rx);
+        }
+        start_grim_capture_target(frame_tx, shutdown, target)
+            .await
+            .map_err(ScreenCaptureError::Failed)?;
+        return Ok(frame_rx);
+    }
+
+    // X11 fallback
+    start_ffmpeg_x11_capture(frame_tx, shutdown)
+        .await
+        .map_err(ScreenCaptureError::Failed)?;
     Ok(frame_rx)
 }
 
-async fn start_portal_screencast(
-    frame_tx: mpsc::Sender<CapturedFrame>,
-    shutdown: Arc<AtomicBool>,
-) -> Result<(), PortalError> {
-    let proxy = Screencast::new()
+pub async fn list_grim_targets() -> Vec<ScreenShareTarget> {
+    let monitors_json = match tokio::process::Command::new("hyprctl")
+        .args(["monitors", "-j"])
+        .output()
         .await
-        .map_err(|e| PortalError::Unavailable(format!("D-Bus Screencast proxy error: {}", e)))?;
-
-    let session = proxy
-        .create_session(Default::default())
-        .await
-        .map_err(|e| PortalError::Unavailable(format!("create_session error: {}", e)))?;
-
-    proxy
-        .select_sources(
-            &session,
-            SelectSourcesOptions::default()
-                .set_cursor_mode(CursorMode::EMBEDDED)
-                .set_sources(SourceType::MONITOR | SourceType::WINDOW)
-                .set_multiple(false)
-                .set_persist_mode(PersistMode::DoNot),
-        )
-        .await
-        .map_err(|e| PortalError::Unavailable(format!("select_sources error: {}", e)))?;
-
-    let start_req = proxy
-        .start(&session, None, Default::default())
-        .await
-        .map_err(|e| PortalError::Unavailable(format!("start error: {}", e)))?;
-
-    let streams = match start_req.response() {
-        Ok(resp) => resp,
-        Err(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled)) => {
-            let _ = session.close().await;
-            return Err(PortalError::Cancelled);
-        }
-        Err(e) => {
-            let _ = session.close().await;
-            return Err(PortalError::Unavailable(format!("portal response error: {}", e)));
-        }
+    {
+        Ok(out) if out.status.success() => String::from_utf8(out.stdout).ok(),
+        _ => None,
     };
 
-    let Some(stream_info) = streams.streams().first() else {
-        let _ = session.close().await;
-        return Err(PortalError::Unavailable("portal returned zero streams".to_string()));
-    };
-    let node_id = stream_info.pipe_wire_node_id();
-    log_info!(
-        "ScreenCast portal granted node_id={} size={:?}",
-        node_id,
-        stream_info.size()
-    );
-
-    let fd = proxy
-        .open_pipe_wire_remote(&session, Default::default())
+    let clients_json = match tokio::process::Command::new("hyprctl")
+        .args(["clients", "-j"])
+        .output()
         .await
-        .map_err(|e| PortalError::Unavailable(format!("open_pipe_wire_remote error: {}", e)))?;
+    {
+        Ok(out) if out.status.success() => String::from_utf8(out.stdout).ok(),
+        _ => None,
+    };
 
-    // Keep portal session alive until shutdown
-    let session_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        while !session_shutdown.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        let _ = session.close().await;
-    });
-
-    spawn_pipewire_reader_thread(fd, node_id, frame_tx, shutdown)
-        .map_err(PortalError::Unavailable)?;
-
-    Ok(())
+    build_hyprland_targets(monitors_json.as_deref(), clients_json.as_deref())
 }
 
-fn spawn_pipewire_reader_thread(
-    fd: OwnedFd,
-    node_id: u32,
+async fn start_wf_recorder_capture(
     frame_tx: mpsc::Sender<CapturedFrame>,
     shutdown: Arc<AtomicBool>,
+    target: &ScreenShareTargetKind,
 ) -> Result<(), String> {
-    let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+    let Some((args, src_w, src_h)) = wf_recorder_args_for_target(target) else {
+        return Err("Target does not have fixed dimensions for wf-recorder".to_string());
+    };
 
-    std::thread::spawn(move || {
-        pw::init();
+    let mut child = tokio::process::Command::new("wf-recorder")
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("wf-recorder unavailable: {}", e))?;
 
-        let mainloop = match pw::main_loop::MainLoopRc::new(None) {
-            Ok(ml) => ml,
-            Err(e) => {
-                let _ = init_tx.send(Err(format!("PipeWire MainLoopRc error: {}", e)));
-                return;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "wf-recorder missing stdout pipe".to_string())?;
+
+    let frame_bytes = (src_w as usize) * (src_h as usize) * 4;
+    let mut raw_buf = vec![0u8; frame_bytes];
+
+    // Verify first frame arrives cleanly before committing to wf-recorder
+    tokio::time::timeout(Duration::from_millis(1200), stdout.read_exact(&mut raw_buf))
+        .await
+        .map_err(|_| "wf-recorder timed out waiting for first frame".to_string())?
+        .map_err(|e| format!("wf-recorder exited before first frame: {}", e))?;
+
+    let (dw, dh, scaled) =
+        downscale_rgba_even(&raw_buf, src_w, src_h, MAX_CAPTURE_WIDTH, MAX_CAPTURE_HEIGHT);
+    let _ = frame_tx.try_send(CapturedFrame {
+        width: dw,
+        height: dh,
+        rgba: scaled,
+    });
+
+    log_info!(
+        "ScreenCast: streaming via `wf-recorder` ({}x{} -> {}x{})",
+        src_w,
+        src_h,
+        dw,
+        dh
+    );
+
+    tokio::spawn(async move {
+        let mut child = child;
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                let _ = child.kill().await;
+                break;
             }
-        };
-
-        let context = match pw::context::ContextRc::new(&mainloop, None) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = init_tx.send(Err(format!("PipeWire ContextRc error: {}", e)));
-                return;
-            }
-        };
-
-        let core = match context.connect_fd_rc(fd, None) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = init_tx.send(Err(format!("PipeWire connect_fd_rc error: {}", e)));
-                return;
-            }
-        };
-
-        let stream = match pw::stream::StreamBox::new(
-            &core,
-            "stoat-tui-screencast",
-            properties! {
-                *pw::keys::MEDIA_TYPE => "Video",
-                *pw::keys::MEDIA_CATEGORY => "Capture",
-                *pw::keys::MEDIA_ROLE => "Screen",
-            },
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = init_tx.send(Err(format!("PipeWire StreamBox error: {}", e)));
-                return;
-            }
-        };
-
-        struct PwState {
-            format: spa::param::video::VideoInfoRaw,
-            last_sent: Instant,
-            frame_tx: mpsc::Sender<CapturedFrame>,
-        }
-
-        let user_data = PwState {
-            format: Default::default(),
-            last_sent: Instant::now() - PIPEWIRE_MIN_FRAME_INTERVAL,
-            frame_tx,
-        };
-
-        let mainloop_err = mainloop.clone();
-        let _listener = match stream
-            .add_local_listener_with_user_data(user_data)
-            .state_changed(move |_, _, old, new| {
-                log_debug!("PipeWire screencast state: {:?} -> {:?}", old, new);
-                if matches!(new, pw::stream::StreamState::Error(_)) {
-                    mainloop_err.quit();
-                }
-            })
-            .param_changed(|_, state, id, param| {
-                let Some(param) = param else { return; };
-                if id != spa::param::ParamType::Format.as_raw() {
-                    return;
-                }
-                let Ok((media_type, media_subtype)) = format_utils::parse_format(param) else {
-                    return;
-                };
-                if media_type != MediaType::Video || media_subtype != MediaSubtype::Raw {
-                    return;
-                }
-                if state.format.parse(param).is_ok() {
-                    log_info!(
-                        "PipeWire negotiated video format: {:?} {}x{}",
-                        state.format.format(),
-                        state.format.size().width,
-                        state.format.size().height
-                    );
-                }
-            })
-            .process(|stream, state| {
-                let Some(mut buffer) = stream.dequeue_buffer() else {
-                    return;
-                };
-                if state.last_sent.elapsed() < PIPEWIRE_MIN_FRAME_INTERVAL {
-                    return;
-                }
-                let datas = buffer.datas_mut();
-                if datas.is_empty() {
-                    return;
-                }
-                let width = state.format.size().width;
-                let height = state.format.size().height;
-                let fmt = state.format.format();
-                if width == 0 || height == 0 {
-                    return;
-                }
-
-                let data = &mut datas[0];
-                let chunk_offset = data.chunk().offset() as usize;
-                let chunk_size = data.chunk().size() as usize;
-                let chunk_stride = data.chunk().stride() as usize;
-                let Some(raw) = data.data() else {
-                    return;
-                };
-                let end = (chunk_offset + chunk_size).min(raw.len());
-                if chunk_offset >= end {
-                    return;
-                }
-
-                if let Some(rgba) =
-                    convert_pipewire_to_rgba(fmt, &raw[chunk_offset..end], chunk_stride, width, height)
-                {
+            match stdout.read_exact(&mut raw_buf).await {
+                Ok(_) => {
                     let (dw, dh, scaled) = downscale_rgba_even(
-                        &rgba,
-                        width,
-                        height,
+                        &raw_buf,
+                        src_w,
+                        src_h,
                         MAX_CAPTURE_WIDTH,
                         MAX_CAPTURE_HEIGHT,
                     );
                     if dw > 0 && dh > 0 {
-                        state.last_sent = Instant::now();
-                        let _ = state.frame_tx.try_send(CapturedFrame {
+                        let _ = frame_tx.try_send(CapturedFrame {
                             width: dw,
                             height: dh,
                             rgba: scaled,
                         });
                     }
                 }
-            })
-            .register()
-        {
-            Ok(l) => l,
-            Err(e) => {
-                let _ = init_tx.send(Err(format!("PipeWire listener register error: {}", e)));
-                return;
-            }
-        };
-
-        let obj = spa::pod::object!(
-            spa::utils::SpaTypes::ObjectParamFormat,
-            spa::param::ParamType::EnumFormat,
-            spa::pod::property!(
-                spa::param::format::FormatProperties::MediaType,
-                Id,
-                MediaType::Video
-            ),
-            spa::pod::property!(
-                spa::param::format::FormatProperties::MediaSubtype,
-                Id,
-                MediaSubtype::Raw
-            ),
-            spa::pod::property!(
-                spa::param::format::FormatProperties::VideoFormat,
-                Choice,
-                Enum,
-                Id,
-                VideoFormat::BGRx,
-                VideoFormat::BGRx,
-                VideoFormat::BGRA,
-                VideoFormat::RGBA,
-                VideoFormat::RGBx,
-                VideoFormat::RGB,
-            ),
-            spa::pod::property!(
-                spa::param::format::FormatProperties::VideoSize,
-                Choice,
-                Range,
-                Rectangle,
-                spa::utils::Rectangle {
-                    width: 1280,
-                    height: 720
-                },
-                spa::utils::Rectangle {
-                    width: 1,
-                    height: 1
-                },
-                spa::utils::Rectangle {
-                    width: 4096,
-                    height: 4096
+                Err(e) => {
+                    log_debug!("wf-recorder stdout stream ended: {}", e);
+                    let _ = child.kill().await;
+                    break;
                 }
-            ),
-            spa::pod::property!(
-                spa::param::format::FormatProperties::VideoFramerate,
-                Choice,
-                Range,
-                Fraction,
-                spa::utils::Fraction { num: 20, denom: 1 },
-                spa::utils::Fraction { num: 1, denom: 1 },
-                spa::utils::Fraction { num: 30, denom: 1 }
-            ),
-        );
-        let values: Vec<u8> = spa::pod::serialize::PodSerializer::serialize(
-            Cursor::new(Vec::new()),
-            &spa::pod::Value::Object(obj),
-        )
-        .unwrap()
-        .0
-        .into_inner();
-        let mut params = [Pod::from_bytes(&values).unwrap()];
-
-        if let Err(e) = stream.connect(
-            spa::utils::Direction::Input,
-            Some(node_id),
-            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
-            &mut params,
-        ) {
-            let _ = init_tx.send(Err(format!("PipeWire stream.connect error: {}", e)));
-            return;
+            }
         }
-
-        let mainloop_weak = mainloop.downgrade();
-        let timer = mainloop.loop_().add_timer(move |_| {
-            if shutdown.load(Ordering::SeqCst) {
-                if let Some(ml) = mainloop_weak.upgrade() {
-                    ml.quit();
-                }
-            }
-        });
-        let _ = timer.update_timer(
-            Some(Duration::from_millis(100)),
-            Some(Duration::from_millis(100)),
-        );
-
-        let _ = init_tx.send(Ok(()));
-        mainloop.run();
-        log_debug!("PipeWire screencast loop exited");
     });
 
-    init_rx
-        .recv()
-        .map_err(|_| "PipeWire initialization thread aborted".to_string())?
+    Ok(())
 }
 
-async fn start_cli_fallback_capture(
+async fn start_grim_capture_target(
+    frame_tx: mpsc::Sender<CapturedFrame>,
+    shutdown: Arc<AtomicBool>,
+    target: ScreenShareTargetKind,
+) -> Result<(), String> {
+    let test_frame = grab_grim_frame_async(&target).await?;
+    log_info!(
+        "ScreenCast: using safe `grim` back-to-back capture ({:?}, {}x{})",
+        target,
+        test_frame.width,
+        test_frame.height
+    );
+    let _ = frame_tx.try_send(test_frame);
+
+    tokio::spawn(async move {
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            match grab_grim_frame_async(&target).await {
+                Ok(frame) => {
+                    let _ = frame_tx.try_send(frame);
+                }
+                Err(e) => {
+                    log_warn!("grim capture frame error: {}", e);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    Ok(())
+}
+
+async fn start_ffmpeg_x11_capture(
     frame_tx: mpsc::Sender<CapturedFrame>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    // 1. Test `grim -t ppm -` (standard wlroots/Hyprland fast frame grabber)
-    if let Ok(test_frame) = tokio::task::spawn_blocking(grab_grim_frame).await.map_err(|e| e.to_string())? {
-        log_info!(
-            "ScreenCast fallback: using `grim -t ppm -` ({}x{})",
-            test_frame.width,
-            test_frame.height
-        );
-        let _ = frame_tx.try_send(test_frame);
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(CLI_FALLBACK_FRAME_INTERVAL);
-            loop {
-                interval.tick().await;
-                if shutdown.load(Ordering::SeqCst) {
-                    break;
-                }
-                match tokio::task::spawn_blocking(grab_grim_frame).await {
-                    Ok(Ok(frame)) => {
-                        let _ = frame_tx.try_send(frame);
-                    }
-                    Ok(Err(e)) => {
-                        log_warn!("grim capture frame error: {}", e);
-                    }
-                    Err(e) => {
-                        log_warn!("grim blocking task error: {}", e);
-                    }
-                }
-            }
-        });
-        return Ok(());
-    }
-
-    // 2. Test `ffmpeg` X11 fallback if DISPLAY is set
     if let Ok(display) = std::env::var("DISPLAY") {
         if !display.trim().is_empty() {
             if let Ok(test_frame) =
@@ -621,7 +593,7 @@ async fn start_cli_fallback_capture(
 
                 tokio::spawn(async move {
                     let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
-                    let mut interval = tokio::time::interval(CLI_FALLBACK_FRAME_INTERVAL);
+                    let mut interval = tokio::time::interval(X11_FALLBACK_FRAME_INTERVAL);
                     loop {
                         interval.tick().await;
                         if shutdown.load(Ordering::SeqCst) {
@@ -640,15 +612,17 @@ async fn start_cli_fallback_capture(
         }
     }
 
-    let msg = "No Wayland ScreenCast portal, `grim`, or X11 `ffmpeg` capture available".to_string();
-    log_error!("ScreenCast fallback failed: {}", msg);
+    let msg = "No Wayland `wf-recorder`/`grim` or X11 `ffmpeg` capture available".to_string();
+    log_error!("ScreenCast failed: {}", msg);
     Err(msg)
 }
 
-fn grab_grim_frame() -> Result<CapturedFrame, String> {
-    let output = Command::new("grim")
-        .args(["-t", "ppm", "-"])
+async fn grab_grim_frame_async(target: &ScreenShareTargetKind) -> Result<CapturedFrame, String> {
+    let args = grim_args_for_target(target);
+    let output = tokio::process::Command::new("grim")
+        .args(&args)
         .output()
+        .await
         .map_err(|e| format!("Failed to execute grim: {}", e))?;
 
     if !output.status.success() {
@@ -658,6 +632,9 @@ fn grab_grim_frame() -> Result<CapturedFrame, String> {
 
     let (w, h, rgba) = parse_ppm_p6(&output.stdout)?;
     let (dw, dh, scaled) = downscale_rgba_even(&rgba, w, h, MAX_CAPTURE_WIDTH, MAX_CAPTURE_HEIGHT);
+    if dw == 0 || dh == 0 || scaled.len() != (dw as usize) * (dh as usize) * 4 {
+        return Err("Invalid scaled frame dimensions from grim".to_string());
+    }
     Ok(CapturedFrame {
         width: dw,
         height: dh,

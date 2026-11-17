@@ -35,6 +35,13 @@ impl<'a> Widget for MessageInput<'a> {
             format!("Message #{}... (Enter to send)", ch_name)
         };
 
+        let surface_bg = Color::Rgb(32, 34, 37);
+        let border_style = if is_focused {
+            ratatui::style::Style::default().fg(theme.accent)
+        } else {
+            ratatui::style::Style::default().fg(theme.border_unfocused)
+        };
+
         let inner = if borderless {
             area
         } else {
@@ -43,9 +50,10 @@ impl<'a> Widget for MessageInput<'a> {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(theme.focused_border_style(is_focused))
-                .title_top(if is_focused { " [INPUT ACTIVE] " } else { "" })
-                .title_bottom(counter_text);
+                .border_style(border_style)
+                .style(ratatui::style::Style::default().bg(surface_bg))
+                .title_top(if is_focused { " ✎ Message " } else { "" })
+                .title_bottom(ratatui::text::Line::from(counter_text).right_aligned());
             let inner = block.inner(area);
             block.render(area, buf);
             inner
@@ -55,12 +63,12 @@ impl<'a> Widget for MessageInput<'a> {
             return;
         }
 
-        // Fill inner background
+        // Fill inner background with subtle dark surface
         for y in inner.top()..inner.bottom() {
             for x in inner.left()..inner.right() {
                 buf[(x, y)]
                     .set_char(' ')
-                    .set_bg(theme.bg);
+                    .set_bg(surface_bg);
             }
         }
 

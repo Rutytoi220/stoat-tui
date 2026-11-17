@@ -38,5 +38,4 @@ image = { version = "0.25.10", features = ["png", "jpeg", "webp", "gif"] }
 livekit = { version = "0.11.0", features = ["rustls-tls-webpki-roots"] }
 ratatui-image = { version = "11.1.0", features = ["crossterm"], default-features = false }
 rfd = "0.18.0"
-ashpd = { version = "0.14", features = ["screencast"] }
-pipewire = "0.10"
+libc = "0.2"

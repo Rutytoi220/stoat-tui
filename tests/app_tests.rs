@@ -1372,6 +1372,7 @@ async fn test_call_events_lifecycle_and_active_speakers() {
     app.handle_event(AppEvent::CallParticipantJoined {
         channel_id: "ch_voice_1".to_string(),
         user_id: "u_friend".to_string(),
+        is_local: false,
     }).await;
     assert_eq!(app.state.active_call.as_ref().unwrap().participants.len(), 1);
 
@@ -1599,8 +1600,7 @@ async fn test_livekit_nodes_parsing_and_join_call_node_payload() {
 #[test]
 fn test_screen_capture_ppm_downscale_and_i420_roundtrip() {
     use livekit::webrtc::video_frame::{BoxVideoBuffer, VideoFrame, VideoRotation};
-    use pipewire::spa::param::video::VideoFormat;
-    use stoat_tui::voice::screen::{convert_pipewire_to_rgba, downscale_rgba_even, parse_ppm_p6};
+    use stoat_tui::voice::screen::{downscale_rgba_even, parse_ppm_p6};
     use stoat_tui::voice::{rgba_to_i420_buffer, video_frame_to_rgba};
 
     // 1. Parse PPM P6 with comment
@@ -1612,13 +1612,7 @@ fn test_screen_capture_ppm_downscale_and_i420_roundtrip() {
     assert_eq!((w, h), (4, 2));
     assert_eq!(&rgba[0..4], &[200, 40, 20, 255]);
 
-    // 2. Convert PipeWire BGRx -> RGBA
-    let bgrx = [10u8, 20, 30, 0, 40, 50, 60, 0];
-    let pw_rgba = convert_pipewire_to_rgba(VideoFormat::BGRx, &bgrx, 8, 2, 1).unwrap();
-    assert_eq!(&pw_rgba[0..4], &[30, 20, 10, 255]);
-    assert_eq!(&pw_rgba[4..8], &[60, 50, 40, 255]);
-
-    // 3. Downscale 2560x1440 -> 1280x720 (even dims)
+    // 2. Downscale 2560x1440 -> 1280x720 (even dims)
     let large = vec![128u8; 2560 * 1440 * 4];
     let (dw, dh, scaled) = downscale_rgba_even(&large, 2560, 1440, 1280, 720);
     assert_eq!((dw, dh), (1280, 720));
@@ -1631,7 +1625,7 @@ fn test_screen_capture_ppm_downscale_and_i420_roundtrip() {
     for _ in 0..16 {
         red_rgba.extend_from_slice(&[240, 10, 10, 255]);
     }
-    let i420 = rgba_to_i420_buffer(&red_rgba, 4, 4);
+    let i420 = rgba_to_i420_buffer(&red_rgba, 4, 4).expect("Valid even 4x4 RGBA buffer should convert");
     let box_buf: BoxVideoBuffer = Box::new(i420);
     let vf = VideoFrame::new(VideoRotation::VideoRotation0, box_buf);
     let (rw, rh, out_rgba) = video_frame_to_rgba(&vf).expect("Roundtrip should succeed");
@@ -1961,6 +1955,7 @@ async fn test_call_participant_deduplication_and_real_resolution() {
     app.handle_event(AppEvent::CallParticipantJoined {
         channel_id: "ch_call_dedup".to_string(),
         user_id: "01ME000001:cli".to_string(),
+        is_local: false,
     })
     .await;
     assert!(app.state.active_call.as_ref().unwrap().participants.is_empty());
@@ -1969,11 +1964,13 @@ async fn test_call_participant_deduplication_and_real_resolution() {
     app.handle_event(AppEvent::CallParticipantJoined {
         channel_id: "ch_call_dedup".to_string(),
         user_id: "01REMOTE01:web".to_string(),
+        is_local: false,
     })
     .await;
     app.handle_event(AppEvent::CallParticipantJoined {
         channel_id: "ch_call_dedup".to_string(),
         user_id: "01REMOTE01:mobile".to_string(),
+        is_local: false,
     })
     .await;
     assert_eq!(app.state.active_call.as_ref().unwrap().participants.len(), 1);
@@ -1986,6 +1983,7 @@ async fn test_call_participant_deduplication_and_real_resolution() {
     app.handle_event(AppEvent::CallParticipantJoined {
         channel_id: "ch_call_dedup".to_string(),
         user_id: "caller".to_string(),
+        is_local: false,
     })
     .await;
     app.handle_event(AppEvent::Gateway(GatewayEvent::MessageReceived(
@@ -2089,23 +2087,18 @@ fn test_call_stage_cards_speaking_border_and_mute_deafen_icons() {
         VoiceParticipant {
             user_id: "u_a".to_string(),
             is_speaking: true,
-            is_muted: false,
-            is_deafened: false,
-            is_screensharing: false,
+            ..Default::default()
         },
         VoiceParticipant {
             user_id: "u_b".to_string(),
-            is_speaking: false,
             is_muted: true,
-            is_deafened: false,
-            is_screensharing: false,
+            ..Default::default()
         },
         VoiceParticipant {
             user_id: "u_c".to_string(),
-            is_speaking: false,
             is_muted: true,
             is_deafened: true,
-            is_screensharing: false,
+            ..Default::default()
         },
     ];
     state.active_call = Some(call);
@@ -2116,15 +2109,16 @@ fn test_call_stage_cards_speaking_border_and_mute_deafen_icons() {
     let buf = term.backend().buffer();
     let txt: String = buf.content().iter().map(|c| c.symbol()).collect();
 
-    assert!(txt.contains("Me (You)"), "Missing local user card: {}", txt);
+    assert!(txt.contains("Me"), "Missing local user card: {}", txt);
+    assert!(!txt.contains("Me (You)"), "Must not append awkward (You) suffix: {}", txt);
     assert!(txt.contains("Alice"), "Missing speaking user card: {}", txt);
     assert!(
-        txt.contains("Bob [🔇 ]") || txt.contains("Bob [🔇]"),
+        txt.contains("Bob 🔇"),
         "Missing muted badge on Bob card: {}",
         txt
     );
     assert!(
-        txt.contains("Carol [🔇 🎧 ]") || txt.contains("Carol [🔇🎧]"),
+        txt.contains("Carol 🎧"),
         "Missing deafened badge on Carol card: {}",
         txt
     );
@@ -2214,17 +2208,12 @@ fn test_call_stage_dynamic_desired_height() {
     call.participants = vec![
         VoiceParticipant {
             user_id: "u_r1".to_string(),
-            is_speaking: false,
-            is_muted: false,
-            is_deafened: false,
-            is_screensharing: false,
+            ..Default::default()
         },
         VoiceParticipant {
             user_id: "u_r2".to_string(),
             is_speaking: true,
-            is_muted: false,
-            is_deafened: false,
-            is_screensharing: false,
+            ..Default::default()
         },
     ];
 
@@ -2469,6 +2458,18 @@ async fn test_join_call_already_connected_auto_leave_and_retry() {
                 "POST /channels/ch_ghost/join_call ",
                 r#"{"node":"europe"}"#,
                 "HTTP/1.1 400 Bad Request",
+                r#"{"type":"AlreadyConnected","location":"voice_join.rs:80:10"}"#,
+            ),
+            (
+                "POST /channels/ch_ghost/leave_call ",
+                "{}",
+                "HTTP/1.1 204 No Content",
+                "",
+            ),
+            (
+                "POST /channels/ch_ghost/join_call ",
+                r#"{"node":"europe"}"#,
+                "HTTP/1.1 400 Bad Request",
                 r#"{"type":"AlreadyConnected"}"#,
             ),
             (
@@ -2527,6 +2528,12 @@ async fn test_join_call_already_connected_auto_leave_and_retry() {
     assert_eq!(join_res.token, "jwt_recovered");
     assert_eq!(join_res.url.as_deref(), Some("wss://lk.example.com"));
 
+    // Also verify StatusBar cleanly extracts Stoat JSON error "type"
+    let sanitized = stoat_tui::ui::components::status_bar::sanitize_status_text(
+        r#"Join call error (HTTP 400): {"type":"AlreadyConnected","location":"crates/delta/src/routes/channels/voice_join.rs:80:10"}"#,
+    );
+    assert_eq!(sanitized, "Join call error (HTTP 400): AlreadyConnected");
+
     server_handle.await.unwrap();
 }
 
@@ -2537,12 +2544,13 @@ async fn test_leave_call_fallback_and_app_shutdown_leaves_call() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    // 1. Test DeltaClient::leave_call fallback chain: 404 /leave_call -> DELETE /ring -> POST /end_ring
+    // 1. Test DeltaClient::leave_call fallback chain: POST /leave_call -> DELETE /call -> DELETE /ring -> POST /end_ring
     let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url1 = format!("http://127.0.0.1:{}", listener1.local_addr().unwrap().port());
     let h1 = tokio::spawn(async move {
         let steps = [
             ("POST /channels/c_fb/leave_call ", "HTTP/1.1 404 Not Found"),
+            ("DELETE /channels/c_fb/call ", "HTTP/1.1 404 Not Found"),
             ("DELETE /channels/c_fb/ring ", "HTTP/1.1 404 Not Found"),
             ("POST /channels/c_fb/end_ring ", "HTTP/1.1 204 No Content"),
         ];
@@ -2603,4 +2611,495 @@ async fn test_leave_call_fallback_and_app_shutdown_leaves_call() {
     app.shutdown().await;
     assert!(app.state.active_call.is_none());
     h2.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_normalize_and_probe_api_url_auto_detects_api_subpath() {
+    use stoat_tui::api::DeltaClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // 1. Verify scheme normalization for public domains vs local LAN IPs
+    assert_eq!(
+        DeltaClient::normalize_url_str("alpha-node.example.ts.net/"),
+        "https://alpha-node.example.ts.net"
+    );
+    assert_eq!(
+        DeltaClient::normalize_url_str("192.168.1.42:8000/"),
+        "http://192.168.1.42:8000"
+    );
+
+    // 2. When GET / returns HTML and GET /api/ returns Delta root JSON, resolve to {base}/api
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{}", port);
+
+    let server_handle = tokio::spawn(async move {
+        // Request 1: GET / -> 200 OK HTML (web client frontend)
+        {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.contains("GET / HTTP/1.1"), "Expected GET /, got:\n{}", req);
+            let html = "<!DOCTYPE html><html><body>Stoat Web</body></html>";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                html.len(),
+                html
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        }
+        // Request 2: GET /api/ -> 200 OK Delta JSON metadata
+        {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.contains("GET /api/ HTTP/1.1"),
+                "Expected GET /api/, got:\n{}",
+                req
+            );
+            let body = r#"{"revolt":"0.6.5","features":{"autumn":{"enabled":true,"url":"https://alpha-node.example.ts.net/autumn"}},"ws":"wss://alpha-node.example.ts.net/ws"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        }
+    });
+
+    let resolved = DeltaClient::normalize_and_probe_api_url(&format!("{}/", base_url)).await;
+    assert_eq!(resolved, format!("{}/api", base_url));
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_login_email_friendly_name_and_structured_errors() {
+    use stoat_tui::api::models::LoginResponse;
+    use stoat_tui::api::DeltaClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_url = format!("http://127.0.0.1:{}", port);
+
+    let server_handle = tokio::spawn(async move {
+        let responses = [
+            (
+                "HTTP/1.1 401 Unauthorized",
+                r#"{"type":"InvalidCredentials"}"#,
+            ),
+            (
+                "HTTP/1.1 401 Unauthorized",
+                r#"{"type":"UnverifiedAccount"}"#,
+            ),
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"result":"MFA","ticket":"mfa_t_1","allowed_methods":["Totp"]}"#,
+            ),
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"result":"Success","token":"sess_tok_ok","user_id":"01USER"}"#,
+            ),
+        ];
+
+        for (status_line, resp_body) in responses {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                req.contains("POST /auth/session/login HTTP/1.1"),
+                "Unexpected request line:\n{}",
+                req
+            );
+            let body_part = req.split("\r\n\r\n").nth(1).unwrap_or("");
+            let parsed: serde_json::Value =
+                serde_json::from_str(body_part).expect("Login request body should be valid JSON");
+            assert_eq!(parsed.get("email").and_then(|v| v.as_str()), Some("alice@example.com"));
+            assert_eq!(parsed.get("password").and_then(|v| v.as_str()), Some("pw123"));
+            assert_eq!(
+                parsed.get("friendly_name").and_then(|v| v.as_str()),
+                Some("stoat-tui")
+            );
+
+            let resp = format!(
+                "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status_line,
+                resp_body.len(),
+                resp_body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        }
+    });
+
+    let client = DeltaClient::new(server_url, None, false);
+
+    // 1. InvalidCredentials error
+    let err1 = client
+        .login_email("  alice@example.com  ", "pw123")
+        .await
+        .expect_err("Should fail on InvalidCredentials")
+        .to_string();
+    assert!(
+        err1.contains("InvalidCredentials"),
+        "Expected InvalidCredentials in error, got: {}",
+        err1
+    );
+
+    // 2. UnverifiedAccount error
+    let err2 = client
+        .login_email("alice@example.com", "pw123")
+        .await
+        .expect_err("Should fail on UnverifiedAccount")
+        .to_string();
+    assert!(
+        err2.contains("UnverifiedAccount"),
+        "Expected UnverifiedAccount in error, got: {}",
+        err2
+    );
+
+    // 3. MFA challenge surfaces clear Token tab guidance
+    let err3 = client
+        .login_email("alice@example.com", "pw123")
+        .await
+        .expect_err("Should return MFA guidance error")
+        .to_string();
+    assert!(
+        err3.contains("Account has 2FA/MFA enabled — log in via Token tab instead"),
+        "Expected MFA guidance message, got: {}",
+        err3
+    );
+
+    // 4. Success returns session token
+    let ok_res = client
+        .login_email("alice@example.com", "pw123")
+        .await
+        .expect("Should succeed on 4th attempt");
+    match ok_res {
+        LoginResponse::Success { token, .. } => assert_eq!(token, "sess_tok_ok"),
+        other => panic!("Expected LoginResponse::Success, got {:?}", other),
+    }
+
+    server_handle.await.unwrap();
+}
+
+#[test]
+fn test_rgba_to_i420_bounds_validation_and_ppm_roundtrip() {
+    use stoat_tui::voice::rgba_to_i420_buffer;
+    use stoat_tui::voice::screen::{downscale_rgba_even, parse_ppm_p6};
+
+    // Zero dimensions must return None safely
+    assert!(rgba_to_i420_buffer(&[], 0, 0).is_none());
+    assert!(rgba_to_i420_buffer(&[0u8; 16], 0, 4).is_none());
+    assert!(rgba_to_i420_buffer(&[0u8; 16], 4, 0).is_none());
+
+    // Odd dimensions must return None safely (required for I420 4:2:0 subsampling)
+    assert!(rgba_to_i420_buffer(&vec![0u8; 3 * 4 * 4], 3, 4).is_none());
+    assert!(rgba_to_i420_buffer(&vec![0u8; 4 * 5 * 4], 4, 5).is_none());
+
+    // Truncated or oversized RGBA buffer must return None without out-of-bounds read
+    assert!(rgba_to_i420_buffer(&vec![0u8; 4 * 4 * 4 - 1], 4, 4).is_none());
+    assert!(rgba_to_i420_buffer(&vec![0u8; 4 * 4 * 4 + 4], 4, 4).is_none());
+
+    // Valid even PPM -> downscale_rgba_even -> rgba_to_i420_buffer roundtrip
+    let mut ppm = b"P6\n5 3\n255\n".to_vec();
+    for _ in 0..15 {
+        ppm.extend_from_slice(&[20, 180, 90]);
+    }
+    let (w, h, rgba) = parse_ppm_p6(&ppm).expect("Valid 5x3 P6 PPM should parse");
+    assert_eq!((w, h), (5, 3));
+    let (dw, dh, scaled) = downscale_rgba_even(&rgba, w, h, 1280, 720);
+    assert_eq!((dw % 2, dh % 2), (0, 0));
+    assert!(rgba_to_i420_buffer(&scaled, dw, dh).is_some());
+}
+
+#[tokio::test]
+async fn test_hyprland_target_parsing_grim_args_and_screen_picker_modal() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::ui;
+    use stoat_tui::voice::screen::{
+        build_hyprland_targets, grim_args_for_target, wf_recorder_args_for_target,
+        ScreenShareTargetKind,
+    };
+    use stoat_tui::voice::ActiveCallState;
+
+    let monitors_json = r#"[
+        {"name": "DP-1", "width": 2560, "height": 1440, "x": 0, "y": 0},
+        {"name": "HDMI-A-1", "width": 1920, "height": 1080, "x": 2560, "y": 0}
+    ]"#;
+    let clients_json = r#"[
+        {"mapped": true, "hidden": false, "title": "Neovim", "class": "kitty", "at": [100, 50], "size": [1200, 800]},
+        {"mapped": false, "hidden": false, "title": "Ghost", "class": "x", "at": [0, 0], "size": [100, 100]}
+    ]"#;
+
+    let targets = build_hyprland_targets(Some(monitors_json), Some(clients_json));
+    assert_eq!(targets.len(), 4);
+    assert_eq!(
+        targets[0].kind,
+        ScreenShareTargetKind::Monitor {
+            name: "DP-1".to_string(),
+            width: 2560,
+            height: 1440,
+        }
+    );
+    assert_eq!(
+        targets[2].kind,
+        ScreenShareTargetKind::Window {
+            x: 100,
+            y: 50,
+            width: 1200,
+            height: 800,
+            class: "kitty".to_string(),
+        }
+    );
+    assert_eq!(targets[3].kind, ScreenShareTargetKind::EntireDesktop);
+
+    assert_eq!(
+        grim_args_for_target(&targets[0].kind),
+        vec!["-o", "DP-1", "-t", "ppm", "-"]
+    );
+    assert_eq!(
+        grim_args_for_target(&targets[2].kind),
+        vec!["-g", "100,50 1200x800", "-t", "ppm", "-"]
+    );
+    assert_eq!(
+        grim_args_for_target(&targets[3].kind),
+        vec!["-t", "ppm", "-"]
+    );
+
+    // Verify wf-recorder raw RGBA stdout arguments (--output / --geometry / None)
+    let (wf_mon_args, mw, mh) = wf_recorder_args_for_target(&targets[0].kind)
+        .expect("Monitor target should produce wf-recorder args");
+    assert_eq!((mw, mh), (2560, 1440));
+    assert_eq!(
+        wf_mon_args,
+        vec![
+            "--output",
+            "DP-1",
+            "-c",
+            "rawvideo",
+            "-m",
+            "rawvideo",
+            "-x",
+            "rgba",
+            "-f",
+            "pipe:1",
+        ]
+    );
+    let (wf_win_args, ww, wh) = wf_recorder_args_for_target(&targets[2].kind)
+        .expect("Window target should produce wf-recorder args");
+    assert_eq!((ww, wh), (1200, 800));
+    assert_eq!(
+        wf_win_args,
+        vec![
+            "--geometry",
+            "100,50 1200x800",
+            "-c",
+            "rawvideo",
+            "-m",
+            "rawvideo",
+            "-x",
+            "rgba",
+            "-f",
+            "pipe:1",
+        ]
+    );
+    assert!(wf_recorder_args_for_target(&targets[3].kind).is_none());
+
+    // Exercise ScreenShareSelectTarget -> modal render -> j/Enter selection -> ScreenShareCancelled
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (cfg, _guard) = isolated_config(Some("tok_scr"));
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
+    app.state.show_login_modal = false;
+    app.state.active_call = Some(ActiveCallState::new("ch_scr".to_string()));
+
+    app.handle_event(AppEvent::ScreenShareSelectTarget {
+        channel_id: "ch_scr".to_string(),
+        targets: targets.clone(),
+    })
+    .await;
+    assert!(app.state.show_screen_picker_modal);
+
+    let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
+    term.draw(|f| ui::render(f, &mut app.state)).unwrap();
+    let txt: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+    assert!(txt.contains("Select Screen Share Source"), "Missing picker title: {}", txt);
+    assert!(txt.contains("DP-1"), "Missing monitor entry: {}", txt);
+
+    // Move down twice (to Window) and confirm with Enter
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)))
+        .await;
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)))
+        .await;
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
+        .await;
+
+    assert!(!app.state.show_screen_picker_modal);
+    let call = app.state.active_call.as_ref().unwrap();
+    assert!(call.is_screensharing());
+    let chosen = call.pending_screen_target.lock().unwrap().clone();
+    assert_eq!(chosen, Some(targets[2].kind.clone()));
+
+    app.handle_event(AppEvent::ScreenShareCancelled {
+        channel_id: "ch_scr".to_string(),
+    })
+    .await;
+    assert!(!app.state.active_call.as_ref().unwrap().is_screensharing());
+}
+
+#[tokio::test]
+async fn test_start_screen_capture_wayland_routes_through_target_picker() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use stoat_tui::voice::screen::{start_screen_capture, ScreenCaptureError};
+
+    let tmp_dir = std::env::temp_dir().join(format!("stoat_tui_bin_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let hyprctl_path = tmp_dir.join("hyprctl");
+    std::fs::write(
+        &hyprctl_path,
+        r#"#!/bin/sh
+if [ "$1" = "monitors" ]; then
+  echo '[{"name":"ED240Q S3","width":1920,"height":1080,"x":0,"y":0}]'
+elif [ "$1" = "clients" ]; then
+  echo '[{"mapped":true,"hidden":false,"title":"Kitty","class":"kitty","at":[0,0],"size":[800,600]}]'
+fi
+"#,
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&hyprctl_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&hyprctl_path, perms).unwrap();
+
+    let prev_path = std::env::var("PATH").unwrap_or_default();
+    let prev_wayland = std::env::var("WAYLAND_DISPLAY").ok();
+    std::env::set_var("PATH", format!("{}:{}", tmp_dir.display(), prev_path));
+    std::env::set_var("WAYLAND_DISPLAY", "wayland-test-1");
+
+    let res = start_screen_capture(Arc::new(AtomicBool::new(false)), None).await;
+
+    std::env::set_var("PATH", prev_path);
+    match prev_wayland {
+        Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
+        None => std::env::remove_var("WAYLAND_DISPLAY"),
+    }
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    match res {
+        Err(ScreenCaptureError::NeedTargetSelection(targets)) => {
+            assert!(targets.iter().any(|t| t.label.contains("ED240Q S3")));
+            assert!(targets.iter().any(|t| t.label.contains("Kitty")));
+            assert!(targets.iter().any(|t| t.label.contains("Entire Desktop")));
+        }
+        Ok(_) => panic!("Expected NeedTargetSelection when multiple targets exist"),
+        Err(other) => panic!("Unexpected ScreenCaptureError: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_secondary_account_call_no_duplicate_local_participant() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use stoat_tui::api::models::{Channel, User};
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::ui;
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (cfg, _guard) = isolated_config(Some("tok_primary"));
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
+    app.state.show_login_modal = false;
+
+    // Primary account: Rutytoi (id_primary)
+    app.handle_event(AppEvent::AccountScoped {
+        account_id: "primary".to_string(),
+        event: Box::new(AppEvent::ApiCurrentUser(User {
+            id: "id_primary".to_string(),
+            username: "Rutytoi".to_string(),
+            ..Default::default()
+        })),
+    })
+    .await;
+
+    // Secondary alpha-node account: rutytoi (id_selfhosted)
+    app.handle_event(AppEvent::AccountScoped {
+        account_id: "alpha-node".to_string(),
+        event: Box::new(AppEvent::ApiCurrentUser(User {
+            id: "id_selfhosted".to_string(),
+            username: "rutytoi".to_string(),
+            ..Default::default()
+        })),
+    })
+    .await;
+
+    // Channel owned by alpha-node
+    app.state.channel_accounts.insert("ch_alpha".to_string(), "alpha-node".to_string());
+    app.state.channels.insert(
+        "ch_alpha".to_string(),
+        Channel {
+            id: "ch_alpha".to_string(),
+            channel_type: "DirectMessage".to_string(),
+            ..Default::default()
+        },
+    );
+    app.state.active_channel_id = Some("ch_alpha".to_string());
+
+    // Join call on alpha-node channel
+    app.toggle_call().await;
+    {
+        let call = app.state.active_call.as_ref().expect("Call should be initialized");
+        assert_eq!(call.account_id, "alpha-node");
+        assert_eq!(call.local_user_id, "id_selfhosted");
+        assert_eq!(call.participants.len(), 1);
+        assert_eq!(call.participants[0].user_id, "id_selfhosted");
+        assert!(call.participants[0].is_local);
+    }
+
+    // Simulate LiveKit reporting local_participant identity with device suffix + duplicate Bonfire join
+    app.handle_event(AppEvent::CallParticipantJoined {
+        channel_id: "ch_alpha".to_string(),
+        user_id: "id_selfhosted:desktop".to_string(),
+        is_local: true,
+    })
+    .await;
+    app.handle_event(AppEvent::CallParticipantJoined {
+        channel_id: "ch_alpha".to_string(),
+        user_id: "id_selfhosted".to_string(),
+        is_local: false,
+    })
+    .await;
+
+    let call = app.state.active_call.as_ref().unwrap();
+    assert_eq!(call.participants.len(), 1, "Must not duplicate local participant");
+    assert_eq!(call.participants[0].user_id, "id_selfhosted");
+
+    // Render CallStage and verify only 'rutytoi' appears in the stage, never primary 'Rutytoi'
+    let mut term = Terminal::new(TestBackend::new(90, 26)).unwrap();
+    term.draw(|f| ui::render(f, &mut app.state)).unwrap();
+    let txt: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+    let stage_slice = txt
+        .split("Live Voice & Video Stage")
+        .nth(1)
+        .and_then(|s| s.split("Welcome to").next())
+        .unwrap_or(&txt);
+    assert!(
+        stage_slice.contains("rutytoi"),
+        "Missing alpha-node local user 'rutytoi' in CallStage: {}",
+        stage_slice
+    );
+    assert!(
+        !stage_slice.contains("Rutytoi"),
+        "Primary user 'Rutytoi' must not appear in alpha-node CallStage: {}",
+        stage_slice
+    );
 }

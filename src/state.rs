@@ -134,6 +134,10 @@ pub struct AppState {
     pub show_settings_modal: bool,
     pub settings_selected_index: usize,
 
+    pub show_screen_picker_modal: bool,
+    pub screen_picker_targets: Vec<crate::voice::screen::ScreenShareTarget>,
+    pub screen_picker_selected: usize,
+
     pub show_login_modal: bool,
     pub is_demo_mode: bool,
     pub login_tab: LoginTab,
@@ -272,6 +276,10 @@ impl AppState {
 
             show_settings_modal: false,
             settings_selected_index: 0,
+
+            show_screen_picker_modal: false,
+            screen_picker_targets: Vec::new(),
+            screen_picker_selected: 0,
 
             show_login_modal: show_login,
             is_demo_mode: false,
@@ -1270,6 +1278,25 @@ impl AppState {
         } else {
             // Trigger user fetch so we know whether the user has a custom Autumn avatar
             let _ = self.resolve_user(user_id);
+        }
+    }
+
+    pub fn request_user_avatar_with_key_in_account(
+        &mut self,
+        account_id: &str,
+        user_id: &str,
+        key: &str,
+    ) {
+        if !account_id.is_empty() {
+            self.user_accounts
+                .entry(user_id.to_string())
+                .or_insert_with(|| account_id.to_string());
+        }
+        if let Some(user) = self.users.get(user_id).cloned() {
+            let url = self.avatar_url_for_user(&user);
+            self.request_image(key.to_string(), url);
+        } else {
+            let _ = self.resolve_user_in_account(account_id, user_id);
         }
     }
 }

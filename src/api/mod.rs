@@ -46,6 +46,173 @@ impl DeltaClient {
             .unwrap_or(false)
     }
 
+    /// Normalizes a user-entered server URL by trimming trailing `/` and prefixing `https://`
+    /// (or `http://` for localhost / private LAN IPs) if no scheme was specified.
+    pub fn normalize_url_str(raw_url: &str) -> String {
+        let trimmed = raw_url.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            return "https://api.stoat.chat".to_string();
+        }
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            return trimmed.to_string();
+        }
+        let host_port = trimmed.split('/').next().unwrap_or(trimmed);
+        let host = host_port
+            .split(':')
+            .next()
+            .unwrap_or(host_port)
+            .to_ascii_lowercase();
+        let is_local = host == "localhost"
+            || host == "[::1]"
+            || host.starts_with("127.")
+            || host.starts_with("10.")
+            || host.starts_with("192.168.")
+            || (host.starts_with("172.")
+                && host
+                    .split('.')
+                    .nth(1)
+                    .and_then(|o| o.parse::<u8>().ok())
+                    .map(|o| (16..=31).contains(&o))
+                    .unwrap_or(false));
+        let scheme = if is_local { "http" } else { "https" };
+        format!("{}://{}", scheme, trimmed)
+    }
+
+    fn is_delta_metadata_json(body: &str) -> bool {
+        let trimmed = body.trim();
+        if trimmed.is_empty() || trimmed.starts_with('<') {
+            return false;
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(obj) = val.as_object() {
+                return obj.contains_key("revolt")
+                    || obj.contains_key("features")
+                    || obj.contains_key("stoat");
+            }
+        }
+        false
+    }
+
+    /// Normalizes `raw_url` and probes `GET {url}/` for Delta's root metadata (`"revolt"` or `"features"`).
+    /// If `/` returns HTML, 404, or lacks Delta's metadata signature, automatically probes `GET {url}/api/`
+    /// and returns `{url}/api` when that endpoint serves Delta's root JSON.
+    pub async fn normalize_and_probe_api_url(raw_url: &str) -> String {
+        let base = Self::normalize_url_str(raw_url);
+        let probe_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .user_agent("stoat-tui/0.1.0")
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
+        let root_probe = format!("{}/", base);
+        log_debug!("Probing Stoat API root metadata at GET {}", root_probe);
+        if let Ok(resp) = probe_client.get(&root_probe).send().await {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if status.is_success() && Self::is_delta_metadata_json(&body) {
+                log_info!("GET {} confirmed valid Delta API root (HTTP {})", root_probe, status);
+                return base;
+            }
+            let preview: String = body.chars().take(120).collect();
+            log_debug!(
+                "GET {} did not match Delta metadata (HTTP {}, preview={:?}); checking /api fallback...",
+                root_probe,
+                status,
+                preview
+            );
+        } else {
+            log_debug!("GET {} probe failed to connect", root_probe);
+            return base;
+        }
+
+        if !base.ends_with("/api") {
+            let api_base = format!("{}/api", base);
+            for candidate_probe in [format!("{}/", api_base), api_base.clone()] {
+                log_debug!("Probing fallback Stoat API path at GET {}", candidate_probe);
+                if let Ok(resp) = probe_client.get(&candidate_probe).send().await {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    if status.is_success() && Self::is_delta_metadata_json(&body) {
+                        log_info!(
+                            "Auto-detected self-hosted Delta API base URL: {} (via GET {} -> HTTP {})",
+                            api_base,
+                            candidate_probe,
+                            status
+                        );
+                        return api_base;
+                    }
+                }
+            }
+        }
+
+        base
+    }
+
+    fn redact_auth_response(raw_body: &str) -> String {
+        if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(raw_body) {
+            if let Some(obj) = val.as_object_mut() {
+                for secret_key in ["token", "password", "ticket", "mfa_ticket"] {
+                    if let Some(s) = obj.get(secret_key).and_then(|v| v.as_str()) {
+                        let len = s.len();
+                        obj.insert(
+                            secret_key.to_string(),
+                            serde_json::Value::String(format!("<redacted len={}>", len)),
+                        );
+                    }
+                }
+            }
+            val.to_string()
+        } else {
+            raw_body.chars().take(300).collect()
+        }
+    }
+
+    fn format_structured_auth_error(status: reqwest::StatusCode, raw_body: &str) -> Option<String> {
+        let val = serde_json::from_str::<serde_json::Value>(raw_body).ok()?;
+        let obj = val.as_object()?;
+        let err_type = obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .or_else(|| obj.get("error").and_then(|v| v.as_str()))?;
+
+        let description = match err_type {
+            "InvalidCredentials" => "InvalidCredentials: Invalid email or password",
+            "UnverifiedAccount" => "UnverifiedAccount: Account email is not verified",
+            "UserNotFound" => "UserNotFound: Account not found",
+            "FailedValidation" => "FailedValidation: Invalid email or password format",
+            "InvalidSession" => "InvalidSession: Invalid or expired session",
+            "CompromisedPassword" => "CompromisedPassword: Compromised password, please reset password",
+            "Blocked" => "Blocked: Account access blocked",
+            "LockedOut" => "LockedOut: Account temporarily locked out",
+            "TooManyRequests" => "TooManyRequests: Too many login attempts, please wait and try again",
+            other => {
+                let extra = obj
+                    .get("message")
+                    .or_else(|| obj.get("error"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| *s != other)
+                    .unwrap_or("");
+                return if extra.is_empty() {
+                    Some(format!("{} (HTTP {})", other, status.as_u16()))
+                } else {
+                    Some(format!("{} (HTTP {}): {}", other, status.as_u16(), extra))
+                };
+            }
+        };
+
+        let extra = obj
+            .get("message")
+            .or_else(|| obj.get("error"))
+            .and_then(|v| v.as_str())
+            .filter(|s| *s != err_type)
+            .unwrap_or("");
+        if extra.is_empty() {
+            Some(format!("{} (HTTP {})", description, status.as_u16()))
+        } else {
+            Some(format!("{} (HTTP {}): {}", description, status.as_u16(), extra))
+        }
+    }
+
     fn headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -100,19 +267,27 @@ impl DeltaClient {
         Ok(metadata)
     }
 
-    pub async fn login(&self, email: &str, password: &str) -> Result<LoginResponse> {
-        let url = format!("{}/auth/session/login", self.api_url);
-        log_info!("POST {} (logging in user '{}')", url, email);
-        let payload = LoginPayload {
-            email: email.to_string(),
-            password: password.to_string(),
-            friendly_name: "stoat-tui".to_string(),
-        };
+    pub async fn login_email(&self, email: &str, password: &str) -> Result<LoginResponse> {
+        let url = format!("{}/auth/session/login", self.api_url.trim_end_matches('/'));
+        let email_trimmed = email.trim();
+        log_info!(
+            "POST {} | payload={{\"email\":{:?},\"password\":\"<redacted>\",\"friendly_name\":\"stoat-tui\"}}",
+            url,
+            email_trimmed
+        );
+        let payload = serde_json::json!({
+            "email": email_trimmed,
+            "password": password,
+            "friendly_name": "stoat-tui"
+        });
+
+        let mut anon_headers = HeaderMap::new();
+        anon_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         let resp = self
             .client
             .post(&url)
-            .headers(self.headers())
+            .headers(anon_headers)
             .json(&payload)
             .send()
             .await
@@ -120,39 +295,40 @@ impl DeltaClient {
 
         let status = resp.status();
         let raw_body = resp.text().await.unwrap_or_default();
-        log_info!("POST {} -> Status: {}", url, status);
+        let redacted = Self::redact_auth_response(&raw_body);
+        log_info!("POST {} -> HTTP {} | body: {}", url, status, redacted);
+
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw_body) {
+            if val.get("result").and_then(|v| v.as_str()) == Some("MFA") {
+                let msg = "Account has 2FA/MFA enabled — log in via Token tab instead";
+                log_warn!("POST {} returned result=MFA: {}", url, msg);
+                return Err(anyhow!(msg));
+            }
+            if val.get("result").and_then(|v| v.as_str()) == Some("Disabled") {
+                return Err(anyhow!("Account is disabled"));
+            }
+        }
 
         if !status.is_success() {
-            log_warn!("Login failed with status {}: {}", status, raw_body);
-            // 1. Attempt to deserialize standard Stoat/Revolt JSON error
-            if let Ok(api_err) = serde_json::from_str::<RevoltApiError>(&raw_body) {
-                let description = match api_err.error_type.as_str() {
-                    "InvalidCredentials" => "Invalid credentials",
-                    "UserNotFound" => "Account not found",
-                    "FailedValidation" => "Failed validation (invalid email or password format)",
-                    "InvalidSession" => "Invalid session",
-                    "CompromisedPassword" => "Compromised password, please reset password",
-                    "Blocked" => "Access blocked",
-                    "TooManyRequests" => "Too many login attempts, please wait and try again",
-                    other => other,
-                };
-                let extra = api_err.error.as_deref().unwrap_or("");
-                if extra.is_empty() {
-                    return Err(anyhow!("{} ({})", description, status.as_u16()));
-                } else {
-                    return Err(anyhow!("{} ({}): {}", description, status.as_u16(), extra));
-                }
+            log_warn!("Login failed at {} with HTTP {}: {}", url, status, redacted);
+            if let Some(structured) = Self::format_structured_auth_error(status, &raw_body) {
+                return Err(anyhow!(structured));
             }
 
-            // 2. Handle known HTTP status codes gracefully
             let clean_body = raw_body.trim();
             if status == reqwest::StatusCode::NOT_FOUND {
-                return Err(anyhow!("HTTP 404 - Check API URL (endpoint not found at {})", self.api_url));
+                return Err(anyhow!(
+                    "HTTP 404 - Check API URL (endpoint not found at {})",
+                    self.api_url
+                ));
             }
             if clean_body.is_empty() {
                 return Err(anyhow!("Server returned HTTP {}", status));
             } else if clean_body.starts_with('<') {
-                return Err(anyhow!("Server returned HTTP {} (HTML response - verify API URL)", status));
+                return Err(anyhow!(
+                    "Server returned HTTP {} (HTML response - verify API URL)",
+                    status
+                ));
             } else {
                 let preview = if clean_body.len() > 100 {
                     format!("{}...", &clean_body[..100])
@@ -163,9 +339,14 @@ impl DeltaClient {
             }
         }
 
-        // 3. Success deserialization: try tagged LoginResponse first, then direct
         if let Ok(login_resp) = serde_json::from_str::<LoginResponse>(&raw_body) {
-            return Ok(login_resp);
+            return match login_resp {
+                LoginResponse::MFA { .. } => Err(anyhow!(
+                    "Account has 2FA/MFA enabled — log in via Token tab instead"
+                )),
+                LoginResponse::Disabled => Err(anyhow!("Account is disabled")),
+                other => Ok(other),
+            };
         }
 
         if let Ok(direct) = serde_json::from_str::<DirectLoginSuccess>(&raw_body) {
@@ -179,8 +360,16 @@ impl DeltaClient {
         Err(anyhow!(
             "Unexpected server response format (HTTP {}): {}",
             status,
-            if raw_body.len() > 80 { format!("{}...", &raw_body[..80]) } else { raw_body }
+            if raw_body.len() > 80 {
+                format!("{}...", &raw_body[..80])
+            } else {
+                raw_body
+            }
         ))
+    }
+
+    pub async fn login(&self, email: &str, password: &str) -> Result<LoginResponse> {
+        self.login_email(email, password).await
     }
 
     pub async fn verify_mfa_totp(&self, ticket: &str, code: &str) -> Result<LoginResponse> {
@@ -321,6 +510,9 @@ impl DeltaClient {
                 header_name,
                 err_text
             );
+            if let Some(structured) = Self::format_structured_auth_error(status, &err_text) {
+                return Err(anyhow!("401 Unauthorized: {}", structured));
+            }
             return Err(anyhow!("401 Unauthorized: Session expired"));
         }
 
@@ -333,6 +525,9 @@ impl DeltaClient {
                 header_name,
                 err_text
             );
+            if let Some(structured) = Self::format_structured_auth_error(status, &err_text) {
+                return Err(anyhow!("{}", structured));
+            }
             return Err(anyhow!("Failed to get user ({}): {}", status, err_text));
         }
 
@@ -665,18 +860,31 @@ impl DeltaClient {
                 if status_opt == Some(reqwest::StatusCode::BAD_REQUEST)
                     && primary_err.contains("AlreadyConnected")
                 {
-                    log_warn!(
-                        "Detected AlreadyConnected ghost session; sending leave_call and retrying..."
-                    );
-                    self.leave_call(channel_id).await;
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    return match self
-                        .try_call_request(reqwest::Method::POST, &primary_url, &payload)
-                        .await
-                    {
-                        Ok(res) => Ok(res),
-                        Err((_, retry_err)) => Err(anyhow!(retry_err)),
-                    };
+                    let mut last_err = primary_err;
+                    let backoff_ms = [300u64, 600, 1000];
+                    for (idx, delay_ms) in backoff_ms.iter().enumerate() {
+                        log_warn!(
+                            "Detected AlreadyConnected ghost session (attempt {}/{}); sending leave_call and retrying in {}ms...",
+                            idx + 1,
+                            backoff_ms.len(),
+                            delay_ms
+                        );
+                        self.leave_call(channel_id).await;
+                        tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+                        match self
+                            .try_call_request(reqwest::Method::POST, &primary_url, &payload)
+                            .await
+                        {
+                            Ok(res) => return Ok(res),
+                            Err((Some(reqwest::StatusCode::BAD_REQUEST), retry_err))
+                                if retry_err.contains("AlreadyConnected") =>
+                            {
+                                last_err = retry_err;
+                            }
+                            Err((_, retry_err)) => return Err(anyhow!(retry_err)),
+                        }
+                    }
+                    return Err(anyhow!(last_err));
                 }
 
                 let should_fallback = matches!(
@@ -747,79 +955,48 @@ impl DeltaClient {
 
     pub async fn leave_call(&self, channel_id: &str) {
         let base_api = self.api_url.trim_end_matches('/');
-        let leave_url = format!("{}/channels/{}/leave_call", base_api, channel_id);
-        log_info!("Calling POST {} to leave call cleanly...", leave_url);
+        let attempts = [
+            (
+                reqwest::Method::POST,
+                format!("{}/channels/{}/leave_call", base_api, channel_id),
+                true,
+            ),
+            (
+                reqwest::Method::DELETE,
+                format!("{}/channels/{}/call", base_api, channel_id),
+                false,
+            ),
+            (
+                reqwest::Method::DELETE,
+                format!("{}/channels/{}/ring", base_api, channel_id),
+                false,
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{}/channels/{}/end_ring", base_api, channel_id),
+                true,
+            ),
+        ];
 
-        let fallback_needed = match self
-            .client
-            .post(&leave_url)
-            .headers(self.headers())
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                if status.is_success() {
-                    log_info!("POST {} -> HTTP {} (left call)", leave_url, status);
-                    false
-                } else {
-                    log_debug!("POST {} -> HTTP {} | body: {}", leave_url, status, body);
-                    matches!(
-                        status,
-                        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
-                    )
+        log_info!("Disconnecting call session for channel {}...", channel_id);
+        for (method, url, send_json) in attempts {
+            let mut req = self.client.request(method.clone(), &url).headers(self.headers());
+            if send_json {
+                req = req.json(&serde_json::json!({}));
+            }
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    if status.is_success() {
+                        log_info!("{} {} -> HTTP {} (call session left)", method, url, status);
+                        return;
+                    }
+                    log_debug!("{} {} -> HTTP {} | body: {}", method, url, status, body);
                 }
-            }
-            Err(e) => {
-                log_debug!("POST {} request error (ignored non-fatal): {}", leave_url, e);
-                false
-            }
-        };
-
-        if !fallback_needed {
-            return;
-        }
-
-        let ring_url = format!("{}/channels/{}/ring", base_api, channel_id);
-        match self
-            .client
-            .delete(&ring_url)
-            .headers(self.headers())
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                if status.is_success() {
-                    log_info!("DELETE {} -> HTTP {} (ended call ring)", ring_url, status);
-                    return;
+                Err(e) => {
+                    log_debug!("{} {} request error (ignored non-fatal): {}", method, url, e);
                 }
-                log_debug!("DELETE {} -> HTTP {} | body: {}", ring_url, status, body);
-            }
-            Err(e) => {
-                log_debug!("DELETE {} request error (ignored non-fatal): {}", ring_url, e);
-            }
-        }
-
-        let end_ring_url = format!("{}/channels/{}/end_ring", base_api, channel_id);
-        match self
-            .client
-            .post(&end_ring_url)
-            .headers(self.headers())
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                log_debug!("POST {} -> HTTP {} | body: {}", end_ring_url, status, body);
-            }
-            Err(e) => {
-                log_debug!("POST {} request error (ignored non-fatal): {}", end_ring_url, e);
             }
         }
     }

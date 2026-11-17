@@ -17,6 +17,51 @@ use stoat_tui::ui;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+struct TermiosSlot(std::cell::UnsafeCell<std::mem::MaybeUninit<libc::termios>>);
+unsafe impl Sync for TermiosSlot {}
+
+static ORIG_TERMIOS: TermiosSlot =
+    TermiosSlot(std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()));
+static HAS_ORIG_TERMIOS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn save_original_termios() {
+    unsafe {
+        let slot = &mut *ORIG_TERMIOS.0.get();
+        if libc::tcgetattr(libc::STDIN_FILENO, slot.as_mut_ptr()) == 0 {
+            HAS_ORIG_TERMIOS.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+extern "C" fn crash_signal_handler(sig: libc::c_int) {
+    unsafe {
+        if HAS_ORIG_TERMIOS.load(std::sync::atomic::Ordering::SeqCst) {
+            let slot = &*ORIG_TERMIOS.0.get();
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, slot.as_ptr());
+        }
+        let seq = b"\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l";
+        let _ = libc::write(
+            libc::STDERR_FILENO,
+            seq.as_ptr() as *const libc::c_void,
+            seq.len(),
+        );
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+fn install_crash_signal_handlers() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = crash_signal_handler as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = libc::SA_RESETHAND;
+        for sig in [libc::SIGSEGV, libc::SIGABRT, libc::SIGTERM, libc::SIGHUP] {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
 fn print_help() {
     let log_path = stoat_tui::logger::resolve_log_path();
     println!(
@@ -105,8 +150,25 @@ fn detect_picker_fast() -> (std::sync::Arc<ratatui_image::picker::Picker>, bool)
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 0. Setup panic hook immediately so any crash restores terminal state
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            Show
+        );
+        stoat_tui::log_error!("Application panicked: {:?}", info);
+        default_panic(info);
+    }));
+    save_original_termios();
+    install_crash_signal_handlers();
+
     let launch_start = Instant::now();
-    // 0. Parse command-line arguments
+    // 1. Parse command-line arguments
     let args: Vec<String> = env::args().skip(1).collect();
     let mut override_api: Option<String> = None;
     let mut i = 0;
@@ -147,25 +209,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 1. Initialize file logger early
+    // 2. Initialize file logger early
     let log_path = stoat_tui::logger::init();
     stoat_tui::log_info!("Starting stoat-tui v{} (PID: {})", VERSION, std::process::id());
     stoat_tui::log_info!("Debug log path: {}", log_path.display());
-
-    // 2. Setup panic hook for terminal restoration safety
-    let default_panic = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            LeaveAlternateScreen,
-            DisableMouseCapture,
-            DisableBracketedPaste,
-            Show
-        );
-        stoat_tui::log_error!("Application panicked: {:?}", info);
-        default_panic(info);
-    }));
 
     // 3. Load configuration and lightweight navigation cache synchronously (<1ms)
     let mut config = Config::load().unwrap_or_default();

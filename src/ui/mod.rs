@@ -15,6 +15,7 @@ use components::servers::ServersRail;
 use components::status_bar::StatusBar;
 use modals::command_palette::CommandPaletteModal;
 use modals::login::LoginModal;
+use modals::screen_picker::ScreenPickerModal;
 use modals::settings::SettingsModal;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -146,6 +147,26 @@ fn render_modals(f: &mut Frame, state: &mut AppState, size: Rect) {
         };
         if modal_rect.width > 0 && modal_rect.height > 0 {
             f.render_widget(SettingsModal::new(state), modal_rect);
+        }
+    }
+
+    if state.show_screen_picker_modal {
+        let modal_rect = if size.width < 36 || size.height < 12 {
+            size
+        } else {
+            let modal_w = 66.min(size.width.saturating_sub(4));
+            let modal_h = (5 + state.screen_picker_targets.len() as u16)
+                .clamp(8, 18)
+                .min(size.height.saturating_sub(2));
+            Rect {
+                x: size.width.saturating_sub(modal_w) / 2,
+                y: size.height.saturating_sub(modal_h) / 2,
+                width: modal_w,
+                height: modal_h,
+            }
+        };
+        if modal_rect.width > 0 && modal_rect.height > 0 {
+            f.render_widget(ScreenPickerModal::new(state), modal_rect);
         }
     }
 }

@@ -26,6 +26,7 @@ pub struct App {
     pub accounts: HashMap<String, AccountRuntime>,
     pub account_clients: Arc<StdMutex<HashMap<String, DeltaClient>>>,
     pub pending_call_cleanups: Vec<tokio::task::JoinHandle<()>>,
+    pub last_video_preview_encode: Option<std::time::Instant>,
 }
 
 impl App {
@@ -139,6 +140,7 @@ impl App {
             accounts,
             account_clients,
             pending_call_cleanups: Vec::new(),
+            last_video_preview_encode: None,
         }
     }
 
@@ -235,6 +237,7 @@ impl App {
         let tx_me = tx.clone();
         let tok_me = token.clone();
         let acc_me = account_id.clone();
+        let api_url_me = api_url.clone();
         let gw_cfg_me = gw_url_config.clone();
         let has_initial_ws = initial_ws_hint.is_some();
         tokio::spawn(async move {
@@ -249,6 +252,32 @@ impl App {
                         .await;
                 }
                 Err(e) => {
+                    if !api_url_me.ends_with("/api") {
+                        let probed = DeltaClient::normalize_and_probe_api_url(&api_url_me).await;
+                        if probed != api_url_me {
+                            let probed_client =
+                                DeltaClient::new(probed.clone(), Some(tok_me.clone()), is_bot);
+                            if let Ok(user) = probed_client.fetch_me(&tok_me).await {
+                                log_info!(
+                                    "Startup [{}]: Auto-upgraded api_url {} -> {} and authenticated @{}",
+                                    acc_me,
+                                    api_url_me,
+                                    probed,
+                                    user.username
+                                );
+                                let _ = tx_me
+                                    .send(AppEvent::AccountLoginSuccess {
+                                        api_url: probed,
+                                        token: tok_me,
+                                        is_bot,
+                                        add_to_existing: true,
+                                    })
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+
                     let err_msg = e.to_string();
                     log_warn!("Startup [{}]: GET /users/@me failed: {}", acc_me, err_msg);
                     if err_msg.contains("401") || err_msg.contains("Unauthorized") || err_msg.contains("Session expired") {
@@ -507,6 +536,7 @@ impl App {
             }
             AppEvent::ApiLoginFailure(err) => {
                 self.state.login_loading = false;
+                self.state.set_status(format!("Login failed: {}", err));
                 self.state.login_error = Some(err);
             }
             AppEvent::ApiMessageSent(res) => match res {
@@ -618,7 +648,14 @@ impl App {
                 if let Some(ref mut cache) = self.state.image_cache {
                     if let Some((snap, show_local)) = maybe_snap {
                         if snap.is_remote || show_local {
-                            cache.insert("active_call_video".to_string(), snap.image);
+                            let should_encode = self
+                                .last_video_preview_encode
+                                .map(|t| t.elapsed() >= std::time::Duration::from_millis(33))
+                                .unwrap_or(true);
+                            if should_encode {
+                                self.last_video_preview_encode = Some(std::time::Instant::now());
+                                cache.insert("active_call_video".to_string(), snap.image);
+                            }
                         } else {
                             cache.remove("active_call_video");
                         }
@@ -639,6 +676,25 @@ impl App {
                     error
                 ));
                 self.state.set_status(clean);
+            }
+            AppEvent::ScreenShareCancelled { channel_id } => {
+                if let Some(ref mut call) = self.state.active_call {
+                    if call.channel_id == channel_id {
+                        call.screensharing.store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                self.state.set_status("Screen share cancelled");
+            }
+            AppEvent::ScreenShareSelectTarget { channel_id, targets } => {
+                if let Some(ref mut call) = self.state.active_call {
+                    if call.channel_id == channel_id {
+                        call.screensharing.store(false, std::sync::atomic::Ordering::SeqCst);
+                        self.state.screen_picker_targets = targets;
+                        self.state.screen_picker_selected = 0;
+                        self.state.show_screen_picker_modal = true;
+                        self.state.set_status("Select a monitor or window to share");
+                    }
+                }
             }
             AppEvent::CallConnected { channel_id } => {
                 if let Some(ref mut call) = self.state.active_call {
@@ -666,32 +722,87 @@ impl App {
                 }
                 self.state.set_status(format!("📞 Call disconnected: {}", reason));
             }
-            AppEvent::CallParticipantJoined { channel_id, user_id } => {
+            AppEvent::CallParticipantJoined {
+                channel_id,
+                user_id,
+                is_local,
+            } => {
                 let norm_id = crate::voice::normalize_livekit_identity(&user_id);
                 if norm_id.is_empty() || norm_id == "caller" {
                     return;
                 }
-                let _ = self.state.resolve_user(&norm_id);
-                let is_self = self.state.current_user.as_ref().map(|u| u.id == norm_id).unwrap_or(false);
-                if !is_self {
-                    if let Some(ref mut call) = self.state.active_call {
-                        if call.channel_id == channel_id
-                            && !call.participants.iter().any(|p| p.user_id == norm_id)
-                        {
-                            call.participants.push(crate::voice::VoiceParticipant {
-                                user_id: norm_id.clone(),
-                                is_speaking: false,
-                                is_muted: false,
-                                is_deafened: false,
-                                is_screensharing: false,
-                            });
+                let acc_id = self.state.account_for_channel(&channel_id).to_string();
+                let _ = self.state.resolve_user_in_account(&acc_id, &norm_id);
+                let acc_self_uid = self
+                    .state
+                    .current_user_for_account(&acc_id)
+                    .map(|u| u.id.clone());
+
+                if let Some(ref mut call) = self.state.active_call {
+                    if call.channel_id == channel_id {
+                        if is_local {
+                            call.local_user_id = norm_id.clone();
+                            let existing_idx = call
+                                .participants
+                                .iter()
+                                .position(|p| p.is_local || p.user_id == norm_id);
+                            if let Some(idx) = existing_idx {
+                                call.participants[idx].user_id = norm_id.clone();
+                                call.participants[idx].is_local = true;
+                                call.participants[idx].account_id = acc_id.clone();
+                                let mut seen_local = false;
+                                call.participants.retain(|p| {
+                                    if p.is_local || p.user_id == norm_id {
+                                        if seen_local {
+                                            return false;
+                                        }
+                                        seen_local = true;
+                                    }
+                                    true
+                                });
+                            } else {
+                                call.participants.push(crate::voice::VoiceParticipant {
+                                    user_id: norm_id.clone(),
+                                    account_id: acc_id.clone(),
+                                    is_local: true,
+                                    is_speaking: call.local_speaking,
+                                    is_muted: call.is_muted(),
+                                    is_deafened: call.is_deafened(),
+                                    is_screensharing: call.is_screensharing(),
+                                });
+                            }
+                        } else {
+                            let is_same_as_local = (!call.local_user_id.is_empty()
+                                && call.local_user_id == norm_id)
+                                || acc_self_uid.as_deref() == Some(norm_id.as_str());
+                            if !is_same_as_local
+                                && !call.participants.iter().any(|p| p.user_id == norm_id)
+                            {
+                                call.participants.push(crate::voice::VoiceParticipant {
+                                    user_id: norm_id.clone(),
+                                    account_id: acc_id.clone(),
+                                    is_local: false,
+                                    is_speaking: false,
+                                    is_muted: false,
+                                    is_deafened: false,
+                                    is_screensharing: false,
+                                });
+                            }
                         }
                     }
                 }
-                let entry = self.state.voice_channel_participants.entry(channel_id).or_default();
+
+                let is_self_for_acc = acc_self_uid.as_deref() == Some(norm_id.as_str());
+                let entry = self
+                    .state
+                    .voice_channel_participants
+                    .entry(channel_id)
+                    .or_default();
                 if !entry.iter().any(|p| p.user_id == norm_id) {
                     entry.push(crate::voice::VoiceParticipant {
                         user_id: norm_id,
+                        account_id: acc_id,
+                        is_local: is_local || is_self_for_acc,
                         is_speaking: false,
                         is_muted: false,
                         is_deafened: false,
@@ -727,11 +838,18 @@ impl App {
                         self.state.call_fallback_names.insert(norm_id.clone(), trimmed);
                     }
                 }
-                let _ = self.state.resolve_user(&norm_id);
-                let is_self = self.state.current_user.as_ref().map(|u| u.id == norm_id).unwrap_or(false);
-                if !is_self {
-                    if let Some(ref mut call) = self.state.active_call {
-                        if call.channel_id == channel_id {
+                let acc_id = self.state.account_for_channel(&channel_id).to_string();
+                let _ = self.state.resolve_user_in_account(&acc_id, &norm_id);
+                let acc_self_uid = self
+                    .state
+                    .current_user_for_account(&acc_id)
+                    .map(|u| u.id.clone());
+                if let Some(ref mut call) = self.state.active_call {
+                    if call.channel_id == channel_id {
+                        let is_self = (!call.local_user_id.is_empty()
+                            && call.local_user_id == norm_id)
+                            || acc_self_uid.as_deref() == Some(norm_id.as_str());
+                        if !is_self {
                             if let Some(p) = call.participants.iter_mut().find(|p| p.user_id == norm_id) {
                                 if let Some(m) = is_muted {
                                     p.is_muted = m;
@@ -747,6 +865,8 @@ impl App {
                                 let m = is_muted.unwrap_or(false) || d;
                                 call.participants.push(crate::voice::VoiceParticipant {
                                     user_id: norm_id.clone(),
+                                    account_id: acc_id,
+                                    is_local: false,
                                     is_speaking: false,
                                     is_muted: m,
                                     is_deafened: d,
@@ -775,10 +895,19 @@ impl App {
                     .iter()
                     .map(|s| crate::voice::normalize_livekit_identity(s))
                     .collect();
-                let cur_uid = self.state.current_user.as_ref().map(|u| u.id.as_str());
+                let acc_id = self.state.account_for_channel(&channel_id).to_string();
+                let acc_uid = self
+                    .state
+                    .current_user_for_account(&acc_id)
+                    .map(|u| u.id.clone());
                 if let Some(ref mut call) = self.state.active_call {
                     if call.channel_id == channel_id {
-                        call.local_speaking = cur_uid
+                        let local_uid = if !call.local_user_id.is_empty() {
+                            Some(call.local_user_id.as_str())
+                        } else {
+                            acc_uid.as_deref()
+                        };
+                        call.local_speaking = local_uid
                             .map(|id| norm_speakers.iter().any(|s| s == id))
                             .unwrap_or(false);
                         for p in &mut call.participants {
@@ -883,8 +1012,9 @@ impl App {
         add_to_existing: bool,
     ) {
         let trimmed_token = token.trim().to_string();
-        let norm_url = api_url.trim().trim_end_matches('/').to_string();
+        let norm_url = DeltaClient::normalize_url_str(&api_url);
         let replace_primary = !add_to_existing || self.state.config.accounts.is_empty();
+        self.state.login_api_input = norm_url.clone();
 
         log_info!(
             "Authentication succeeded! api_url={}, replace_primary={}, total_accounts_before={}",
@@ -1058,7 +1188,44 @@ impl App {
             return;
         }
 
-        // 1b. If Settings Modal is open
+        // 1b. If Screen Share Source Picker Modal is open
+        if self.state.show_screen_picker_modal {
+            let count = self.state.screen_picker_targets.len();
+            let idx = if count > 0 {
+                self.state.screen_picker_selected.min(count - 1)
+            } else {
+                0
+            };
+            match key.code {
+                KeyCode::Esc => {
+                    self.state.show_screen_picker_modal = false;
+                    self.state.screen_picker_targets.clear();
+                    self.state.set_status("Screen share cancelled");
+                }
+                KeyCode::Up | KeyCode::Char('k') if count > 0 => {
+                    self.state.screen_picker_selected = if idx == 0 { count - 1 } else { idx - 1 };
+                }
+                KeyCode::Down | KeyCode::Char('j') if count > 0 => {
+                    self.state.screen_picker_selected = (idx + 1) % count;
+                }
+                KeyCode::Enter if count > 0 => {
+                    let chosen = self.state.screen_picker_targets[idx].clone();
+                    self.state.show_screen_picker_modal = false;
+                    self.state.screen_picker_targets.clear();
+                    if let Some(ref mut call) = self.state.active_call {
+                        if let Ok(mut slot) = call.pending_screen_target.lock() {
+                            *slot = Some(chosen.kind);
+                        }
+                        call.screensharing.store(true, std::sync::atomic::Ordering::SeqCst);
+                        self.state.set_status(format!("Screen sharing started: {}", chosen.label));
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // 1c. If Settings Modal is open
         if self.state.show_settings_modal {
             use crate::ui::modals::settings::SETTINGS_ITEM_COUNT;
             let count = SETTINGS_ITEM_COUNT + self.state.config.accounts.len();
@@ -1125,20 +1292,22 @@ impl App {
                         let api_url = if target_api.is_empty() {
                             self.state.config.api_url.clone()
                         } else {
-                            target_api.trim_end_matches('/').to_string()
+                            DeltaClient::normalize_url_str(target_api)
                         };
                         let add_to_existing = self.state.login_add_account;
-                        let client = DeltaClient::new(api_url.clone(), None, false);
                         let tx = self.event_tx.clone();
                         let ticket_clone = ticket.clone();
 
                         tokio::spawn(async move {
+                            let resolved_api_url =
+                                DeltaClient::normalize_and_probe_api_url(&api_url).await;
+                            let client = DeltaClient::new(resolved_api_url.clone(), None, false);
                             match client.verify_mfa_totp(&ticket_clone, &code).await {
                                 Ok(LoginResponse::Success { token, .. }) => {
                                     let trimmed = token.trim().to_string();
-                                    log_info!("MFA TOTP verification succeeded on {}!", api_url);
+                                    log_info!("MFA TOTP verification succeeded on {}!", resolved_api_url);
                                     let _ = tx.send(AppEvent::AccountLoginSuccess {
-                                        api_url,
+                                        api_url: resolved_api_url,
                                         token: trimmed,
                                         is_bot: false,
                                         add_to_existing,
@@ -1250,7 +1419,7 @@ impl App {
                     let api_url = if target_api.is_empty() {
                         self.state.config.api_url.clone()
                     } else {
-                        target_api.trim_end_matches('/').to_string()
+                        DeltaClient::normalize_url_str(target_api)
                     };
                     let add_to_existing = self.state.login_add_account;
 
@@ -1265,16 +1434,18 @@ impl App {
                             self.state.login_loading = true;
                             self.state.login_error = None;
 
-                            let client = DeltaClient::new(api_url.clone(), None, false);
                             let tx = self.event_tx.clone();
 
                             tokio::spawn(async move {
-                                match client.login(&email, &password).await {
+                                let resolved_api_url =
+                                    DeltaClient::normalize_and_probe_api_url(&api_url).await;
+                                let client = DeltaClient::new(resolved_api_url.clone(), None, false);
+                                match client.login_email(&email, &password).await {
                                     Ok(LoginResponse::Success { token, .. }) => {
                                         let trimmed = token.trim().to_string();
-                                        log_info!("Password login succeeded on {}!", api_url);
+                                        log_info!("Password login succeeded on {}!", resolved_api_url);
                                         let _ = tx.send(AppEvent::AccountLoginSuccess {
-                                            api_url,
+                                            api_url: resolved_api_url,
                                             token: trimmed,
                                             is_bot: false,
                                             add_to_existing,
@@ -1303,13 +1474,29 @@ impl App {
                             }
                             self.state.login_loading = true;
                             self.state.login_error = None;
+                            let tx = self.event_tx.clone();
                             log_info!("Manual token tab submitted for {} (add={})!", api_url, add_to_existing);
-                            let _ = self.event_tx.send(AppEvent::AccountLoginSuccess {
-                                api_url,
-                                token,
-                                is_bot: false,
-                                add_to_existing,
-                            }).await;
+                            tokio::spawn(async move {
+                                let resolved_api_url =
+                                    DeltaClient::normalize_and_probe_api_url(&api_url).await;
+                                let client =
+                                    DeltaClient::new(resolved_api_url.clone(), Some(token.clone()), false);
+                                match client.fetch_me(&token).await {
+                                    Ok(_) => {
+                                        let _ = tx
+                                            .send(AppEvent::AccountLoginSuccess {
+                                                api_url: resolved_api_url,
+                                                token,
+                                                is_bot: false,
+                                                add_to_existing,
+                                            })
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(AppEvent::ApiLoginFailure(e.to_string())).await;
+                                    }
+                                }
+                            });
                         }
                         LoginTab::Demo => {
                             self.state.load_demo_data();
@@ -1822,7 +2009,7 @@ impl App {
                             let api_url = if target_api.is_empty() {
                                 self.state.config.api_url.clone()
                             } else {
-                                target_api.trim_end_matches('/').to_string()
+                                DeltaClient::normalize_url_str(target_api)
                             };
                             let add_to_existing = self.state.login_add_account;
                             match self.state.login_tab {
@@ -1835,13 +2022,15 @@ impl App {
                                     }
                                     self.state.login_loading = true;
                                     self.state.login_error = None;
-                                    let client = DeltaClient::new(api_url.clone(), None, false);
                                     let tx = self.event_tx.clone();
                                     tokio::spawn(async move {
-                                        match client.login(&email, &password).await {
+                                        let resolved_api_url =
+                                            DeltaClient::normalize_and_probe_api_url(&api_url).await;
+                                        let client = DeltaClient::new(resolved_api_url.clone(), None, false);
+                                        match client.login_email(&email, &password).await {
                                             Ok(LoginResponse::Success { token, .. }) => {
                                                 let trimmed = token.trim().to_string();
-                                                let _ = tx.send(AppEvent::AccountLoginSuccess { api_url, token: trimmed, is_bot: false, add_to_existing }).await;
+                                                let _ = tx.send(AppEvent::AccountLoginSuccess { api_url: resolved_api_url, token: trimmed, is_bot: false, add_to_existing }).await;
                                             }
                                             Ok(LoginResponse::MFA { ticket, allowed_methods }) => {
                                                 let _ = tx.send(AppEvent::ApiMfaRequired { ticket, allowed_methods }).await;
@@ -1863,7 +2052,28 @@ impl App {
                                     }
                                     self.state.login_loading = true;
                                     self.state.login_error = None;
-                                    let _ = self.event_tx.send(AppEvent::AccountLoginSuccess { api_url, token, is_bot: false, add_to_existing }).await;
+                                    let tx = self.event_tx.clone();
+                                    tokio::spawn(async move {
+                                        let resolved_api_url =
+                                            DeltaClient::normalize_and_probe_api_url(&api_url).await;
+                                        let client =
+                                            DeltaClient::new(resolved_api_url.clone(), Some(token.clone()), false);
+                                        match client.fetch_me(&token).await {
+                                            Ok(_) => {
+                                                let _ = tx
+                                                    .send(AppEvent::AccountLoginSuccess {
+                                                        api_url: resolved_api_url,
+                                                        token,
+                                                        is_bot: false,
+                                                        add_to_existing,
+                                                    })
+                                                    .await;
+                                            }
+                                            Err(e) => {
+                                                let _ = tx.send(AppEvent::ApiLoginFailure(e.to_string())).await;
+                                            }
+                                        }
+                                    });
                                 }
                                 LoginTab::Demo => {
                                     self.state.load_demo_data();
@@ -2200,11 +2410,13 @@ impl App {
                                 });
                             if let Some(uid) = resolved_id {
                                 let norm_id = crate::voice::normalize_livekit_identity(uid);
-                                let _ = self.state.resolve_user(&norm_id);
+                                let _ = self.state.resolve_user_in_account(account_id, &norm_id);
                                 let entry = self.state.voice_channel_participants.entry(channel_id.clone()).or_default();
                                 if !entry.iter().any(|p| p.user_id == norm_id) {
                                     entry.push(crate::voice::VoiceParticipant {
                                         user_id: norm_id,
+                                        account_id: account_id.to_string(),
+                                        is_local: false,
                                         is_speaking: false,
                                         is_muted: false,
                                         is_deafened: false,
@@ -2252,10 +2464,13 @@ impl App {
                     self.state.channels.remove(&id);
                 }
                 ServerMessage::VoiceChannelJoin { id, user } => {
+                    let _ = self.state.resolve_user_in_account(account_id, &user);
                     let entry = self.state.voice_channel_participants.entry(id).or_default();
                     if !entry.iter().any(|p| p.user_id == user) {
                         entry.push(crate::voice::VoiceParticipant {
                             user_id: user,
+                            account_id: account_id.to_string(),
+                            is_local: false,
                             is_speaking: false,
                             is_muted: false,
                             is_deafened: false,
@@ -2914,18 +3129,38 @@ impl App {
             .map(|c| c.channel_type == "DirectMessage" || c.channel_type == "Group")
             .unwrap_or(false);
 
+        let acc_id = self.state.account_for_channel(&channel_id).to_string();
+        let acc_local_uid = self
+            .state
+            .current_user_for_account(&acc_id)
+            .map(|u| u.id.clone())
+            .unwrap_or_default();
+
         // Immediate UI feedback on 'c' / 'Alt+c': initialize state.active_call with status Connecting
         let mut call = crate::voice::ActiveCallState::new(channel_id.clone());
+        call.account_id = acc_id.clone();
+        call.local_user_id = acc_local_uid.clone();
         call.status = crate::voice::CallStatus::Connecting;
         call.connected_at = None;
+        if !acc_local_uid.is_empty() {
+            call.participants.push(crate::voice::VoiceParticipant {
+                user_id: acc_local_uid,
+                account_id: acc_id.clone(),
+                is_local: true,
+                is_speaking: false,
+                is_muted: false,
+                is_deafened: false,
+                is_screensharing: false,
+            });
+        }
 
         let muted = call.muted.clone();
         let deafened = call.deafened.clone();
         let screensharing = call.screensharing.clone();
+        let pending_screen_target = call.pending_screen_target.clone();
         let latest_video_frame = call.latest_video_frame.clone();
         let shutdown = call.shutdown.clone();
 
-        let acc_id = self.state.account_for_channel(&channel_id).to_string();
         let api = self.client_for_account_arc(&acc_id);
         let cid_clone = channel_id.clone();
         let app_tx = self.event_tx.clone();
@@ -2987,6 +3222,7 @@ impl App {
                 muted,
                 deafened,
                 screensharing,
+                pending_screen_target,
                 latest_video_frame,
                 shutdown,
                 app_tx,

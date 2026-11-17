@@ -41,8 +41,20 @@ impl<'a> CallStage<'a> {
             return 0;
         };
         let mut seen = std::collections::HashSet::new();
-        let cur_uid = state.current_user.as_ref().map(|u| u.id.as_str());
+        let acc_id = if !call.account_id.is_empty() {
+            call.account_id.as_str()
+        } else {
+            state.account_for_channel(&call.channel_id)
+        };
+        let cur_uid = if !call.local_user_id.is_empty() {
+            Some(call.local_user_id.as_str())
+        } else {
+            state.current_user_for_account(acc_id).map(|u| u.id.as_str())
+        };
         for p in &call.participants {
+            if p.is_local {
+                continue;
+            }
             let nid = crate::voice::normalize_livekit_identity(&p.user_id);
             if !nid.is_empty() && nid != "caller" && Some(nid.as_str()) != cur_uid {
                 seen.insert(nid);
@@ -50,6 +62,9 @@ impl<'a> CallStage<'a> {
         }
         if let Some(gw) = state.voice_channel_participants.get(&call.channel_id) {
             for p in gw {
+                if p.is_local {
+                    continue;
+                }
                 let nid = crate::voice::normalize_livekit_identity(&p.user_id);
                 if !nid.is_empty() && nid != "caller" && Some(nid.as_str()) != cur_uid {
                     seen.insert(nid);
@@ -84,6 +99,8 @@ impl<'a> Widget for CallStage<'a> {
 
         let (
             channel_id,
+            call_account_id,
+            local_user_id,
             status,
             duration,
             is_muted,
@@ -105,8 +122,15 @@ impl<'a> Widget for CallStage<'a> {
                     .try_lock()
                     .ok()
                     .and_then(|g| g.clone());
+                let acc_id = if !call.account_id.is_empty() {
+                    call.account_id.clone()
+                } else {
+                    self.state.account_for_channel(&call.channel_id).to_string()
+                };
                 (
                     call.channel_id.clone(),
+                    acc_id,
+                    call.local_user_id.clone(),
                     call.status.clone(),
                     dur,
                     call.is_muted(),
@@ -136,7 +160,8 @@ impl<'a> Widget for CallStage<'a> {
         } else {
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(80, 100, 140)))
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Rgb(70, 88, 124)))
                 .title(Span::styled(
                     " 📞 Live Voice & Video Stage ",
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -218,34 +243,34 @@ impl<'a> Widget for CallStage<'a> {
 
         let mut status_spans = vec![
             Span::styled(
-                format!(" [⏱️ {}] ", duration),
-                Style::default().fg(Color::White).bg(Color::Rgb(40, 45, 60)),
+                format!(" [ ⏱ {} ] ", duration),
+                Style::default().fg(Color::White).bg(Color::Rgb(38, 42, 56)),
             ),
             Span::raw(" "),
         ];
 
         if is_muted {
             status_spans.push(Span::styled(
-                " [🎙️ MUTED] ",
-                Style::default().fg(Color::White).bg(Color::Rgb(180, 40, 40)),
+                " [ 🔇 MUTED ] ",
+                Style::default().fg(Color::White).bg(Color::Rgb(175, 45, 50)),
             ));
         } else {
             status_spans.push(Span::styled(
-                " [🎙️ MIC ON] ",
-                Style::default().fg(Color::White).bg(Color::Rgb(40, 140, 60)),
+                " [ 🎙 MIC ] ",
+                Style::default().fg(Color::White).bg(Color::Rgb(38, 136, 68)),
             ));
         }
         status_spans.push(Span::raw(" "));
 
         if is_deafened {
             status_spans.push(Span::styled(
-                " [🎧 DEAFENED] ",
-                Style::default().fg(Color::White).bg(Color::Rgb(180, 40, 40)),
+                " [ 🔇 DEAF ] ",
+                Style::default().fg(Color::White).bg(Color::Rgb(175, 45, 50)),
             ));
         } else {
             status_spans.push(Span::styled(
-                " [🎧 AUDIO ON] ",
-                Style::default().fg(Color::White).bg(Color::Rgb(40, 140, 60)),
+                " [ 🎧 AUDIO ] ",
+                Style::default().fg(Color::White).bg(Color::Rgb(38, 136, 68)),
             ));
         }
         status_spans.push(Span::raw(" "));
@@ -256,14 +281,14 @@ impl<'a> Widget for CallStage<'a> {
                 self.state
                     .current_user
                     .as_ref()
-                    .map(|u| format!("{} (You)", u.name()))
+                    .map(|u| u.name().to_string())
                     .unwrap_or_else(|| "You".to_string())
             } else {
                 let _ = self.state.resolve_user(&snap.owner_id);
                 self.state.resolve_call_participant_name(&snap.owner_id)
             };
             screen_spans.push(Span::styled(
-                format!(" [🖥 STREAMING • {}fps • {}] ", snap.fps, owner_name),
+                format!(" [ 🖥 STREAMING • {}fps • {} ] ", snap.fps, owner_name),
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Rgb(255, 180, 40))
@@ -272,16 +297,16 @@ impl<'a> Widget for CallStage<'a> {
             if is_screensharing && !snap.is_remote {
                 screen_spans.push(Span::raw(" "));
                 screen_spans.push(Span::styled(
-                    " [v: Hide Preview] ",
-                    Style::default().fg(Color::White).bg(Color::Rgb(55, 55, 70)),
+                    " [ 👁 PREVIEW ] ",
+                    Style::default().fg(Color::White).bg(Color::Rgb(52, 56, 72)),
                 ));
             }
         } else if is_screensharing {
             screen_spans.push(Span::styled(
                 if show_local_preview {
-                    " [🖥 STARTING SCREEN SHARE...] "
+                    " [ 🖥 STARTING... ] "
                 } else {
-                    " [🖥 SHARING • v: Show Preview] "
+                    " [ 🖥 SHARING ] "
                 },
                 Style::default()
                     .fg(Color::Black)
@@ -290,10 +315,17 @@ impl<'a> Widget for CallStage<'a> {
             ));
         } else {
             screen_spans.push(Span::styled(
-                " [🖥 SCREEN OFF] ",
+                " [ 🖥 SHARE ] ",
                 Style::default()
-                    .fg(Color::Rgb(150, 150, 160))
-                    .bg(Color::Rgb(40, 40, 50)),
+                    .fg(Color::Rgb(165, 170, 185))
+                    .bg(Color::Rgb(38, 40, 50)),
+            ));
+        }
+        if self.state.call_fullscreen {
+            screen_spans.push(Span::raw(" "));
+            screen_spans.push(Span::styled(
+                " [ ⛶ FULL ] ",
+                Style::default().fg(Color::White).bg(Color::Rgb(60, 74, 110)),
             ));
         }
 
@@ -302,8 +334,8 @@ impl<'a> Widget for CallStage<'a> {
         let combined_line = Line::from(combined_spans);
 
         // When video is active (expanded 16+ row stage), allow 2 header rows so the full streaming badge isn't clipped;
-        // when voice-only (7-row compact stage), keep header strictly 1 row.
-        let header_rows: u16 = if combined_line.width() <= inner.width as usize {
+        // when voice-only (7-row compact stage), keep header strictly 1 row and dynamically drop text to icon-only pills when narrow.
+        let header_rows: u16 = if area.width >= 68 && combined_line.width() <= inner.width as usize {
             buf.set_line(inner.left(), inner.top(), &combined_line, inner.width);
             1
         } else if active_video.is_some() && inner.height >= 3 {
@@ -314,41 +346,55 @@ impl<'a> Widget for CallStage<'a> {
             2
         } else {
             let short_dur = if duration.starts_with("Conn") { "Conn" } else { &duration };
-            let mut compact_spans = vec![
+            let mut icon_spans = vec![
                 Span::styled(
-                    format!(" [⏱ {}]", short_dur),
-                    Style::default().fg(Color::White).bg(Color::Rgb(40, 45, 60)),
+                    format!(" [ ⏱ {} ]", short_dur),
+                    Style::default().fg(Color::White).bg(Color::Rgb(38, 42, 56)),
                 ),
                 Span::raw(" "),
                 Span::styled(
-                    if is_muted { "[🎙 MUTE]" } else { "[🎙 MIC]" },
-                    Style::default().fg(Color::White).bg(if is_muted { Color::Rgb(180, 40, 40) } else { Color::Rgb(40, 140, 60) }),
+                    if is_muted { "[ 🔇 ]" } else { "[ 🎙 ]" },
+                    Style::default().fg(Color::White).bg(if is_muted { Color::Rgb(175, 45, 50) } else { Color::Rgb(38, 136, 68) }),
                 ),
                 Span::raw(" "),
                 Span::styled(
-                    if is_deafened { "[🎧 DEAF]" } else { "[🎧 AUD]" },
-                    Style::default().fg(Color::White).bg(if is_deafened { Color::Rgb(180, 40, 40) } else { Color::Rgb(40, 140, 60) }),
+                    if is_deafened { "[ 🔇 ]" } else { "[ 🎧 ]" },
+                    Style::default().fg(Color::White).bg(if is_deafened { Color::Rgb(175, 45, 50) } else { Color::Rgb(38, 136, 68) }),
                 ),
                 Span::raw(" "),
             ];
             if let Some(ref snap) = active_video {
-                compact_spans.push(Span::styled(
-                    format!("[🖥 STREAMING • {}fps • {}]", snap.fps, self.state.resolve_call_participant_name(&snap.owner_id)),
+                icon_spans.push(Span::styled(
+                    format!("[ 🖥 STREAMING • {}fps • {} ]", snap.fps, self.state.resolve_call_participant_name(&snap.owner_id)),
                     Style::default().fg(Color::Black).bg(Color::Rgb(255, 180, 40)).add_modifier(Modifier::BOLD),
                 ));
             } else if is_screensharing {
-                compact_spans.push(Span::styled(
-                    "[🖥 SHARING]",
+                icon_spans.push(Span::styled(
+                    "[ 🖥 ]",
                     Style::default().fg(Color::Black).bg(Color::Rgb(255, 180, 40)).add_modifier(Modifier::BOLD),
                 ));
             } else {
-                compact_spans.push(Span::styled(
-                    "[🖥 SCR OFF]",
-                    Style::default().fg(Color::Rgb(150, 150, 160)).bg(Color::Rgb(40, 40, 50)),
+                icon_spans.push(Span::styled(
+                    "[ 🖥 ]",
+                    Style::default().fg(Color::Rgb(165, 170, 185)).bg(Color::Rgb(38, 40, 50)),
                 ));
             }
-            let compact_line = Line::from(compact_spans);
-            buf.set_line(inner.left(), inner.top(), &compact_line, inner.width);
+            if is_screensharing && active_video.is_some() {
+                icon_spans.push(Span::raw(" "));
+                icon_spans.push(Span::styled(
+                    "[ 👁 ]",
+                    Style::default().fg(Color::White).bg(Color::Rgb(52, 56, 72)),
+                ));
+            }
+            if self.state.call_fullscreen {
+                icon_spans.push(Span::raw(" "));
+                icon_spans.push(Span::styled(
+                    "[ ⛶ ]",
+                    Style::default().fg(Color::White).bg(Color::Rgb(60, 74, 110)),
+                ));
+            }
+            let icon_line = Line::from(icon_spans);
+            buf.set_line(inner.left(), inner.top(), &icon_line, inner.width);
             1
         };
 
@@ -435,11 +481,29 @@ impl<'a> Widget for CallStage<'a> {
         let mut seen_ids = std::collections::HashSet::new();
         let mut cards: Vec<CardParticipant> = Vec::new();
 
-        if let Some(ref cur) = self.state.current_user {
-            seen_ids.insert(cur.id.clone());
+        let effective_local_uid = if !local_user_id.is_empty() {
+            local_user_id.clone()
+        } else {
+            self.state
+                .current_user_for_account(&call_account_id)
+                .map(|u| u.id.clone())
+                .unwrap_or_default()
+        };
+
+        if !effective_local_uid.is_empty() {
+            seen_ids.insert(effective_local_uid.clone());
+            let _ = self
+                .state
+                .resolve_user_in_account(&call_account_id, &effective_local_uid);
+            let local_name = self
+                .state
+                .current_user_for_account(&call_account_id)
+                .filter(|u| u.id == effective_local_uid)
+                .map(|u| u.name().to_string())
+                .unwrap_or_else(|| self.state.resolve_call_participant_name(&effective_local_uid));
             cards.push(CardParticipant {
-                user_id: cur.id.clone(),
-                display_name: format!("{} (You)", cur.name()),
+                user_id: effective_local_uid,
+                display_name: local_name,
                 is_self: true,
                 is_speaking: local_speaking,
                 is_muted,
@@ -466,11 +530,19 @@ impl<'a> Widget for CallStage<'a> {
         }
 
         for p in merged_remote {
+            if p.is_local {
+                continue;
+            }
             let norm_id = crate::voice::normalize_livekit_identity(&p.user_id);
             if norm_id.is_empty() || norm_id == "caller" || !seen_ids.insert(norm_id.clone()) {
                 continue;
             }
-            let _ = self.state.resolve_user(&norm_id);
+            let p_acc = if !p.account_id.is_empty() {
+                p.account_id.as_str()
+            } else {
+                call_account_id.as_str()
+            };
+            let _ = self.state.resolve_user_in_account(p_acc, &norm_id);
             let name = self.state.resolve_call_participant_name(&norm_id);
             cards.push(CardParticipant {
                 user_id: norm_id,
@@ -483,13 +555,15 @@ impl<'a> Widget for CallStage<'a> {
         }
         let _ = is_screensharing;
 
-        // Card sizing: 14x4 compact (14w x 4h -> 7 total rows on 1 row) or 14x6 in fullscreen
+        // Card sizing: 16x5 (4x2 PFP) when height >= 5, 16x4 or 14x4 compact otherwise
         let approx_cols = ((body_area.width) / 14).max(1) as usize;
         let approx_rows = ((cards.len() + approx_cols - 1) / approx_cols).max(1) as u16;
 
         let (card_w, card_h, pfp_w, pfp_h): (u16, u16, u16, u16) =
-            if self.state.call_fullscreen && body_area.height >= 6 * approx_rows && body_area.width >= 14 {
-                (14, 6, 6, 3)
+            if body_area.height >= 5 * approx_rows && body_area.width >= 16 {
+                (16, 5, 6, 2)
+            } else if body_area.height >= 4 && body_area.width >= 16 {
+                (16, 4, 4, 1)
             } else if body_area.height >= 4 && body_area.width >= 14 {
                 (14, 4, 4, 1)
             } else if body_area.height >= 4 && body_area.width >= 12 {
@@ -527,12 +601,18 @@ impl<'a> Widget for CallStage<'a> {
                 return;
             };
 
-        let gap_x: u16 = if body_area.width >= card_w * 2 + 2 { 1 } else { 0 };
-        let start_x = body_area.left() + if body_area.width > card_w { 1 } else { 0 };
-        let cards_per_row = ((body_area.width.saturating_sub(start_x - body_area.left()) + gap_x)
-            / (card_w + gap_x).max(1))
-        .max(1) as usize;
-        let rows_needed = ((cards.len() + cards_per_row - 1) / cards_per_row).max(1) as u16;
+        let gap_x: u16 = if body_area.width >= card_w * 2 + 4 {
+            2
+        } else if body_area.width >= card_w * 2 + 2 {
+            1
+        } else {
+            0
+        };
+        let max_per_row = ((body_area.width + gap_x) / (card_w + gap_x).max(1)).max(1) as usize;
+        let row_cards_count = cards.len().min(max_per_row).max(1) as u16;
+        let row_total_w = row_cards_count * card_w + row_cards_count.saturating_sub(1) * gap_x;
+        let start_x = body_area.left() + body_area.width.saturating_sub(row_total_w) / 2;
+        let rows_needed = ((cards.len() + max_per_row - 1) / max_per_row).max(1) as u16;
         let gap_y: u16 = if body_area.height >= rows_needed * card_h + rows_needed.saturating_sub(1) {
             1
         } else {
@@ -557,7 +637,14 @@ impl<'a> Widget for CallStage<'a> {
                 height: card_h,
             };
 
-            // Outline ONLY when speaking (bright green); flush borderless when silent
+            let card_bg = Color::Rgb(30, 31, 34);
+            for cy in card_rect.top()..card_rect.bottom() {
+                for cx in card_rect.left()..card_rect.right() {
+                    crate::ui::put_cell(buf, card_rect, cx, cy, ' ', Style::default().bg(card_bg));
+                }
+            }
+
+            // Rounded green border when speaking; subtle dark card fill when silent
             if card.is_speaking {
                 let block = Block::default()
                     .borders(Borders::ALL)
@@ -566,7 +653,8 @@ impl<'a> Widget for CallStage<'a> {
                         Style::default()
                             .fg(Color::Rgb(35, 165, 90))
                             .add_modifier(Modifier::BOLD),
-                    );
+                    )
+                    .style(Style::default().bg(card_bg));
                 block.render(card_rect, buf);
             }
 
@@ -628,16 +716,17 @@ impl<'a> Widget for CallStage<'a> {
                 if !card.user_id.is_empty() {
                     let key = format!("avatar_card_{}", card.user_id);
                     self.state.deferred_image_renders.push((pfp_rect, key.clone()));
-                    self.state.request_user_avatar_with_key(&card.user_id, &key);
+                    self.state
+                        .request_user_avatar_with_key_in_account(&call_account_id, &card.user_id, &key);
                 }
             }
 
             // Bottom label row inside card: truncated username + muted/deafened icon ONLY when muted/deafened
             let label_y = card_inner.bottom().saturating_sub(1);
             let status_badge = if card.is_deafened {
-                " [🔇🎧]"
+                " 🎧"
             } else if card.is_muted {
-                " [🔇]"
+                " 🔇"
             } else {
                 ""
             };

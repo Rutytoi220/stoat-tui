@@ -691,7 +691,7 @@ impl<'a> Widget for LoginModal<'a> {
         if let Some(ref err) = self.state.login_error {
             cur_y += 2;
             let err_label = if err.contains("<html") || err.contains("<!DOCTYPE") || err.contains("<HTML") {
-                "⚠ Server error: HTTP 401 Unauthorized (endpoint rejected request or invalid session)".to_string()
+                "⚠ Server returned HTML instead of JSON — check Server API URL (e.g. /api)".to_string()
             } else if err.starts_with('⚠') {
                 err.clone()
             } else {

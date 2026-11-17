@@ -131,23 +131,40 @@ impl<'a> Widget for ContentHeader<'a> {
             }
         }
 
+        // Compute right-side controls first so the channel title gets all remaining space
+        let member_btn = if self.state.show_member_rail {
+            "[ 👥 Members ▾ ]"
+        } else {
+            "[ 👥 Members ▸ ]"
+        };
+        let member_btn_w = member_btn.chars().count() as u16;
+        let member_rx = area.right().saturating_sub(1 + member_btn_w);
+
+        let (dot, dot_color, status_text) = match &self.state.gateway_status {
+            GatewayStatus::Connected { latency_ms } => ('●', theme.status_online, format!("{}ms", latency_ms)),
+            GatewayStatus::Connecting => ('◐', theme.status_idle, "Connecting...".to_string()),
+            GatewayStatus::Disconnected(_) => ('○', theme.status_offline, "Offline".to_string()),
+        };
+        let status_w = (status_text.chars().count() as u16) + 2; // dot + space + text
+        let status_rx = member_rx.saturating_sub(2 + status_w);
+        let title_right_limit = status_rx.saturating_sub(2);
+
+        let name_limit = Rect {
+            x: area.left(),
+            y: area.top(),
+            width: title_right_limit.saturating_sub(area.left()),
+            height: area.height,
+        };
+
         // Render prefix
         cur_x = crate::ui::write_str(
             buf,
-            area,
+            name_limit,
             cur_x,
             cur_y,
             prefix,
             Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
         );
-
-        let right_reserve = area.right().saturating_sub(40);
-        let name_limit = Rect {
-            x: area.left(),
-            y: area.top(),
-            width: right_reserve.saturating_sub(area.left()),
-            height: area.height,
-        };
         cur_x = crate::ui::write_str(
             buf,
             name_limit,
@@ -167,47 +184,23 @@ impl<'a> Widget for ContentHeader<'a> {
             );
         }
 
-        // Separator and topic
-        if !topic.is_empty() && cur_x + 6 < area.right().saturating_sub(40) {
-            let topic_limit = Rect {
-                x: area.left(),
-                y: area.top(),
-                width: area.right().saturating_sub(38).saturating_sub(area.left()),
-                height: area.height,
-            };
-            cur_x = crate::ui::write_str(buf, topic_limit, cur_x, cur_y, "  │  ", Style::default().fg(Color::Rgb(60, 60, 70)));
-            cur_x = crate::ui::write_str(buf, topic_limit, cur_x, cur_y, &topic, Style::default().fg(theme.muted));
+        // Separator and topic if room remains
+        if !topic.is_empty() && cur_x + 8 < title_right_limit {
+            cur_x = crate::ui::write_str(buf, name_limit, cur_x, cur_y, "  │  ", Style::default().fg(Color::Rgb(60, 62, 70)));
+            let _ = crate::ui::write_str(buf, name_limit, cur_x, cur_y, &topic, Style::default().fg(theme.muted));
         }
 
-        // Right side: Member toggle button and connection status
-        let mut rx = area.right().saturating_sub(2);
-        let member_btn = if self.state.show_member_rail {
-            "[ 👥 Members ▾ ]"
-        } else {
-            "[ 👥 Members ▸ ]"
-        };
-        rx = rx.saturating_sub(member_btn.chars().count() as u16);
+        // Render right-aligned connection status pill + member toggle pill
+        if status_rx > area.left() + 4 {
+            crate::ui::put_cell(buf, area, status_rx, cur_y, dot, Style::default().fg(dot_color));
+            crate::ui::write_str(buf, area, status_rx + 2, cur_y, &status_text, Style::default().fg(theme.muted));
+        }
+
         let btn_style = if self.state.show_member_rail {
-            Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 50))
+            Style::default().fg(Color::White).bg(Color::Rgb(40, 42, 52))
         } else {
-            Style::default().fg(theme.muted).bg(Color::Rgb(25, 25, 30))
+            Style::default().fg(theme.muted).bg(Color::Rgb(28, 30, 36))
         };
-        crate::ui::write_str(buf, area, rx, cur_y, member_btn, btn_style);
-
-        // Connection status pill
-        rx = rx.saturating_sub(2);
-        let (dot, dot_color, status_text) = match &self.state.gateway_status {
-            GatewayStatus::Connected { latency_ms } => ('●', theme.status_online, format!("{}ms", latency_ms)),
-            GatewayStatus::Connecting => ('◐', theme.status_idle, "Connecting...".to_string()),
-            GatewayStatus::Disconnected(_) => ('○', theme.status_offline, "Offline".to_string()),
-        };
-
-        let status_len = (status_text.len() + 3) as u16;
-        rx = rx.saturating_sub(status_len);
-
-        if rx > cur_x + 2 {
-            crate::ui::put_cell(buf, area, rx, cur_y, dot, Style::default().fg(dot_color));
-            crate::ui::write_str(buf, area, rx + 2, cur_y, &status_text, Style::default().fg(theme.muted));
-        }
+        crate::ui::write_str(buf, area, member_rx, cur_y, member_btn, btn_style);
     }
 }

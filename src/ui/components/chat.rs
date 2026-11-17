@@ -178,6 +178,8 @@ impl<'a> Widget for ChatFeed<'a> {
 
         // Pre-render all messages into formatted items
         let mut rendered_items: Vec<ChatRenderItem> = Vec::new();
+        let mut prev_author: Option<String> = None;
+        let mut prev_ts_ms: Option<u64> = None;
 
         for msg in msgs {
             let has_content = msg.content.as_ref().map(|c| !c.trim().is_empty()).unwrap_or(false);
@@ -191,9 +193,13 @@ impl<'a> Widget for ChatFeed<'a> {
             }
 
             let time_str = format_ulid_time(&msg.id);
+            let msg_ts_ms = crate::api::models::ulid_timestamp(&msg.id)
+                .map(|dt| dt.timestamp_millis().max(0) as u64);
 
-            // Handle system messages specially
+            // Handle system messages specially with subtle muted rule
             if is_system {
+                prev_author = None;
+                prev_ts_ms = None;
                 let notice = if let Some(ref sys) = msg.system {
                     format_system_event(sys)
                 } else if let Some(ref c) = msg.content {
@@ -203,48 +209,66 @@ impl<'a> Widget for ChatFeed<'a> {
                 };
 
                 let sys_spans = vec![
-                    Span::styled(format!("[{}] ", time_str), Style::default().fg(Color::Rgb(90, 90, 100))),
-                    Span::styled(notice, Style::default().fg(Color::Rgb(170, 170, 190)).add_modifier(Modifier::ITALIC)),
+                    Span::styled("─── ", Style::default().fg(Color::Rgb(62, 65, 74))),
+                    Span::styled(
+                        format!("{} • {}", notice, time_str),
+                        Style::default().fg(Color::Rgb(150, 155, 170)),
+                    ),
+                    Span::styled(" ───", Style::default().fg(Color::Rgb(62, 65, 74))),
                 ];
                 rendered_items.push(ChatRenderItem::Line(Line::from(sys_spans)));
                 rendered_items.push(ChatRenderItem::Line(Line::from(String::new())));
                 continue;
             }
 
-            // 1. Author header line (resolved from cache or fetched asynchronously)
-            let user = self.state.resolve_user(&msg.author).cloned();
-            let author_name = if let Some(ref m) = msg.masquerade {
-                m.name.clone().unwrap_or_else(|| "Anonymous".to_string())
-            } else if let Some(ref u) = user {
-                u.name().to_string()
-            } else {
-                format!("User {}", &msg.author[..msg.author.len().min(6)])
-            };
+            // Consecutive message grouping: same author within 5 minutes (when not compact_mode)
+            let is_grouped = !is_compact
+                && msg.masquerade.is_none()
+                && prev_author.as_deref() == Some(msg.author.as_str())
+                && match (prev_ts_ms, msg_ts_ms) {
+                    (Some(p), Some(c)) => c.saturating_sub(p) <= 5 * 60 * 1000,
+                    _ => false,
+                };
 
-            let author_color = theme.role_color(&msg.author);
+            prev_author = Some(msg.author.clone());
+            prev_ts_ms = msg_ts_ms;
 
-            let mut header_spans = if is_compact {
-                vec![Span::styled(author_name, Style::default().fg(author_color).add_modifier(Modifier::BOLD))]
-            } else {
-                vec![
-                    Span::styled(format!("[{}] ", time_str), Style::default().fg(Color::Rgb(90, 90, 100))),
-                    Span::styled(author_name, Style::default().fg(author_color).add_modifier(Modifier::BOLD)),
-                ]
-            };
+            if !is_grouped {
+                // 1. Author header line (resolved from cache or fetched asynchronously)
+                let user = self.state.resolve_user(&msg.author).cloned();
+                let author_name = if let Some(ref m) = msg.masquerade {
+                    m.name.clone().unwrap_or_else(|| "Anonymous".to_string())
+                } else if let Some(ref u) = user {
+                    u.name().to_string()
+                } else {
+                    format!("User {}", &msg.author[..msg.author.len().min(6)])
+                };
 
-            // Bot badge
-            if !is_compact {
-                if let Some(ref u) = user {
-                    if u.bot.is_some() {
-                        header_spans.push(Span::styled(" BOT", Style::default().fg(Color::White).bg(theme.accent).add_modifier(Modifier::BOLD)));
+                let author_color = theme.role_color(&msg.author);
+
+                let mut header_spans = if is_compact {
+                    vec![Span::styled(author_name, Style::default().fg(author_color).add_modifier(Modifier::BOLD))]
+                } else {
+                    vec![
+                        Span::styled(format!("[{}] ", time_str), Style::default().fg(Color::Rgb(95, 98, 110))),
+                        Span::styled(author_name, Style::default().fg(author_color).add_modifier(Modifier::BOLD)),
+                    ]
+                };
+
+                // Bot badge
+                if !is_compact {
+                    if let Some(ref u) = user {
+                        if u.bot.is_some() {
+                            header_spans.push(Span::styled(" BOT", Style::default().fg(Color::White).bg(theme.accent).add_modifier(Modifier::BOLD)));
+                        }
                     }
                 }
-            }
 
-            rendered_items.push(ChatRenderItem::AuthorHeader {
-                spans: header_spans,
-                author_id: msg.author.clone(),
-            });
+                rendered_items.push(ChatRenderItem::AuthorHeader {
+                    spans: header_spans,
+                    author_id: msg.author.clone(),
+                });
+            }
 
             // 2. Content lines
             let content = msg.content.as_deref().unwrap_or("");
@@ -495,8 +519,12 @@ impl<'a> Widget for ChatFeed<'a> {
             for y_off in 0..track_height {
                 let y = area.top() + y_off as u16;
                 let is_thumb = y_off >= thumb_pos && y_off < thumb_pos + thumb_height;
-                let ch = if is_thumb { '█' } else { '│' };
-                let color = if is_thumb { theme.primary } else { Color::Rgb(40, 40, 45) };
+                let ch = if is_thumb { '┃' } else { '│' };
+                let color = if is_thumb {
+                    Color::Rgb(120, 124, 136)
+                } else {
+                    Color::Rgb(52, 54, 62)
+                };
                 crate::ui::put_cell(buf, area, scrollbar_x, y, ch, Style::default().fg(color));
             }
         }

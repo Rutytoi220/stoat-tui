@@ -43,7 +43,7 @@ impl Theme {
             text,
             muted,
             border_focused: primary,
-            border_unfocused: Color::Rgb(50, 50, 55),
+            border_unfocused: Color::Rgb(45, 47, 52),
             item_selected_bg: Color::Rgb(45, 45, 55),
             unread_badge: primary,
             status_online: Color::Rgb(46, 204, 113),

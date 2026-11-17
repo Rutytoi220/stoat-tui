@@ -83,9 +83,11 @@ pub enum CallStatus {
     Disconnected,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct VoiceParticipant {
     pub user_id: String,
+    pub account_id: String,
+    pub is_local: bool,
     pub is_speaking: bool,
     pub is_muted: bool,
     pub is_deafened: bool,
@@ -102,11 +104,14 @@ pub struct VideoFrameSnapshot {
 
 pub struct ActiveCallState {
     pub channel_id: String,
+    pub account_id: String,
+    pub local_user_id: String,
     pub status: CallStatus,
     pub connected_at: Option<std::time::Instant>,
     pub muted: Arc<AtomicBool>,
     pub deafened: Arc<AtomicBool>,
     pub screensharing: Arc<AtomicBool>,
+    pub pending_screen_target: Arc<StdMutex<Option<screen::ScreenShareTargetKind>>>,
     pub show_local_preview: bool,
     pub local_speaking: bool,
     pub latest_video_frame: Arc<Mutex<Option<VideoFrameSnapshot>>>,
@@ -119,11 +124,14 @@ impl ActiveCallState {
     pub fn new(channel_id: String) -> Self {
         Self {
             channel_id,
+            account_id: String::new(),
+            local_user_id: String::new(),
             status: CallStatus::Connecting,
             connected_at: None,
             muted: Arc::new(AtomicBool::new(false)),
             deafened: Arc::new(AtomicBool::new(false)),
             screensharing: Arc::new(AtomicBool::new(false)),
+            pending_screen_target: Arc::new(StdMutex::new(None)),
             show_local_preview: true,
             local_speaking: false,
             latest_video_frame: Arc::new(Mutex::new(None)),
@@ -264,7 +272,18 @@ impl Mono48kResampler {
 type MixerBuffers = Arc<StdMutex<HashMap<String, VecDeque<i16>>>>;
 
 /// Converts packed RGBA (`[R, G, B, A]`) into a WebRTC `I420Buffer`.
-pub fn rgba_to_i420_buffer(rgba: &[u8], width: u32, height: u32) -> I420Buffer {
+/// Returns `None` if dimensions are zero/odd or `rgba.len()` does not match `width * height * 4`.
+pub fn rgba_to_i420_buffer(rgba: &[u8], width: u32, height: u32) -> Option<I420Buffer> {
+    if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        return None;
+    }
+    let expected_len = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?;
+    if rgba.len() != expected_len {
+        return None;
+    }
+
     let mut i420 = I420Buffer::new(width, height);
     let (sy, su, sv) = i420.strides();
     let (dy, du, dv) = i420.data_mut();
@@ -280,7 +299,7 @@ pub fn rgba_to_i420_buffer(rgba: &[u8], width: u32, height: u32) -> I420Buffer {
         width as i32,
         height as i32,
     );
-    i420
+    Some(i420)
 }
 
 /// Converts any incoming WebRTC `BoxVideoFrame` into packed RGBA (`[R, G, B, A]`).
@@ -311,6 +330,7 @@ impl VoiceEngine {
         muted: Arc<AtomicBool>,
         deafened: Arc<AtomicBool>,
         screensharing: Arc<AtomicBool>,
+        pending_screen_target: Arc<StdMutex<Option<screen::ScreenShareTargetKind>>>,
         frame_slot: Arc<Mutex<Option<VideoFrameSnapshot>>>,
         shutdown: Arc<AtomicBool>,
         event_tx: mpsc::Sender<AppEvent>,
@@ -354,6 +374,16 @@ impl VoiceEngine {
                 local_identity
             );
 
+            if !local_identity.is_empty() {
+                let _ = event_tx
+                    .send(AppEvent::CallParticipantJoined {
+                        channel_id: channel_id.clone(),
+                        user_id: local_identity.clone(),
+                        is_local: true,
+                    })
+                    .await;
+            }
+
             // Report any already-present remote participants (deduplicated & excluding local user)
             for (identity, rp) in room.remote_participants() {
                 let uid = normalize_livekit_identity(identity.as_str());
@@ -378,6 +408,7 @@ impl VoiceEngine {
                     .send(AppEvent::CallParticipantJoined {
                         channel_id: channel_id.clone(),
                         user_id: uid.clone(),
+                        is_local: false,
                     })
                     .await;
                 let _ = event_tx
@@ -497,6 +528,7 @@ impl VoiceEngine {
                                 room.clone(),
                                 share_stop,
                                 screensharing.clone(),
+                                pending_screen_target.clone(),
                                 frame_slot.clone(),
                                 active_remote_video_tracks.clone(),
                                 screen_sid_tx.clone(),
@@ -555,6 +587,7 @@ impl VoiceEngine {
                                     .send(AppEvent::CallParticipantJoined {
                                         channel_id: channel_id.clone(),
                                         user_id: uid.clone(),
+                                        is_local: false,
                                     })
                                     .await;
                                 let _ = event_tx
@@ -797,15 +830,43 @@ fn spawn_local_screen_share(
     room: Arc<Room>,
     share_stop: Arc<AtomicBool>,
     screensharing_flag: Arc<AtomicBool>,
+    pending_screen_target: Arc<StdMutex<Option<screen::ScreenShareTargetKind>>>,
     frame_slot: Arc<Mutex<Option<VideoFrameSnapshot>>>,
     active_remote_video_tracks: Arc<StdMutex<HashSet<String>>>,
     screen_sid_tx: mpsc::UnboundedSender<TrackSid>,
     event_tx: mpsc::Sender<AppEvent>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut capture_rx = match screen::start_screen_capture(share_stop.clone()).await {
+        let selected_target = pending_screen_target
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take());
+        let mut capture_rx = match screen::start_screen_capture(share_stop.clone(), selected_target).await {
             Ok(rx) => rx,
-            Err(err) => {
+            Err(screen::ScreenCaptureError::Cancelled) => {
+                log_info!("Screen share cancelled by user for {}", channel_id);
+                screensharing_flag.store(false, Ordering::SeqCst);
+                let _ = event_tx
+                    .send(AppEvent::ScreenShareCancelled { channel_id })
+                    .await;
+                return;
+            }
+            Err(screen::ScreenCaptureError::NeedTargetSelection(targets)) => {
+                log_info!(
+                    "Screen share requesting source picker ({} targets) for {}",
+                    targets.len(),
+                    channel_id
+                );
+                screensharing_flag.store(false, Ordering::SeqCst);
+                let _ = event_tx
+                    .send(AppEvent::ScreenShareSelectTarget {
+                        channel_id,
+                        targets,
+                    })
+                    .await;
+                return;
+            }
+            Err(screen::ScreenCaptureError::Failed(err)) => {
                 log_error!("Screen share failed to initialize for {}: {}", channel_id, err);
                 screensharing_flag.store(false, Ordering::SeqCst);
                 let _ = event_tx
@@ -823,6 +884,7 @@ fn spawn_local_screen_share(
         let mut fps_window_start = Instant::now();
         let mut fps_frames = 0u32;
         let mut current_fps = 0u32;
+        let mut last_preview_push = Instant::now() - Duration::from_millis(40);
 
         while let Some(captured) = capture_rx.recv().await {
             if share_stop.load(Ordering::SeqCst) {
@@ -880,7 +942,15 @@ fn spawn_local_screen_share(
                 }
             };
 
-            let i420_buf = rgba_to_i420_buffer(&captured.rgba, captured.width, captured.height);
+            let Some(i420_buf) = rgba_to_i420_buffer(&captured.rgba, captured.width, captured.height) else {
+                log_warn!(
+                    "Skipping invalid captured screen frame ({}x{}, {} bytes)",
+                    captured.width,
+                    captured.height,
+                    captured.rgba.len()
+                );
+                continue;
+            };
             let video_frame = VideoFrame {
                 rotation: VideoRotation::VideoRotation0,
                 timestamp_us: started_at.elapsed().as_micros() as i64,
@@ -903,10 +973,11 @@ fn spawn_local_screen_share(
                 .lock()
                 .map(|s| !s.is_empty())
                 .unwrap_or(false);
-            if !has_remote_video {
+            if !has_remote_video && last_preview_push.elapsed() >= Duration::from_millis(33) {
                 if let Some(rgba_img) =
                     RgbaImage::from_raw(captured.width, captured.height, captured.rgba)
                 {
+                    last_preview_push = Instant::now();
                     *frame_slot.lock().await = Some(VideoFrameSnapshot {
                         image: DynamicImage::ImageRgba8(rgba_img),
                         owner_id: "You".to_string(),
