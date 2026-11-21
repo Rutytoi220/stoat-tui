@@ -183,6 +183,28 @@ pub struct RevoltApiError {
     pub location: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum RelationshipStatus {
+    #[default]
+    None,
+    User,
+    Friend,
+    Outgoing,
+    Incoming,
+    Blocked,
+    BlockedOther,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Relationship {
+    #[serde(rename = "_id")]
+    pub id: String,
+    #[serde(default)]
+    pub status: RelationshipStatus,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct User {
     #[serde(rename = "_id")]
@@ -190,11 +212,17 @@ pub struct User {
     #[serde(default)]
     pub username: String,
     #[serde(default)]
+    pub discriminator: Option<String>,
+    #[serde(default)]
     pub display_name: Option<String>,
     #[serde(default)]
     pub avatar: Option<FileObject>,
     #[serde(default)]
     pub status: Option<UserStatus>,
+    #[serde(default)]
+    pub relationship: Option<RelationshipStatus>,
+    #[serde(default)]
+    pub relations: Option<Vec<Relationship>>,
     #[serde(default)]
     pub online: Option<bool>,
     #[serde(default)]
@@ -348,6 +376,8 @@ pub struct Channel {
     pub icon: Option<FileObject>,
     #[serde(default)]
     pub recipients: Option<Vec<String>>,
+    #[serde(default)]
+    pub owner: Option<String>,
     #[serde(default)]
     pub last_message_id: Option<String>,
 }

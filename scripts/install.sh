@@ -1,16 +1,16 @@
 #!/bin/sh
 # Single-command installer for stoat-tui
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/stoat-chat/stoat-tui/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Rutytoi220/stoat-tui/master/scripts/install.sh | sh
 #
 # Environment overrides:
-#   REPO="stoat-chat/stoat-tui"
+#   REPO="Rutytoi220/stoat-tui"
 #   VERSION="v0.1.0"
 #   INSTALL_DIR="/usr/local/bin" (or ~/.local/bin)
 
 set -eu
 
-REPO="${REPO:-stoat-chat/stoat-tui}"
+REPO="${REPO:-Rutytoi220/stoat-tui}"
 GITHUB_URL="https://github.com"
 GITHUB_API="https://api.github.com"
 
@@ -31,52 +31,78 @@ error() {
     exit 1
 }
 
-# 1. Detect OS
+fallback_cargo_install() {
+    if command -v cargo >/dev/null 2>&1; then
+        warn "Prebuilt binary unavailable for this target/release. Falling back to building via cargo..."
+        info "Running: cargo install --git ${GITHUB_URL}/${REPO}"
+        cargo install --git "${GITHUB_URL}/${REPO}"
+        success "Successfully built and installed stoat-tui via cargo!"
+        info "Run 'stoat-tui' to start chatting!"
+        exit 0
+    fi
+}
+
+# 1. Detect OS & Architecture
 OS="$(uname -s)"
+ARCH="$(uname -m)"
+TARGET=""
+FALLBACK_TARGET=""
+
 case "$OS" in
     Linux)
-        OS_TYPE="linux"
+        case "$ARCH" in
+            x86_64|amd64)
+                TARGET="x86_64-unknown-linux-gnu"
+                FALLBACK_TARGET="x86_64-unknown-linux-musl"
+                ;;
+            aarch64|arm64)
+                TARGET="aarch64-unknown-linux-gnu"
+                ;;
+            *)
+                fallback_cargo_install
+                error "Unsupported Linux architecture: $ARCH."
+                ;;
+        esac
+        ;;
+    Darwin)
+        case "$ARCH" in
+            arm64|aarch64)
+                TARGET="aarch64-apple-darwin"
+                ;;
+            x86_64)
+                TARGET="x86_64-apple-darwin"
+                ;;
+            *)
+                fallback_cargo_install
+                error "Unsupported macOS architecture: $ARCH."
+                ;;
+        esac
         ;;
     *)
-        error "Unsupported operating system: $OS. stoat-tui currently provides prebuilt binaries for Linux."
-        ;;
-esac
-
-# 2. Detect Architecture & Target
-ARCH="$(uname -m)"
-case "$ARCH" in
-    x86_64|amd64)
-        TARGET="x86_64-unknown-linux-musl"
-        FALLBACK_TARGET="x86_64-unknown-linux-gnu"
-        ;;
-    aarch64|arm64)
-        TARGET="aarch64-unknown-linux-gnu"
-        FALLBACK_TARGET=""
-        ;;
-    *)
-        error "Unsupported architecture: $ARCH. Supported architectures: x86_64, aarch64."
+        fallback_cargo_install
+        error "Unsupported operating system: $OS. Install via: cargo install --git ${GITHUB_URL}/${REPO}"
         ;;
 esac
 
 info "Detected platform: $OS ($ARCH) -> target: $TARGET"
 
-# 3. Determine Version
+# 2. Determine Version
 if [ -z "${VERSION:-}" ]; then
     info "Fetching latest release tag from GitHub..."
     LATEST_JSON=$(curl -fsSL "${GITHUB_API}/repos/${REPO}/releases/latest" 2>/dev/null || true)
     if [ -n "$LATEST_JSON" ]; then
         VERSION=$(printf '%s' "$LATEST_JSON" | grep '"tag_name":' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
     fi
+fi
 
-    if [ -z "${VERSION:-}" ]; then
-        VERSION="v0.1.0"
-        warn "Could not fetch latest release tag from GitHub API, falling back to $VERSION"
-    fi
+if [ -z "${VERSION:-}" ]; then
+    fallback_cargo_install
+    error "No GitHub release found for ${REPO} yet and 'cargo' is not installed. Install Rust (https://rustup.rs) or publish a release tag."
 fi
 
 info "Installing stoat-tui $VERSION..."
 
-# 4. Determine Download URL & Filename
+# 3. Download Archive
 ARCHIVE="stoat-tui-${VERSION}-${TARGET}.tar.gz"
 DOWNLOAD_URL="${GITHUB_URL}/${REPO}/releases/download/${VERSION}/${ARCHIVE}"
 CHECKSUM_URL="${GITHUB_URL}/${REPO}/releases/download/${VERSION}/checksums.txt"
@@ -94,15 +120,17 @@ if ! curl -fsSL "$DOWNLOAD_URL" -o "${TMP_DIR}/${ARCHIVE}" 2>/dev/null; then
         TARGET="$FALLBACK_TARGET"
         ARCHIVE="stoat-tui-${VERSION}-${TARGET}.tar.gz"
         DOWNLOAD_URL="${GITHUB_URL}/${REPO}/releases/download/${VERSION}/${ARCHIVE}"
-        if ! curl -fsSL "$DOWNLOAD_URL" -o "${TMP_DIR}/${ARCHIVE}"; then
+        if ! curl -fsSL "$DOWNLOAD_URL" -o "${TMP_DIR}/${ARCHIVE}" 2>/dev/null; then
+            fallback_cargo_install
             error "Failed to download release archive from $DOWNLOAD_URL"
         fi
     else
+        fallback_cargo_install
         error "Failed to download release archive from $DOWNLOAD_URL"
     fi
 fi
 
-# 5. Verify Checksum if available
+# 4. Verify Checksum if available
 info "Verifying archive integrity..."
 if curl -fsSL "$CHECKSUM_URL" -o "${TMP_DIR}/checksums.txt" 2>/dev/null; then
     if command -v sha256sum >/dev/null 2>&1; then
@@ -114,7 +142,7 @@ else
     warn "Checksums file not found on release, skipping checksum verification."
 fi
 
-# 6. Extract Binary
+# 5. Extract Binary
 info "Extracting archive..."
 tar -xzf "${TMP_DIR}/${ARCHIVE}" -C "$TMP_DIR"
 
@@ -123,7 +151,7 @@ if [ -z "$BINARY_PATH" ] || [ ! -f "$BINARY_PATH" ]; then
     error "Binary 'stoat-tui' not found in extracted archive."
 fi
 
-# 7. Determine Destination Directory
+# 6. Determine Destination Directory
 if [ -n "${INSTALL_DIR:-}" ]; then
     DEST_DIR="$INSTALL_DIR"
 elif [ "$(id -u)" -eq 0 ]; then
@@ -141,15 +169,13 @@ info "Installing binary to ${DEST_DIR}/stoat-tui..."
 cp "$BINARY_PATH" "${DEST_DIR}/stoat-tui"
 chmod +x "${DEST_DIR}/stoat-tui"
 
-# 8. Verify Installation
+# 7. Verify Installation
 if [ -x "${DEST_DIR}/stoat-tui" ]; then
     success "Successfully installed stoat-tui to ${DEST_DIR}/stoat-tui"
-    "${DEST_DIR}/stoat-tui" --version || true
 else
     error "Installation verification failed. ${DEST_DIR}/stoat-tui is not executable."
 fi
 
-# Check if DEST_DIR is in PATH
 case ":$PATH:" in
     *":${DEST_DIR}:"*)
         ;;

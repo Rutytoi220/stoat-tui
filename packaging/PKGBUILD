@@ -1,13 +1,20 @@
-# Maintainer: Stoat Team <dev@stoat.chat>
+# Maintainer: Rutytoi <https://github.com/Rutytoi220/stoat-tui>
 pkgname=stoat-tui
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="Fast, keyboard-first, and fully mouse-accessible Terminal User Interface client for Stoat"
 arch=('x86_64' 'aarch64')
-url="https://github.com/stoat-chat/stoat-tui"
+url="https://github.com/Rutytoi220/stoat-tui"
 license=('MIT')
-depends=('gcc-libs' 'openssl')
-makedepends=('cargo')
+depends=('gcc-libs' 'alsa-lib')
+makedepends=('cargo' 'pkgconf' 'gtk3')
+optdepends=(
+    'wf-recorder: 30-60 FPS Wayland screen sharing'
+    'wl-screenrec: hardware-accelerated Wayland screen sharing'
+    'grim: Wayland screenshot fallback for screen sharing'
+    'zenity: native file picker for attachment/avatar uploads'
+    'kdialog: KDE file picker for attachment/avatar uploads'
+)
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 

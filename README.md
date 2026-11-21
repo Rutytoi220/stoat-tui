@@ -25,19 +25,29 @@ A fast, keyboard-first, and mouse-accessible Terminal User Interface (TUI) clien
 
 ## Installation
 
-### 1. Via Cargo (Recommended)
+### 1. One-Line Installer (Linux / macOS — Prebuilt Binary with Cargo Fallback)
 ```bash
-# Build and install from a local clone
-cargo install --path .
+curl -fsSL https://raw.githubusercontent.com/Rutytoi220/stoat-tui/master/scripts/install.sh | sh
+```
+Downloads the latest prebuilt release binary from [GitHub Releases](https://github.com/Rutytoi220/stoat-tui/releases/latest) (verifying SHA-256 checksums) into `~/.local/bin` (or `/usr/local/bin`), and automatically falls back to `cargo install --git` if no prebuilt binary exists for your architecture.
+
+### 2. Via Cargo Directly from GitHub (No Clone Required)
+```bash
+cargo install --git https://github.com/Rutytoi220/stoat-tui
 ```
 
-### 2. Arch Linux (`PKGBUILD`)
-System dependencies for building with PipeWire/GStreamer screen capture and ALSA audio on Arch Linux:
+### 3. Prebuilt Binaries
+Download the `.tar.gz` archive for your platform directly from [GitHub Releases](https://github.com/Rutytoi220/stoat-tui/releases/latest), extract it, and place `stoat-tui` in your `$PATH`.
+
+### 4. Arch Linux (`PKGBUILD`)
+System dependencies for building with ALSA audio and optional Wayland screen sharing:
 ```bash
-sudo pacman -S --needed base-devel rust alsa-lib pipewire gstreamer gst-plugins-base grim
-cargo install --path .
+sudo pacman -S --needed base-devel rust alsa-lib gtk3
+# Optional for Wayland screen sharing & file picker:
+sudo pacman -S --needed wf-recorder grim zenity
+cargo install --git https://github.com/Rutytoi220/stoat-tui
 ```
-Or using the included `packaging/PKGBUILD`:
+Or using the included `packaging/PKGBUILD` / `packaging/PKGBUILD-bin`:
 ```bash
 cd packaging
 makepkg -si
@@ -53,9 +63,12 @@ makepkg -si
 | `Alt+1` .. `Alt+5` | Global | Jump directly to `Servers`, `Channels`, `Chat`, `Input`, or `Members` |
 | `Ctrl+P` | Global | Open Fuzzy Command Palette / Quick Switcher |
 | `F2` / `Alt+Shift+L` | Global | Open Login / Add Account Modal (`Email & Password`, `Token`, `Demo`) |
-| `Shift+S` (`S`) | Non-Input | Open Settings Modal (audio chimes, sidebar width, compact mode, accounts) |
+| `Shift+S` (`S`) | Non-Input | Open Settings & Profile Modal (profile, presence, audio chimes, accounts) |
+| `Shift+F` (`F`) / `F3` | Non-Input / Global | Open Friends & Friend Requests Modal (add, accept, decline, open DM) |
+| `Shift+G` (`G`) / `F4` | Non-Input / Global | Open Create Group Modal (name, description, multi-select friends) |
+| `Ctrl+X` / `Delete` / Right-Click | Global / Sidebar | Delete / Leave Group or close DM (with confirmation popup) |
 | `Ctrl+H` / `Ctrl+L` | Global | Shrink / expand left sidebar width (`Ctrl+Left` / `Ctrl+Right` also work) |
-| `F4` / `Alt+M` | Global | Toggle Right Member Rail (`Alt+M` when not in an active call) |
+| `Alt+M` | Non-Call | Toggle Right Member Rail |
 | `Ctrl+Alt+J` / `K` | Global | Switch to next / previous server |
 | `Alt+Shift+J` / `K` | Global | Jump to next / previous unread channel |
 | `c` / `Alt+C` | Non-Input / Global | Join or leave voice call in the active channel |

@@ -1,4 +1,4 @@
-use crate::api::models::{Category, Channel, Member, MemberId, Message, Role, Server, User, UserStatus, Presence};
+use crate::api::models::{Category, Channel, Member, MemberId, Message, Presence, RelationshipStatus, Role, Server, User, UserStatus};
 use crate::config::Config;
 use crate::ui::theme::Theme;
 use crate::voice::{ActiveCallState, VoiceParticipant};
@@ -155,6 +155,24 @@ pub struct AppState {
     pub screen_picker_targets: Vec<crate::voice::screen::ScreenShareTarget>,
     pub screen_picker_selected: usize,
 
+    pub show_friends_modal: bool,
+    pub friends_selected_index: usize,
+    pub friends_account_id: String,
+    pub friends_input_focused: bool,
+    pub friends_input_buffer: String,
+    pub friends_status: Option<String>,
+    pub account_relationships: HashMap<(String, String), RelationshipStatus>,
+
+    pub show_create_group_modal: bool,
+    pub group_account_id: String,
+    pub group_name_input: String,
+    pub group_desc_input: String,
+    pub group_focus_section: usize, // 0 = name, 1 = description, 2 = friends list
+    pub group_member_cursor: usize,
+    pub group_selected_users: HashSet<String>,
+    pub group_status: Option<String>,
+    pub pending_delete_channel: Option<(String, String, String, String)>, // (account_id, channel_id, name, action_verb)
+
     pub show_login_modal: bool,
     pub is_demo_mode: bool,
     pub login_tab: LoginTab,
@@ -303,6 +321,24 @@ impl AppState {
             show_screen_picker_modal: false,
             screen_picker_targets: Vec::new(),
             screen_picker_selected: 0,
+
+            show_friends_modal: false,
+            friends_selected_index: 0,
+            friends_account_id: active_account_id.clone(),
+            friends_input_focused: false,
+            friends_input_buffer: String::new(),
+            friends_status: None,
+            account_relationships: HashMap::new(),
+
+            show_create_group_modal: false,
+            group_account_id: active_account_id.clone(),
+            group_name_input: String::new(),
+            group_desc_input: String::new(),
+            group_focus_section: 0,
+            group_member_cursor: 0,
+            group_selected_users: HashSet::new(),
+            group_status: None,
+            pending_delete_channel: None,
 
             show_login_modal: show_login,
             is_demo_mode: false,
@@ -640,6 +676,119 @@ impl AppState {
         self.account_users
             .get(account_id)
             .or(self.current_user.as_ref())
+    }
+
+    pub fn sync_user_relationships(&mut self, account_id: &str, user: &User) {
+        if let Some(ref rel) = user.relationship {
+            let key = (account_id.to_string(), user.id.clone());
+            match rel {
+                RelationshipStatus::Friend
+                | RelationshipStatus::Incoming
+                | RelationshipStatus::Outgoing => {
+                    self.account_relationships.insert(key, rel.clone());
+                }
+                RelationshipStatus::None
+                | RelationshipStatus::Blocked
+                | RelationshipStatus::BlockedOther => {
+                    self.account_relationships.remove(&key);
+                }
+                _ => {}
+            }
+        }
+        if let Some(ref rels) = user.relations {
+            for r in rels {
+                let key = (account_id.to_string(), r.id.clone());
+                match r.status {
+                    RelationshipStatus::Friend
+                    | RelationshipStatus::Incoming
+                    | RelationshipStatus::Outgoing => {
+                        self.account_relationships.insert(key, r.status.clone());
+                        self.user_accounts
+                            .entry(r.id.clone())
+                            .or_insert_with(|| account_id.to_string());
+                    }
+                    RelationshipStatus::None
+                    | RelationshipStatus::Blocked
+                    | RelationshipStatus::BlockedOther => {
+                        self.account_relationships.remove(&key);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    pub fn incoming_friend_request_count(&self) -> usize {
+        self.account_relationships
+            .values()
+            .filter(|s| **s == RelationshipStatus::Incoming)
+            .count()
+    }
+
+    /// Returns sorted friend user IDs (`RelationshipStatus::Friend`) belonging to `account_id`.
+    pub fn friend_ids_for_account(&self, account_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .account_relationships
+            .iter()
+            .filter(|((acc, _), st)| acc == account_id && **st == RelationshipStatus::Friend)
+            .map(|((_, uid), _)| uid.clone())
+            .collect();
+        ids.sort_by(|a, b| {
+            let na = self
+                .users
+                .get(a)
+                .map(|u| u.name().to_ascii_lowercase())
+                .unwrap_or_else(|| a.clone());
+            let nb = self
+                .users
+                .get(b)
+                .map(|u| u.name().to_ascii_lowercase())
+                .unwrap_or_else(|| b.clone());
+            na.cmp(&nb)
+        });
+        ids
+    }
+
+    /// Returns `(account_id, user_id, RelationshipStatus)` sorted: Incoming -> Outgoing -> Friend.
+    pub fn sorted_friend_entries(&self) -> Vec<(String, String, RelationshipStatus)> {
+        let mut items: Vec<(String, String, RelationshipStatus)> = self
+            .account_relationships
+            .iter()
+            .filter(|(_, s)| {
+                matches!(
+                    s,
+                    RelationshipStatus::Incoming
+                        | RelationshipStatus::Outgoing
+                        | RelationshipStatus::Friend
+                )
+            })
+            .map(|((acc, uid), st)| (acc.clone(), uid.clone(), st.clone()))
+            .collect();
+
+        let rank = |s: &RelationshipStatus| -> u8 {
+            match s {
+                RelationshipStatus::Incoming => 0,
+                RelationshipStatus::Outgoing => 1,
+                RelationshipStatus::Friend => 2,
+                _ => 3,
+            }
+        };
+        items.sort_by(|a, b| {
+            rank(&a.2).cmp(&rank(&b.2)).then_with(|| {
+                let na = self
+                    .users
+                    .get(&a.1)
+                    .map(|u| u.name().to_ascii_lowercase())
+                    .unwrap_or_else(|| a.1.clone());
+                let nb = self
+                    .users
+                    .get(&b.1)
+                    .map(|u| u.name().to_ascii_lowercase())
+                    .unwrap_or_else(|| b.1.clone());
+                na.cmp(&nb)
+            })
+        });
+        items
     }
 
     pub fn purge_account_items(&mut self, account_id: &str) {

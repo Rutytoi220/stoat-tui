@@ -14,6 +14,9 @@ use components::members::MemberRail;
 use components::servers::ServersRail;
 use components::status_bar::StatusBar;
 use modals::command_palette::CommandPaletteModal;
+use modals::confirm_delete::ConfirmDeleteModal;
+use modals::create_group::CreateGroupModal;
+use modals::friends::FriendsModal;
 use modals::login::LoginModal;
 use modals::screen_picker::ScreenPickerModal;
 use modals::settings::SettingsModal;
@@ -167,6 +170,60 @@ fn render_modals(f: &mut Frame, state: &mut AppState, size: Rect) {
         };
         if modal_rect.width > 0 && modal_rect.height > 0 {
             f.render_widget(ScreenPickerModal::new(state), modal_rect);
+        }
+    }
+
+    if state.show_friends_modal {
+        let modal_rect = if size.width < 36 || size.height < 14 {
+            size
+        } else {
+            let modal_w = 72.min(size.width.saturating_sub(4));
+            let modal_h = 20.min(size.height.saturating_sub(2));
+            Rect {
+                x: size.width.saturating_sub(modal_w) / 2,
+                y: size.height.saturating_sub(modal_h) / 2,
+                width: modal_w,
+                height: modal_h,
+            }
+        };
+        if modal_rect.width > 0 && modal_rect.height > 0 {
+            f.render_widget(FriendsModal::new(state), modal_rect);
+        }
+    }
+
+    if state.show_create_group_modal {
+        let modal_rect = if size.width < 36 || size.height < 14 {
+            size
+        } else {
+            let modal_w = 72.min(size.width.saturating_sub(4));
+            let modal_h = 20.min(size.height.saturating_sub(2));
+            Rect {
+                x: size.width.saturating_sub(modal_w) / 2,
+                y: size.height.saturating_sub(modal_h) / 2,
+                width: modal_w,
+                height: modal_h,
+            }
+        };
+        if modal_rect.width > 0 && modal_rect.height > 0 {
+            f.render_widget(CreateGroupModal::new(state), modal_rect);
+        }
+    }
+
+    if state.pending_delete_channel.is_some() {
+        let modal_rect = if size.width < 32 || size.height < 7 {
+            size
+        } else {
+            let modal_w = 58.min(size.width.saturating_sub(4));
+            let modal_h = 7.min(size.height.saturating_sub(2));
+            Rect {
+                x: size.width.saturating_sub(modal_w) / 2,
+                y: size.height.saturating_sub(modal_h) / 2,
+                width: modal_w,
+                height: modal_h,
+            }
+        };
+        if modal_rect.width > 0 && modal_rect.height > 0 {
+            f.render_widget(ConfirmDeleteModal::new(state), modal_rect);
         }
     }
 }

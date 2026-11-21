@@ -54,6 +54,10 @@ pub enum ServerMessage {
         id: String,
         data: serde_json::Value,
     },
+    UserRelationship {
+        id: String,
+        user: User,
+    },
     VoiceChannelJoin {
         id: String,
         user: String,
@@ -140,6 +144,12 @@ impl ServerMessage {
                         deafened,
                         screensharing,
                     })
+                }
+                "UserRelationship" => {
+                    let id = val.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    val.get("user")
+                        .and_then(|u| serde_json::from_value::<User>(u.clone()).ok())
+                        .map(|user| ServerMessage::UserRelationship { id, user })
                 }
                 _ => Some(ServerMessage::Unknown),
             }

@@ -57,6 +57,13 @@ pub enum AppEvent {
     UserProfileFetched { user_id: String, profile: UserProfile },
     UserProfileUpdated { account_id: String, user: User },
     ProfileEditFailed(String),
+    FriendActionSucceeded { account_id: String, user: User, message: String },
+    FriendActionFailed(String),
+    DmChannelOpened { account_id: String, channel: Channel },
+    GroupCreated { account_id: String, channel: Channel },
+    GroupCreateFailed(String),
+    ChannelDeleted { channel_id: String, name: String },
+    ChannelDeleteFailed(String),
 }
 
 pub struct EventHandler {

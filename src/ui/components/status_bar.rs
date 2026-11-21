@@ -207,21 +207,33 @@ impl<'a> Widget for StatusBar<'a> {
                 x += w;
             }
         } else {
-            let mut hints: Vec<(&str, &str, Color)> = vec![
-                ("F2", if self.state.current_user.is_some() { "Account" } else { "Login" }, theme.accent),
-                ("S", "Settings", theme.accent),
+            let pending_reqs = self.state.incoming_friend_request_count();
+            let friends_label = if pending_reqs > 0 {
+                format!("Friends ({})", pending_reqs)
+            } else {
+                "Friends".to_string()
+            };
+            let mut hints: Vec<(&str, String, Color)> = vec![
+                ("F2", if self.state.current_user.is_some() { "Account".into() } else { "Login".into() }, theme.accent),
+                ("S", "Settings".into(), theme.accent),
+                (
+                    "F",
+                    friends_label,
+                    if pending_reqs > 0 { Color::Rgb(250, 190, 60) } else { theme.accent },
+                ),
+                ("G", "Group".into(), theme.accent),
             ];
             if self.state.active_call.is_some() {
-                hints.push(("c", "Leave", theme.primary));
-                hints.push(("m", "Mute", Color::Rgb(200, 200, 220)));
-                hints.push(("d", "Deafen", Color::Rgb(200, 200, 220)));
-                hints.push(("s", "Share", Color::Rgb(200, 200, 220)));
-                hints.push(("f", "Full", Color::Rgb(200, 200, 220)));
+                hints.push(("c", "Leave".into(), theme.primary));
+                hints.push(("m", "Mute".into(), Color::Rgb(200, 200, 220)));
+                hints.push(("d", "Deafen".into(), Color::Rgb(200, 200, 220)));
+                hints.push(("s", "Share".into(), Color::Rgb(200, 200, 220)));
+                hints.push(("f", "Full".into(), Color::Rgb(200, 200, 220)));
             } else {
-                hints.push(("c", "Call", theme.primary));
-                hints.push(("u", "Upload", Color::Rgb(200, 200, 220)));
-                hints.push(("Ctrl+P", "Jump", Color::Rgb(200, 200, 220)));
-                hints.push(("Alt+J/K", "Ch", theme.muted));
+                hints.push(("c", "Call".into(), theme.primary));
+                hints.push(("u", "Upload".into(), Color::Rgb(200, 200, 220)));
+                hints.push(("Ctrl+P", "Jump".into(), Color::Rgb(200, 200, 220)));
+                hints.push(("Alt+J/K", "Ch".into(), theme.muted));
             }
 
             let hints_rect = Rect {

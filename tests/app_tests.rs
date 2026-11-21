@@ -538,6 +538,7 @@ async fn test_api_session_expired_event() {
         status: None,
         bot: None,
         online: Some(true),
+        ..Default::default()
     });
     app.state.show_login_modal = false;
 
@@ -3562,4 +3563,440 @@ async fn test_edit_user_retries_once_on_http_429_retry_after() {
 
     assert_eq!(updated.presence_str(), "Idle");
     server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_delta_client_friend_requests_and_dm() {
+    use stoat_tui::api::models::RelationshipStatus;
+    use stoat_tui::api::DeltaClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+
+    let server_handle = tokio::spawn(async move {
+        // 1. POST /users/friend
+        {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("POST /users/friend "), "Unexpected req: {}", req);
+            assert!(req.contains("\"username\":\"alice#1234\""), "Missing username in body: {}", req);
+            let body = r#"{"_id":"u_alice","username":"alice","discriminator":"1234","relationship":"Outgoing"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        }
+        // 2. PUT /users/u_bob/friend
+        {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("PUT /users/u_bob/friend "), "Unexpected req: {}", req);
+            let body = r#"{"_id":"u_bob","username":"bob","discriminator":"5678","relationship":"Friend"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        }
+        // 3. DELETE /users/u_bob/friend
+        {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("DELETE /users/u_bob/friend "), "Unexpected req: {}", req);
+            let body = r#"{"_id":"u_bob","username":"bob","discriminator":"5678","relationship":"None"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        }
+        // 4. GET /users/u_alice/dm
+        {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("GET /users/u_alice/dm "), "Unexpected req: {}", req);
+            let body = r#"{"_id":"dm_alice","channel_type":"DirectMessage","recipients":["u_me","u_alice"]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        }
+    });
+
+    let client = DeltaClient::new(api_url, Some("tok_friends".to_string()), false);
+    let sent = client.send_friend_request("alice#1234").await.unwrap();
+    assert_eq!(sent.id, "u_alice");
+    assert_eq!(sent.relationship, Some(RelationshipStatus::Outgoing));
+
+    let accepted = client.accept_friend_request("u_bob").await.unwrap();
+    assert_eq!(accepted.relationship, Some(RelationshipStatus::Friend));
+
+    let removed = client.remove_friend("u_bob").await.unwrap();
+    assert_eq!(removed.relationship, Some(RelationshipStatus::None));
+
+    let dm = client.open_dm("u_alice").await.unwrap();
+    assert_eq!(dm.id, "dm_alice");
+    assert_eq!(dm.channel_type, "DirectMessage");
+
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_friends_modal_bonfire_sync_render_and_actions() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use stoat_tui::api::models::{Channel, RelationshipStatus, User};
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::gateway::messages::ServerMessage;
+    use stoat_tui::gateway::GatewayEvent;
+    use stoat_tui::state::Focus;
+    use stoat_tui::ui;
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (cfg, _guard) = isolated_config(Some("tok_f_modal"));
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
+    app.state.show_login_modal = false;
+    app.state.focus = Focus::Chat;
+
+    // 1. Parse live Bonfire UserRelationship event for an incoming friend request
+    let raw_ev = r#"{"type":"UserRelationship","id":"u_me","user":{"_id":"u_in","username":"roman","discriminator":"9001","relationship":"Incoming"}}"#;
+    let parsed = ServerMessage::parse_resilient(raw_ev).expect("UserRelationship should parse");
+    assert!(matches!(parsed, ServerMessage::UserRelationship { .. }));
+
+    app.handle_event(AppEvent::Gateway(GatewayEvent::MessageReceived(parsed))).await;
+    assert_eq!(app.state.incoming_friend_request_count(), 1);
+    assert!(app
+        .state
+        .status_message
+        .as_ref()
+        .map(|(s, _)| s.contains("roman"))
+        .unwrap_or(false));
+
+    // 2. Open Friends modal with Shift+F and render
+    app.handle_event(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('F'),
+        KeyModifiers::SHIFT,
+    )))
+    .await;
+    assert!(app.state.show_friends_modal);
+
+    let backend = TestBackend::new(110, 32);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| ui::render(f, &mut app.state))
+        .expect("FriendsModal should render cleanly");
+    let buf_text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(buf_text.contains("Friends & Requests (1 pending)"), "Missing modal title");
+    assert!(buf_text.contains("roman#9001"), "Missing incoming user in FriendsModal");
+
+    // 3. Focus Add Friend input with 'a', type username, Esc returns to list
+    app.handle_event(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('a'),
+        KeyModifiers::NONE,
+    )))
+    .await;
+    assert!(app.state.friends_input_focused);
+    for ch in "bob#1234".chars() {
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .await;
+    }
+    assert_eq!(app.state.friends_input_buffer, "bob#1234");
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))).await;
+    assert!(!app.state.friends_input_focused);
+
+    // 4. FriendActionSucceeded promotes incoming -> Friend
+    let acc_id = app.state.active_account_id.clone();
+    app.handle_event(AppEvent::FriendActionSucceeded {
+        account_id: acc_id.clone(),
+        user: User {
+            id: "u_in".to_string(),
+            username: "roman".to_string(),
+            discriminator: Some("9001".to_string()),
+            relationship: Some(RelationshipStatus::Friend),
+            ..Default::default()
+        },
+        message: "✓ Accepted friend request from @roman".to_string(),
+    })
+    .await;
+    assert_eq!(app.state.incoming_friend_request_count(), 0);
+    assert_eq!(
+        app.state.account_relationships.get(&(acc_id.clone(), "u_in".to_string())),
+        Some(&RelationshipStatus::Friend)
+    );
+
+    // 5. DmChannelOpened closes FriendsModal and jumps to the DM
+    app.handle_event(AppEvent::DmChannelOpened {
+        account_id: acc_id,
+        channel: Channel {
+            id: "dm_roman".to_string(),
+            channel_type: "DirectMessage".to_string(),
+            recipients: Some(vec!["u_me".to_string(), "u_in".to_string()]),
+            ..Default::default()
+        },
+    })
+    .await;
+    assert!(!app.state.show_friends_modal);
+    assert_eq!(app.state.active_channel_id.as_deref(), Some("dm_roman"));
+}
+
+#[tokio::test]
+async fn test_delta_client_create_group_endpoint() {
+    use stoat_tui::api::DeltaClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+
+    let server_handle = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let n = sock.read(&mut buf).await.unwrap();
+        let req = String::from_utf8_lossy(&buf[..n]);
+        assert!(req.starts_with("POST /channels/create "), "Unexpected req: {}", req);
+        assert!(req.contains("\"name\":\"Dev Squad\""), "Missing name: {}", req);
+        assert!(req.contains("\"description\":\"Late night\""), "Missing desc: {}", req);
+        assert!(req.contains("\"u_a\"") && req.contains("\"u_b\""), "Missing users: {}", req);
+
+        let body = r#"{"_id":"grp_1","channel_type":"Group","name":"Dev Squad","description":"Late night","recipients":["u_me","u_a","u_b"]}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        sock.write_all(resp.as_bytes()).await.unwrap();
+    });
+
+    let client = DeltaClient::new(api_url, Some("tok_grp".to_string()), false);
+    let ch = client
+        .create_group(
+            "Dev Squad",
+            Some("Late night"),
+            &["u_a".to_string(), "u_b".to_string()],
+        )
+        .await
+        .expect("create_group should succeed");
+
+    assert_eq!(ch.id, "grp_1");
+    assert_eq!(ch.channel_type, "Group");
+    assert_eq!(ch.name.as_deref(), Some("Dev Squad"));
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_create_group_modal_flow_render_and_event() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use stoat_tui::api::models::{Channel, RelationshipStatus, User};
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::state::Focus;
+    use stoat_tui::ui;
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (cfg, _guard) = isolated_config(Some("tok_grp_modal"));
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
+    app.state.show_login_modal = false;
+    app.state.focus = Focus::Chat;
+
+    let acc_id = app.state.active_account_id.clone();
+    let friend = User {
+        id: "u_friend1".to_string(),
+        username: "roman".to_string(),
+        discriminator: Some("9001".to_string()),
+        relationship: Some(RelationshipStatus::Friend),
+        online: Some(true),
+        ..Default::default()
+    };
+    app.state.sync_user_relationships(&acc_id, &friend);
+    app.state.users.insert(friend.id.clone(), friend);
+
+    // 1. Open Create Group modal with Shift+G
+    app.handle_event(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('G'),
+        KeyModifiers::SHIFT,
+    )))
+    .await;
+    assert!(app.state.show_create_group_modal);
+    assert_eq!(app.state.group_focus_section, 0);
+
+    // 2. Type group name, Tab to Desc, Tab to Friends list, Space to select friend
+    for ch in "Squad".chars() {
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .await;
+    }
+    assert_eq!(app.state.group_name_input, "Squad");
+
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .await;
+    assert_eq!(app.state.group_focus_section, 1);
+
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .await;
+    assert_eq!(app.state.group_focus_section, 2);
+
+    app.handle_event(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char(' '),
+        KeyModifiers::NONE,
+    )))
+    .await;
+    assert!(app.state.group_selected_users.contains("u_friend1"));
+
+    // 3. Render CreateGroupModal via TestBackend
+    let backend = TestBackend::new(110, 32);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| ui::render(f, &mut app.state))
+        .expect("CreateGroupModal should render cleanly");
+    let buf_text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(buf_text.contains("Create Group (1 selected)"), "Missing modal title");
+    assert!(buf_text.contains("[✓]"), "Missing checked friend box");
+    assert!(buf_text.contains("@roman#9001"), "Missing friend handle");
+
+    // 4. GroupCreated event closes modal, adds group to DMs, and jumps into it
+    app.handle_event(AppEvent::GroupCreated {
+        account_id: acc_id,
+        channel: Channel {
+            id: "grp_squad".to_string(),
+            channel_type: "Group".to_string(),
+            name: Some("Squad".to_string()),
+            recipients: Some(vec!["u_me".to_string(), "u_friend1".to_string()]),
+            ..Default::default()
+        },
+    })
+    .await;
+    assert!(!app.state.show_create_group_modal);
+    assert_eq!(app.state.active_channel_id.as_deref(), Some("grp_squad"));
+    assert!(app.state.dms.iter().any(|d| d.id == "grp_squad"));
+}
+
+#[tokio::test]
+async fn test_delete_or_leave_group_endpoint_and_two_step_confirm() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use stoat_tui::api::models::Channel;
+    use stoat_tui::api::DeltaClient;
+    use stoat_tui::event::AppEvent;
+    use stoat_tui::state::Focus;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+
+    let server_handle = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let n = sock.read(&mut buf).await.unwrap();
+        let req = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            req.starts_with("DELETE /channels/grp_del_1 "),
+            "Unexpected req: {}",
+            req
+        );
+        let resp = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        sock.write_all(resp.as_bytes()).await.unwrap();
+    });
+
+    // 1. Direct DeltaClient DELETE /channels/{id}
+    let client = DeltaClient::new(api_url, Some("tok_del".to_string()), false);
+    client
+        .delete_or_leave_channel("grp_del_1")
+        .await
+        .expect("DELETE /channels/{id} should succeed on 204");
+    server_handle.await.unwrap();
+
+    // 2. Two-step confirmation via Shift+X and ChannelDeleted cleanup
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (cfg, _guard) = isolated_config(Some("tok_del_app"));
+    let picker = std::sync::Arc::new(ratatui_image::picker::Picker::halfblocks());
+    let mut app = stoat_tui::app::App::new(cfg, tx, picker);
+    app.state.show_login_modal = false;
+    app.state.focus = Focus::Chat;
+
+    let grp = Channel {
+        id: "grp_del_2".to_string(),
+        channel_type: "Group".to_string(),
+        name: Some("Temp Group".to_string()),
+        ..Default::default()
+    };
+    app.state.dms.push(grp.clone());
+    app.state.channels.insert(grp.id.clone(), grp);
+    app.state.active_channel_id = Some("grp_del_2".to_string());
+
+    // First Ctrl+X opens the ConfirmDeleteModal without deleting yet
+    app.handle_event(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('x'),
+        KeyModifiers::CONTROL,
+    )))
+    .await;
+    assert!(app.state.pending_delete_channel.is_some());
+    assert!(app.state.channels.contains_key("grp_del_2"));
+
+    // Verify ConfirmDeleteModal renders clearly
+    let backend = ratatui::backend::TestBackend::new(100, 28);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| stoat_tui::ui::render(f, &mut app.state))
+        .expect("ConfirmDeleteModal should render cleanly");
+    let buf_text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(buf_text.contains("Confirm Delete / Leave"), "Missing confirm modal title");
+    assert!(buf_text.contains("Temp Group"), "Missing group name in confirm modal");
+
+    // Esc cancels cleanly
+    app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await;
+    assert!(app.state.pending_delete_channel.is_none());
+
+    // ChannelDeleted removes channel from channels, dms, and clears active_channel_id
+    app.handle_event(AppEvent::ChannelDeleted {
+        channel_id: "grp_del_2".to_string(),
+        name: "Temp Group".to_string(),
+    })
+    .await;
+    assert!(!app.state.channels.contains_key("grp_del_2"));
+    assert!(!app.state.dms.iter().any(|d| d.id == "grp_del_2"));
+    assert_ne!(app.state.active_channel_id.as_deref(), Some("grp_del_2"));
 }

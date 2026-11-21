@@ -1,4 +1,6 @@
-use crate::api::models::{EditUserRequest, LoginResponse, Message, Presence, UserProfileUpdate, UserStatus};
+use crate::api::models::{
+    EditUserRequest, LoginResponse, Message, Presence, RelationshipStatus, UserProfileUpdate, UserStatus,
+};
 use crate::api::DeltaClient;
 use crate::config::{Config, SavedAccount};
 use crate::event::AppEvent;
@@ -596,6 +598,7 @@ impl App {
             AppEvent::ApiCurrentUser(user) => {
                 self.state.user_accounts.insert(user.id.clone(), account_id.to_string());
                 self.state.account_users.insert(account_id.to_string(), user.clone());
+                self.state.sync_user_relationships(account_id, &user);
                 self.state.users.insert(user.id.clone(), user.clone());
                 if account_id == self.state.active_account_id || self.state.current_user.is_none() {
                     self.state.current_user = Some(user.clone());
@@ -1007,6 +1010,110 @@ impl App {
                 self.state.settings_profile_status = Some(msg.clone());
                 self.state.set_status(msg);
             }
+            AppEvent::FriendActionSucceeded {
+                account_id: friend_acc_id,
+                user,
+                message,
+            } => {
+                self.state
+                    .user_accounts
+                    .insert(user.id.clone(), friend_acc_id.clone());
+                self.state.sync_user_relationships(&friend_acc_id, &user);
+                self.state.users.insert(user.id.clone(), user);
+                let total = self.state.sorted_friend_entries().len();
+                if total == 0 {
+                    self.state.friends_selected_index = 0;
+                } else if self.state.friends_selected_index >= total {
+                    self.state.friends_selected_index = total - 1;
+                }
+                self.state.friends_status = Some(message.clone());
+                self.state.set_status(message);
+            }
+            AppEvent::FriendActionFailed(err) => {
+                let msg = crate::ui::components::status_bar::sanitize_status_text(&format!(
+                    "⚠ {}",
+                    err
+                ));
+                self.state.friends_status = Some(msg.clone());
+                self.state.set_status(msg);
+            }
+            AppEvent::DmChannelOpened {
+                account_id: dm_acc_id,
+                channel,
+            } => {
+                let cid = channel.id.clone();
+                self.state
+                    .channel_accounts
+                    .insert(cid.clone(), dm_acc_id.clone());
+                if let Some(ref recipients) = channel.recipients {
+                    for r in recipients {
+                        self.state
+                            .user_accounts
+                            .entry(r.clone())
+                            .or_insert_with(|| dm_acc_id.clone());
+                        let _ = self.state.resolve_user_in_account(&dm_acc_id, r);
+                    }
+                }
+                if !self.state.dms.iter().any(|d| d.id == cid) {
+                    self.state.dms.push(channel.clone());
+                }
+                self.state.channels.insert(cid.clone(), channel);
+                self.state.show_friends_modal = false;
+                self.state.friends_input_focused = false;
+                self.jump_to_channel(cid, None).await;
+            }
+            AppEvent::GroupCreated {
+                account_id: grp_acc_id,
+                channel,
+            } => {
+                let cid = channel.id.clone();
+                let gname = channel
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "Group".to_string());
+                self.state
+                    .channel_accounts
+                    .insert(cid.clone(), grp_acc_id.clone());
+                if let Some(ref recipients) = channel.recipients {
+                    for r in recipients {
+                        self.state
+                            .user_accounts
+                            .entry(r.clone())
+                            .or_insert_with(|| grp_acc_id.clone());
+                        let _ = self.state.resolve_user_in_account(&grp_acc_id, r);
+                    }
+                }
+                if !self.state.dms.iter().any(|d| d.id == cid) {
+                    self.state.dms.push(channel.clone());
+                }
+                self.state.channels.insert(cid.clone(), channel);
+                self.state.show_create_group_modal = false;
+                self.state.group_name_input.clear();
+                self.state.group_desc_input.clear();
+                self.state.group_selected_users.clear();
+                self.state.group_status = None;
+                self.state.set_status(format!("✓ Created group '{}'", gname));
+                self.jump_to_channel(cid, None).await;
+            }
+            AppEvent::GroupCreateFailed(err) => {
+                let msg = crate::ui::components::status_bar::sanitize_status_text(&format!(
+                    "⚠ {}",
+                    err
+                ));
+                self.state.group_status = Some(msg.clone());
+                self.state.set_status(msg);
+            }
+            AppEvent::ChannelDeleted { channel_id, name } => {
+                self.remove_channel_locally(&channel_id);
+                self.state.set_status(format!("✓ Deleted/left '{}'", name));
+            }
+            AppEvent::ChannelDeleteFailed(err) => {
+                let msg = crate::ui::components::status_bar::sanitize_status_text(&format!(
+                    "⚠ {}",
+                    err
+                ));
+                self.state.set_status(msg);
+            }
             AppEvent::AutumnUrlResolved(url) => {
                 let trimmed = url.trim().trim_end_matches('/').to_string();
                 if !trimmed.is_empty() {
@@ -1136,6 +1243,7 @@ impl App {
             self.state.channel_accounts.clear();
             self.state.user_accounts.clear();
             self.state.account_users.clear();
+            self.state.account_relationships.clear();
             self.state.account_autumn_urls.clear();
             self.state.account_livekit.clear();
             self.state.account_gateway_statuses.clear();
@@ -1293,6 +1401,201 @@ impl App {
                         call.screensharing.store(true, std::sync::atomic::Ordering::SeqCst);
                         self.state.set_status(format!("Screen sharing started: {}", chosen.label));
                     }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // 1b2. If Friends & Requests Modal is open
+        if self.state.show_friends_modal {
+            if self.state.friends_input_focused {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state.friends_input_focused = false;
+                    }
+                    KeyCode::Backspace => {
+                        self.state.friends_input_buffer.pop();
+                    }
+                    KeyCode::Char(c)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        self.state.friends_input_buffer.push(c);
+                    }
+                    KeyCode::Enter => {
+                        self.submit_send_friend_request();
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
+            let count = self.state.sorted_friend_entries().len();
+            let idx = if count == 0 {
+                0
+            } else {
+                self.state.friends_selected_index.min(count - 1)
+            };
+            match key.code {
+                KeyCode::Esc | KeyCode::F(3) | KeyCode::Char('F') => {
+                    self.state.show_friends_modal = false;
+                }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.state.show_friends_modal = false;
+                }
+                KeyCode::Char('a') => {
+                    self.state.friends_input_focused = true;
+                    self.state.friends_status = None;
+                }
+                KeyCode::Char('g') => {
+                    let acc = self.friends_account_id();
+                    self.state.show_friends_modal = false;
+                    self.open_create_group_modal(Some(acc));
+                }
+                KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                    self.cycle_friends_account(1);
+                }
+                KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                    self.cycle_friends_account(-1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if count > 0 {
+                        self.state.friends_selected_index = if idx == 0 { count - 1 } else { idx - 1 };
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if count > 0 {
+                        self.state.friends_selected_index = (idx + 1) % count;
+                    }
+                }
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    self.accept_selected_friend_or_open_dm();
+                }
+                KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
+                    self.remove_selected_friend();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // 1b3. If Create Group Modal is open
+        if self.state.show_create_group_modal {
+            if key.code == KeyCode::Esc || key.code == KeyCode::F(4) {
+                self.state.show_create_group_modal = false;
+                return;
+            }
+            if key.code == KeyCode::Tab {
+                self.state.group_focus_section = (self.state.group_focus_section + 1) % 3;
+                return;
+            }
+            if key.code == KeyCode::BackTab {
+                self.state.group_focus_section = (self.state.group_focus_section + 2) % 3;
+                return;
+            }
+            if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
+                self.submit_create_group();
+                return;
+            }
+
+            match self.state.group_focus_section {
+                0 | 1 => match key.code {
+                    KeyCode::Backspace => {
+                        if self.state.group_focus_section == 0 {
+                            self.state.group_name_input.pop();
+                        } else {
+                            self.state.group_desc_input.pop();
+                        }
+                    }
+                    KeyCode::Down => {
+                        self.state.group_focus_section = (self.state.group_focus_section + 1).min(2);
+                    }
+                    KeyCode::Up => {
+                        self.state.group_focus_section = self.state.group_focus_section.saturating_sub(1);
+                    }
+                    KeyCode::Enter => {
+                        if self.state.group_focus_section == 0
+                            && self.state.group_name_input.trim().is_empty()
+                        {
+                            self.state.group_status =
+                                Some("⚠ Enter a group name first".to_string());
+                        } else if !self.state.group_selected_users.is_empty() {
+                            self.submit_create_group();
+                        } else {
+                            self.state.group_focus_section = 2;
+                        }
+                    }
+                    KeyCode::Char(c)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        if self.state.group_focus_section == 0 {
+                            self.state.group_name_input.push(c);
+                        } else {
+                            self.state.group_desc_input.push(c);
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {
+                    let acc_id = self.group_account_id();
+                    let friends = self.state.friend_ids_for_account(&acc_id);
+                    let count = friends.len();
+                    let idx = if count == 0 {
+                        0
+                    } else {
+                        self.state.group_member_cursor.min(count - 1)
+                    };
+                    match key.code {
+                        KeyCode::Left | KeyCode::Char('h') => {
+                            self.cycle_group_account(-1);
+                        }
+                        KeyCode::Right | KeyCode::Char('l') => {
+                            self.cycle_group_account(1);
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if count > 0 {
+                                self.state.group_member_cursor =
+                                    if idx == 0 { count - 1 } else { idx - 1 };
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if count > 0 {
+                                self.state.group_member_cursor = (idx + 1) % count;
+                            }
+                        }
+                        KeyCode::Char(' ') => {
+                            if let Some(uid) = friends.get(idx) {
+                                if !self.state.group_selected_users.remove(uid) {
+                                    self.state.group_selected_users.insert(uid.clone());
+                                }
+                            }
+                        }
+                        KeyCode::Enter => {
+                            self.submit_create_group();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return;
+        }
+
+        // 1b4. If Confirm Delete / Leave Group Modal is open
+        if self.state.pending_delete_channel.is_some() {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_delete_or_leave_channel();
+                }
+                KeyCode::Char('x') | KeyCode::Char('X')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.confirm_delete_or_leave_channel();
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.state.pending_delete_channel = None;
+                    self.state.set_status("Cancelled delete/leave");
                 }
                 _ => {}
             }
@@ -1688,6 +1991,12 @@ impl App {
                     }
                     return;
                 }
+                KeyCode::Char('x') | KeyCode::Char('X') => {
+                    if let Some(cid) = self.state.active_channel_id.clone() {
+                        self.request_delete_or_leave_channel(&cid);
+                    }
+                    return;
+                }
                 KeyCode::Char('v') | KeyCode::Char('V') => {
                     if let Some(ref mut call) = self.state.active_call {
                         let shown = call.toggle_local_preview();
@@ -1724,6 +2033,68 @@ impl App {
             self.state.settings_input_buffer.clear();
             self.state.settings_pending_username.clear();
             self.state.settings_profile_status = None;
+            return;
+        }
+
+        // Open Friends & Requests Modal on Shift + F ('F') when not typing in Input
+        if self.state.focus != Focus::Input
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && (key.code == KeyCode::Char('F')
+                || (key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::SHIFT)))
+        {
+            self.open_friends_modal();
+            return;
+        }
+
+        // Open Create Group Modal on Shift + G ('G') when not typing in Input
+        if self.state.focus != Focus::Input
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && (key.code == KeyCode::Char('G')
+                || (key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::SHIFT)))
+        {
+            self.open_create_group_modal(None);
+            return;
+        }
+
+        // Global Delete / Leave Group (or close DM): Ctrl + X (works from any pane, including Input)
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X'))
+        {
+            let target_cid = if self.state.focus == Focus::Channels {
+                self.state
+                    .rect_channel_items
+                    .get(self.state.selected_channel_index)
+                    .map(|(cid, _)| cid.clone())
+                    .or_else(|| self.state.active_channel_id.clone())
+            } else {
+                self.state.active_channel_id.clone()
+            };
+            if let Some(cid) = target_cid {
+                self.request_delete_or_leave_channel(&cid);
+            }
+            return;
+        }
+
+        // Delete / Leave active Group (or close active DM) on Delete when not typing in Input
+        if self.state.focus != Focus::Input
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && key.code == KeyCode::Delete
+        {
+            let target_cid = if self.state.focus == Focus::Channels {
+                self.state
+                    .rect_channel_items
+                    .get(self.state.selected_channel_index)
+                    .map(|(cid, _)| cid.clone())
+                    .or_else(|| self.state.active_channel_id.clone())
+            } else {
+                self.state.active_channel_id.clone()
+            };
+            if let Some(cid) = target_cid {
+                self.request_delete_or_leave_channel(&cid);
+            }
             return;
         }
 
@@ -1825,6 +2196,18 @@ impl App {
             self.state.login_totp_input.clear();
             self.state.login_password_input.clear();
             self.state.login_token_input.clear();
+            return;
+        }
+
+        // Global Friends & Requests Modal Trigger: F3
+        if key.code == KeyCode::F(3) {
+            self.open_friends_modal();
+            return;
+        }
+
+        // Global Create Group Modal Trigger: F4
+        if key.code == KeyCode::F(4) {
+            self.open_create_group_modal(None);
             return;
         }
 
@@ -1986,6 +2369,22 @@ impl App {
                 KeyCode::Enter => {
                     if let Some((cid, _)) = self.state.rect_channel_items.get(self.state.selected_channel_index) {
                         self.switch_to_channel(cid.clone()).await;
+                    }
+                }
+                KeyCode::Char('x') | KeyCode::Delete => {
+                    let target_cid = self
+                        .state
+                        .rect_channel_items
+                        .get(self.state.selected_channel_index)
+                        .map(|(cid, _)| cid.clone())
+                        .or_else(|| self.state.active_channel_id.clone());
+                    if let Some(cid) = target_cid {
+                        self.request_delete_or_leave_channel(&cid);
+                    }
+                }
+                KeyCode::Esc => {
+                    if self.state.pending_delete_channel.take().is_some() {
+                        self.state.set_status("Cancelled delete/leave");
                     }
                 }
                 _ => {}
@@ -2254,8 +2653,9 @@ impl App {
                 if mx >= chan.left() && mx < chan.right() && my >= chan.top() && my < chan.bottom() {
                     self.state.focus = Focus::Channels;
 
-                    for (cid, rect) in &self.state.rect_channel_items {
+                    for (idx, (cid, rect)) in self.state.rect_channel_items.iter().enumerate() {
                         if my == rect.top() {
+                            self.state.selected_channel_index = idx;
                             self.switch_to_channel(cid.clone()).await;
                             break;
                         }
@@ -2281,6 +2681,24 @@ impl App {
                 let mem = self.state.rect_members;
                 if self.state.show_member_rail && mx >= mem.left() && mx < mem.right() && my >= mem.top() && my < mem.bottom() {
                     self.state.focus = Focus::Members;
+                }
+            }
+
+            MouseEventKind::Down(MouseButton::Right) => {
+                let chan = self.state.rect_channels;
+                if mx >= chan.left() && mx < chan.right() && my >= chan.top() && my < chan.bottom() {
+                    self.state.focus = Focus::Channels;
+                    let clicked = self
+                        .state
+                        .rect_channel_items
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (_, rect))| my == rect.top())
+                        .map(|(idx, (cid, _))| (idx, cid.clone()));
+                    if let Some((idx, cid)) = clicked {
+                        self.state.selected_channel_index = idx;
+                        self.request_delete_or_leave_channel(&cid);
+                    }
                 }
             }
 
@@ -2356,6 +2774,7 @@ impl App {
 
                     for u in users {
                         self.state.user_accounts.insert(u.id.clone(), account_id.to_string());
+                        self.state.sync_user_relationships(account_id, &u);
                         self.state.users.insert(u.id.clone(), u);
                     }
                     for s in servers {
@@ -2567,7 +2986,7 @@ impl App {
                     self.state.channels.insert(ch.id.clone(), ch);
                 }
                 ServerMessage::ChannelDelete { id } => {
-                    self.state.channels.remove(&id);
+                    self.remove_channel_locally(&id);
                 }
                 ServerMessage::VoiceChannelJoin { id, user } => {
                     let _ = self.state.resolve_user_in_account(account_id, &user);
@@ -2613,6 +3032,17 @@ impl App {
                             }
                         }
                     }
+                }
+                ServerMessage::UserRelationship { id: _, user } => {
+                    self.state.user_accounts.insert(user.id.clone(), account_id.to_string());
+                    self.state.sync_user_relationships(account_id, &user);
+                    if user.relationship == Some(RelationshipStatus::Incoming) {
+                        self.state.set_status(format!(
+                            "👋 Friend request from @{} (press Shift+F)",
+                            user.username
+                        ));
+                    }
+                    self.state.users.insert(user.id.clone(), user);
                 }
                 _ => {}
             },
@@ -3341,6 +3771,376 @@ impl App {
         self.state.set_status(format!("📞 Connecting to call in channel {}... [c: Cancel]", channel_id));
     }
 
+    fn open_friends_modal(&mut self) {
+        self.state.show_friends_modal = true;
+        self.state.friends_selected_index = 0;
+        self.state.friends_account_id = self.state.account_for_active_channel().to_string();
+        self.state.friends_input_focused = false;
+        self.state.friends_status = None;
+    }
+
+    fn friends_account_id(&self) -> String {
+        if !self.state.friends_account_id.is_empty() {
+            self.state.friends_account_id.clone()
+        } else {
+            self.state.active_account_id.clone()
+        }
+    }
+
+    fn cycle_friends_account(&mut self, delta: i32) {
+        let mut ids: Vec<String> = self
+            .state
+            .config
+            .accounts
+            .iter()
+            .map(|a| a.id.clone())
+            .collect();
+        for k in self.state.account_users.keys() {
+            if !ids.contains(k) {
+                ids.push(k.clone());
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        let cur = self.friends_account_id();
+        let pos = ids.iter().position(|id| id == &cur).unwrap_or(0) as i32;
+        let next = (pos + delta).rem_euclid(ids.len() as i32) as usize;
+        self.state.friends_account_id = ids[next].clone();
+        self.state.friends_status = None;
+    }
+
+    fn submit_send_friend_request(&mut self) {
+        let target = self.state.friends_input_buffer.trim().to_string();
+        if target.is_empty() {
+            self.state.friends_input_focused = false;
+            return;
+        }
+        let acc_id = self.friends_account_id();
+        let api = self.client_for_account_arc(&acc_id);
+        let tx = self.event_tx.clone();
+        self.state.friends_input_buffer.clear();
+        self.state.friends_input_focused = false;
+        self.state.friends_status = Some(format!("Sending friend request to {}...", target));
+
+        tokio::spawn(async move {
+            let client = api.lock().await;
+            match client.send_friend_request(&target).await {
+                Ok(user) => {
+                    let msg = if user.relationship == Some(RelationshipStatus::Friend) {
+                        format!("✓ Now friends with @{}", user.username)
+                    } else {
+                        format!("✓ Friend request sent to @{}", user.username)
+                    };
+                    let _ = tx
+                        .send(AppEvent::FriendActionSucceeded {
+                            account_id: acc_id,
+                            user,
+                            message: msg,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(AppEvent::FriendActionFailed(format!(
+                            "Friend request failed: {}",
+                            e
+                        )))
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn accept_selected_friend_or_open_dm(&mut self) {
+        let entries = self.state.sorted_friend_entries();
+        let Some((acc_id, user_id, status)) =
+            entries.get(self.state.friends_selected_index).cloned()
+        else {
+            return;
+        };
+        let uname = self
+            .state
+            .users
+            .get(&user_id)
+            .map(|u| u.username.clone())
+            .unwrap_or_else(|| user_id.clone());
+
+        match status {
+            RelationshipStatus::Incoming => {
+                let api = self.client_for_account_arc(&acc_id);
+                let tx = self.event_tx.clone();
+                self.state.friends_status = Some(format!("Accepting @{}...", uname));
+                tokio::spawn(async move {
+                    let client = api.lock().await;
+                    match client.accept_friend_request(&user_id).await {
+                        Ok(user) => {
+                            let msg = format!("✓ Accepted friend request from @{}", user.username);
+                            let _ = tx
+                                .send(AppEvent::FriendActionSucceeded {
+                                    account_id: acc_id,
+                                    user,
+                                    message: msg,
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(AppEvent::FriendActionFailed(format!(
+                                    "Accept failed: {}",
+                                    e
+                                )))
+                                .await;
+                        }
+                    }
+                });
+            }
+            RelationshipStatus::Friend => {
+                let api = self.client_for_account_arc(&acc_id);
+                let tx = self.event_tx.clone();
+                self.state.friends_status = Some(format!("Opening DM with @{}...", uname));
+                tokio::spawn(async move {
+                    let client = api.lock().await;
+                    match client.open_dm(&user_id).await {
+                        Ok(channel) => {
+                            let _ = tx
+                                .send(AppEvent::DmChannelOpened {
+                                    account_id: acc_id,
+                                    channel,
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(AppEvent::FriendActionFailed(format!(
+                                    "Open DM failed: {}",
+                                    e
+                                )))
+                                .await;
+                        }
+                    }
+                });
+            }
+            RelationshipStatus::Outgoing => {
+                self.state.friends_status = Some(format!(
+                    "Waiting for @{} to accept (press 'x' to cancel)",
+                    uname
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    fn remove_selected_friend(&mut self) {
+        let entries = self.state.sorted_friend_entries();
+        let Some((acc_id, user_id, status)) =
+            entries.get(self.state.friends_selected_index).cloned()
+        else {
+            return;
+        };
+        let uname = self
+            .state
+            .users
+            .get(&user_id)
+            .map(|u| u.username.clone())
+            .unwrap_or_else(|| user_id.clone());
+        let verb = match status {
+            RelationshipStatus::Incoming => "Declined",
+            RelationshipStatus::Outgoing => "Cancelled",
+            _ => "Removed",
+        };
+        let api = self.client_for_account_arc(&acc_id);
+        let tx = self.event_tx.clone();
+        self.state.friends_status = Some(format!("Updating @{}...", uname));
+        tokio::spawn(async move {
+            let client = api.lock().await;
+            match client.remove_friend(&user_id).await {
+                Ok(user) => {
+                    let msg = format!("✓ {} @{}", verb, user.username);
+                    let _ = tx
+                        .send(AppEvent::FriendActionSucceeded {
+                            account_id: acc_id,
+                            user,
+                            message: msg,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(AppEvent::FriendActionFailed(format!(
+                            "Friend update failed: {}",
+                            e
+                        )))
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn open_create_group_modal(&mut self, account_override: Option<String>) {
+        self.state.show_create_group_modal = true;
+        self.state.group_account_id = account_override
+            .unwrap_or_else(|| self.state.account_for_active_channel().to_string());
+        self.state.group_name_input.clear();
+        self.state.group_desc_input.clear();
+        self.state.group_focus_section = 0;
+        self.state.group_member_cursor = 0;
+        self.state.group_selected_users.clear();
+        self.state.group_status = None;
+    }
+
+    fn group_account_id(&self) -> String {
+        if !self.state.group_account_id.is_empty() {
+            self.state.group_account_id.clone()
+        } else {
+            self.state.active_account_id.clone()
+        }
+    }
+
+    fn cycle_group_account(&mut self, delta: i32) {
+        let mut ids: Vec<String> = self
+            .state
+            .config
+            .accounts
+            .iter()
+            .map(|a| a.id.clone())
+            .collect();
+        for k in self.state.account_users.keys() {
+            if !ids.contains(k) {
+                ids.push(k.clone());
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        let cur = self.group_account_id();
+        let pos = ids.iter().position(|id| id == &cur).unwrap_or(0) as i32;
+        let next = (pos + delta).rem_euclid(ids.len() as i32) as usize;
+        self.state.group_account_id = ids[next].clone();
+        self.state.group_selected_users.clear();
+        self.state.group_member_cursor = 0;
+        self.state.group_status = None;
+    }
+
+    fn submit_create_group(&mut self) {
+        let name = self.state.group_name_input.trim().to_string();
+        if name.is_empty() {
+            self.state.group_focus_section = 0;
+            self.state.group_status = Some("⚠ Group name cannot be empty".to_string());
+            return;
+        }
+        let acc_id = self.group_account_id();
+        let desc = self.state.group_desc_input.trim().to_string();
+        let desc_opt = (!desc.is_empty()).then_some(desc);
+        let mut users: Vec<String> = self.state.group_selected_users.iter().cloned().collect();
+        users.sort();
+
+        let api = self.client_for_account_arc(&acc_id);
+        let tx = self.event_tx.clone();
+        self.state.group_status = Some(format!("Creating group '{}'...", name));
+
+        tokio::spawn(async move {
+            let client = api.lock().await;
+            match client.create_group(&name, desc_opt.as_deref(), &users).await {
+                Ok(channel) => {
+                    let _ = tx
+                        .send(AppEvent::GroupCreated {
+                            account_id: acc_id,
+                            channel,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(AppEvent::GroupCreateFailed(format!(
+                            "Create group failed: {}",
+                            e
+                        )))
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn remove_channel_locally(&mut self, channel_id: &str) {
+        self.state.channels.remove(channel_id);
+        self.state.dms.retain(|d| d.id != channel_id);
+        for list in self.state.server_channels.values_mut() {
+            list.retain(|c| c != channel_id);
+        }
+        self.state.channel_accounts.remove(channel_id);
+        self.state.messages.remove(channel_id);
+        self.state.unread_counts.remove(channel_id);
+        self.state.voice_channel_participants.remove(channel_id);
+        if self.state.active_channel_id.as_deref() == Some(channel_id) {
+            self.state.active_channel_id = self.state.dms.first().map(|d| d.id.clone());
+        }
+        if self.state.selected_channel_index > 0 {
+            self.state.selected_channel_index = self.state.selected_channel_index.saturating_sub(1);
+        }
+    }
+
+    fn request_delete_or_leave_channel(&mut self, channel_id: &str) {
+        let Some(ch) = self.state.channels.get(channel_id).cloned() else {
+            return;
+        };
+        if ch.channel_type != "Group" && ch.channel_type != "DirectMessage" {
+            self.state.set_status("Only Groups and DMs can be deleted/closed here");
+            return;
+        }
+        let acc_id = self.state.account_for_channel(channel_id).to_string();
+        let my_uid = self
+            .state
+            .current_user_for_account(&acc_id)
+            .map(|u| u.id.as_str());
+        let name = ch.display_name(&self.state.users, my_uid);
+        let action = if ch.channel_type == "DirectMessage" {
+            "close DM"
+        } else if ch.owner.as_deref().is_some() && ch.owner.as_deref() == my_uid {
+            "delete/leave group"
+        } else {
+            "leave group"
+        };
+
+        self.state.pending_delete_channel = Some((
+            acc_id,
+            channel_id.to_string(),
+            name,
+            action.to_string(),
+        ));
+    }
+
+    fn confirm_delete_or_leave_channel(&mut self) {
+        let Some((acc_id, cid, name, _)) = self.state.pending_delete_channel.take() else {
+            return;
+        };
+        let api = self.client_for_account_arc(&acc_id);
+        let tx = self.event_tx.clone();
+        self.state.set_status(format!("Removing '{}'...", name));
+
+        tokio::spawn(async move {
+            let client = api.lock().await;
+            match client.delete_or_leave_channel(&cid).await {
+                Ok(()) => {
+                    let _ = tx
+                        .send(AppEvent::ChannelDeleted {
+                            channel_id: cid,
+                            name,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(AppEvent::ChannelDeleteFailed(format!(
+                            "Delete/leave failed: {}",
+                            e
+                        )))
+                        .await;
+                }
+            }
+        });
+    }
+
     fn settings_profile_account_id(&self) -> String {
         if !self.state.settings_profile_account_id.is_empty() {
             self.state.settings_profile_account_id.clone()
@@ -3801,6 +4601,7 @@ impl App {
         self.state.server_accounts.retain(|_, v| v != account_id);
         self.state.channel_accounts.retain(|_, v| v != account_id);
         self.state.user_accounts.retain(|_, v| v != account_id);
+        self.state.account_relationships.retain(|(acc, _), _| acc != account_id);
         self.state.account_users.remove(account_id);
         self.state.account_autumn_urls.remove(account_id);
         self.state.account_livekit.remove(account_id);
@@ -3845,6 +4646,7 @@ impl App {
 
         self.state.current_user = None;
         self.state.account_users.clear();
+        self.state.account_relationships.clear();
         self.state.account_autumn_urls.clear();
         self.state.account_livekit.clear();
         self.state.account_gateway_statuses.clear();
@@ -3863,6 +4665,8 @@ impl App {
 
         self.state.gateway_status = GatewayStatus::Disconnected("Logged out".to_string());
         self.state.show_settings_modal = false;
+        self.state.show_friends_modal = false;
+        self.state.show_create_group_modal = false;
         self.state.show_login_modal = true;
         self.state.login_field_index = 0;
         self.state.login_add_account = false;

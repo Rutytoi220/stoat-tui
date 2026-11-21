@@ -916,6 +916,171 @@ impl DeltaClient {
         Ok(user)
     }
 
+    pub async fn send_friend_request(&self, username: &str) -> Result<User> {
+        let url = format!("{}/users/friend", self.api_url.trim_end_matches('/'));
+        let trimmed = username.trim();
+        log_info!("POST {} (sending friend request to '{}')", url, trimmed);
+        let resp = self
+            .client
+            .post(&url)
+            .headers(self.headers())
+            .json(&serde_json::json!({ "username": trimmed }))
+            .send()
+            .await
+            .with_context(|| format!("Failed to send friend request at {}", url))?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        log_debug!("POST {} -> HTTP {}", url, status);
+        if !status.is_success() {
+            if let Some(structured) = Self::format_structured_auth_error(status, &body) {
+                return Err(anyhow!(structured));
+            }
+            return Err(anyhow!("Friend request failed (HTTP {}): {}", status, body));
+        }
+        let user: User = serde_json::from_str(&body).context("Failed to parse User JSON")?;
+        Ok(user)
+    }
+
+    pub async fn accept_friend_request(&self, user_id: &str) -> Result<User> {
+        let url = format!("{}/users/{}/friend", self.api_url.trim_end_matches('/'), user_id);
+        log_info!("PUT {} (accepting friend request)", url);
+        let resp = self
+            .client
+            .put(&url)
+            .headers(self.headers())
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .with_context(|| format!("Failed to accept friend request at {}", url))?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        log_debug!("PUT {} -> HTTP {}", url, status);
+        if !status.is_success() {
+            if let Some(structured) = Self::format_structured_auth_error(status, &body) {
+                return Err(anyhow!(structured));
+            }
+            return Err(anyhow!("Accept friend failed (HTTP {}): {}", status, body));
+        }
+        let user: User = serde_json::from_str(&body).context("Failed to parse User JSON")?;
+        Ok(user)
+    }
+
+    pub async fn remove_friend(&self, user_id: &str) -> Result<User> {
+        let url = format!("{}/users/{}/friend", self.api_url.trim_end_matches('/'), user_id);
+        log_info!("DELETE {} (removing/declining friend)", url);
+        let resp = self
+            .client
+            .delete(&url)
+            .headers(self.headers())
+            .send()
+            .await
+            .with_context(|| format!("Failed to remove friend at {}", url))?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        log_info!("DELETE {} -> HTTP {} (body_len={})", url, status, body.len());
+        if !status.is_success() {
+            if let Some(structured) = Self::format_structured_auth_error(status, &body) {
+                return Err(anyhow!(structured));
+            }
+            return Err(anyhow!("Remove friend failed (HTTP {}): {}", status, body));
+        }
+        let user: User = serde_json::from_str(&body).context("Failed to parse User JSON")?;
+        Ok(user)
+    }
+
+    pub async fn open_dm(&self, user_id: &str) -> Result<Channel> {
+        let url = format!("{}/users/{}/dm", self.api_url.trim_end_matches('/'), user_id);
+        log_info!("GET {} (opening DM channel)", url);
+        let resp = self
+            .client
+            .get(&url)
+            .headers(self.headers())
+            .send()
+            .await
+            .with_context(|| format!("Failed to open DM at {}", url))?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            if let Some(structured) = Self::format_structured_auth_error(status, &body) {
+                return Err(anyhow!(structured));
+            }
+            return Err(anyhow!("Open DM failed (HTTP {}): {}", status, body));
+        }
+        let channel: Channel = serde_json::from_str(&body).context("Failed to parse DM Channel JSON")?;
+        Ok(channel)
+    }
+
+    pub async fn create_group(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        users: &[String],
+    ) -> Result<Channel> {
+        let url = format!("{}/channels/create", self.api_url.trim_end_matches('/'));
+        let trimmed_name = name.trim();
+        let mut payload = serde_json::json!({
+            "name": trimmed_name,
+            "users": users,
+        });
+        if let Some(desc) = description.map(str::trim).filter(|s| !s.is_empty()) {
+            payload["description"] = serde_json::json!(desc);
+        }
+        log_info!(
+            "POST {} (creating group '{}' with {} user(s))",
+            url,
+            trimmed_name,
+            users.len()
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .headers(self.headers())
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| format!("Failed to create group at {}", url))?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        log_debug!("POST {} -> HTTP {}", url, status);
+        if !status.is_success() {
+            if let Some(structured) = Self::format_structured_auth_error(status, &body) {
+                return Err(anyhow!(structured));
+            }
+            return Err(anyhow!("Create group failed (HTTP {}): {}", status, body));
+        }
+        let channel: Channel =
+            serde_json::from_str(&body).context("Failed to parse Group Channel JSON")?;
+        Ok(channel)
+    }
+
+    pub async fn delete_or_leave_channel(&self, channel_id: &str) -> Result<()> {
+        let url = format!("{}/channels/{}", self.api_url.trim_end_matches('/'), channel_id);
+        log_info!("DELETE {} (deleting/leaving channel)", url);
+        let resp = self
+            .client
+            .delete(&url)
+            .headers(self.headers())
+            .send()
+            .await
+            .with_context(|| format!("Failed to delete/leave channel at {}", url))?;
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        log_info!("DELETE {} -> HTTP {} (body_len={})", url, status, body.len());
+        if !status.is_success() {
+            if let Some(structured) = Self::format_structured_auth_error(status, &body) {
+                return Err(anyhow!(structured));
+            }
+            return Err(anyhow!("Delete/leave channel failed (HTTP {}): {}", status, body));
+        }
+        Ok(())
+    }
+
     pub async fn fetch_server_members(&self, server_id: &str) -> Result<ServerMembersResponse> {
         let url = format!("{}/servers/{}/members", self.api_url, server_id);
         log_debug!("GET {} (fetching server members)", url);

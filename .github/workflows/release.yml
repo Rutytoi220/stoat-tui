@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag name (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
 
 permissions:
   contents: write
@@ -11,18 +17,16 @@ permissions:
 jobs:
   build:
     name: Build (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            use_cross: false
-          - target: x86_64-unknown-linux-musl
-            use_cross: false
-            apt_packages: musl-tools
-          - target: aarch64-unknown-linux-gnu
-            use_cross: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            apt_packages: libasound2-dev pkg-config libssl-dev libgtk-3-dev
+          - os: macos-latest
+            target: aarch64-apple-darwin
 
     steps:
       - name: Checkout repository
@@ -33,28 +37,19 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install system dependencies
+      - name: Install Linux system dependencies
         if: matrix.apt_packages
         run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt_packages }}
 
-      - name: Install Cross
-        if: matrix.use_cross
-        run: |
-          cargo install cross --git https://github.com/cross-rs/cross
-
       - name: Build release binary
-        run: |
-          if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package archive and checksum
+        shell: bash
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
           ARCHIVE_NAME="stoat-tui-${TAG}-${{ matrix.target }}"
           STAGE_DIR="target/package/${ARCHIVE_NAME}"
           mkdir -p "${STAGE_DIR}"
@@ -64,7 +59,11 @@ jobs:
 
           tar -czvf "target/${ARCHIVE_NAME}.tar.gz" -C "target/package" "${ARCHIVE_NAME}"
           cd target
-          sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+          else
+            shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -98,6 +97,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             dist/*.tar.gz
             dist/checksums.txt

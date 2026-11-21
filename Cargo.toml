@@ -5,7 +5,7 @@ edition = "2021"
 default-run = "stoat-tui"
 description = "A fast, keyboard-first, and fully mouse-accessible Terminal User Interface client for Stoat"
 license = "MIT"
-repository = "https://github.com/stoat-chat/stoat-tui"
+repository = "https://github.com/Rutytoi220/stoat-tui"
 keywords = ["stoat", "revolt", "tui", "chat", "terminal"]
 categories = ["command-line-utilities"]
 

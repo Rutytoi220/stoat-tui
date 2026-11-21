@@ -1,15 +1,22 @@
-# Maintainer: Stoat Team <dev@stoat.chat>
+# Maintainer: Rutytoi <https://github.com/Rutytoi220/stoat-tui>
 pkgname=stoat-tui-bin
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="Fast, keyboard-first, and fully mouse-accessible Terminal User Interface client for Stoat (precompiled binary)"
 arch=('x86_64' 'aarch64')
-url="https://github.com/stoat-chat/stoat-tui"
+url="https://github.com/Rutytoi220/stoat-tui"
 license=('MIT')
+depends=('gcc-libs' 'alsa-lib')
+optdepends=(
+    'wf-recorder: 30-60 FPS Wayland screen sharing'
+    'wl-screenrec: hardware-accelerated Wayland screen sharing'
+    'grim: Wayland screenshot fallback for screen sharing'
+    'zenity: native file picker for attachment/avatar uploads'
+)
 provides=('stoat-tui')
 conflicts=('stoat-tui')
 
-source_x86_64=("$url/releases/download/v$pkgver/stoat-tui-v$pkgver-x86_64-unknown-linux-musl.tar.gz")
+source_x86_64=("$url/releases/download/v$pkgver/stoat-tui-v$pkgver-x86_64-unknown-linux-gnu.tar.gz")
 source_aarch64=("$url/releases/download/v$pkgver/stoat-tui-v$pkgver-aarch64-unknown-linux-gnu.tar.gz")
 sha256sums_x86_64=('SKIP')
 sha256sums_aarch64=('SKIP')
@@ -17,14 +24,12 @@ sha256sums_aarch64=('SKIP')
 package() {
     cd "stoat-tui-v$pkgver-${CARCH}-unknown-linux-"* 2>/dev/null || cd "$srcdir"
 
-    # Find and install executable
     if [ -f "stoat-tui" ]; then
         install -Dm755 "stoat-tui" "$pkgdir/usr/bin/stoat-tui"
     else
         install -Dm755 "$(find . -type f -name stoat-tui | head -n 1)" "$pkgdir/usr/bin/stoat-tui"
     fi
 
-    # Install documentation and license if available
     [ -f "LICENSE" ] && install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
     [ -f "README.md" ] && install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }
